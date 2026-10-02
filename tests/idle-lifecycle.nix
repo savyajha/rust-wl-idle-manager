@@ -6,9 +6,13 @@
 #
 # Behaviours asserted:
 #   1. each timeout idles once, after its own delay, in order, and its
-#      command is logged
-#   2. input resumes every idle timeout, and the on-resume command is logged
-#   3. after a resume, the timers start again
+#      command runs: the locker as a transient user unit, the spawns (found
+#      in PATH) as transient units that are unloaded once they exit
+#   2. input resumes every idle timeout, and the on-resume command runs; one
+#      that is not found is logged as an error
+#   3. after a resume, the timers start again; a second lock while the
+#      locker runs is logged and the daemon keeps running; a locker that
+#      fails is unloaded at once
 #   4. an idle inhibitor holds back every timeout but the ignore-inhibit one
 #   5. the compositor going away -> exit with a failure status
 #   6. SIGTERM -> clean exit 0
@@ -22,11 +26,13 @@ let
   uid = 1000;
   runtimeDir = "/run/user/${toString uid}";
 
+  # The spawns write markers to /tmp. Timeout 2 spawns rather than suspends: the
+  # lingering test user has no logind session, so polkit would refuse a suspend.
   config = pkgs.writeText "idle.kdl" ''
-    locker "true"
-    timeout 3 { lock; }
-    timeout 6 { spawn "true"; on-resume "true" "resumed"; }
-    timeout 9 { ignore-inhibit; suspend; }
+    locker "${pkgs.coreutils}/bin/sleep" "600"
+    timeout 3 { lock; on-resume "no-such-program"; }
+    timeout 6 { spawn "touch" "/tmp/spawned"; on-resume "touch" "/tmp/resumed"; }
+    timeout 9 { ignore-inhibit; spawn "touch" "/tmp/ignored-inhibit"; }
   '';
 
   badConfig = pkgs.writeText "idle-bad.kdl" ''
@@ -134,7 +140,13 @@ pkgs.testers.runNixOSTest {
         assert t[0] < t[1] < t[2], f"out of order: {t}"
         text = journal(since)
         assert text.count("idle after 3 s (timeout 0)") == 1, text
-        assert text.count("command (not run yet): StartLocker") == 1, text
+        assert text.count("starting the locker") == 1, text
+        uctl("systemctl --user is-active rust-wl-locker.service")
+        machine.wait_for_file("/tmp/spawned")
+        machine.wait_for_file("/tmp/ignored-inhibit")
+        spawn_units = PREFIX + "systemctl --user list-units --all --no-legend 'rust-wl-idle-spawn-*'"
+        # Fails, and is retried, while systemctl fails or lists a unit.
+        machine.wait_until_succeeds(f'units=$({spawn_units}) && test -z "$units"')
 
     with subtest("input resumes every timeout"):
         since = cursor()
@@ -146,12 +158,20 @@ pkgs.testers.runNixOSTest {
         ]
         machine.log(f"resumed after {[round(x - sent, 3) for x in resumed]} s")
         assert all(x - sent < 2 for x in resumed), f"slow resume: {resumed} vs {sent}"
-        wait_for_log(since, 'command (not run yet): Spawn(["true", "resumed"])')
+        machine.wait_for_file("/tmp/resumed")
+        wait_for_log(since, "spawning no-such-program: no-such-program not found in PATH")
 
     with subtest("after a resume, the timers start again"):
         again = wait_for_log(since, "idle after 3 s (timeout 0)")
         machine.log(f"idle again {round(again - sent, 3)} s after the input")
         assert 2.5 < again - sent < 4.5, f"re-idled after {again - sent} s"
+        wait_for_log(since, "locker already running")
+        uctl("systemctl --user is-active idle-manager.service")
+        # A killed locker fails; CollectMode=inactive-or-failed must still unload it.
+        uctl("systemctl --user kill -s KILL rust-wl-locker.service")
+        machine.wait_until_succeeds(
+            PREFIX + "systemctl --user show -p LoadState --value rust-wl-locker.service | grep -qx not-found"
+        )
 
     with subtest("an idle inhibitor holds back all but the ignore-inhibit timeout"):
         swaymsg("exec ${pkgs.foot}/bin/foot")
@@ -171,6 +191,8 @@ pkgs.testers.runNixOSTest {
         machine.log(text)
         for line in ["idle after 3 s (timeout 0)", "idle after 6 s (timeout 1)"]:
             assert line not in text, f"inhibited, yet logged {line!r}:\n{text}"
+        # Written again since the input, not left over from an earlier idle.
+        machine.wait_until_succeeds(f"test $(stat -c %Y /tmp/ignored-inhibit) -ge {int(sent) + 5}")
         swaymsg("'[app_id=foot] kill'")
         machine.wait_until_fails("pgrep foot")
 
