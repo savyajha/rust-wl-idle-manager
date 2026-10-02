@@ -1,5 +1,6 @@
 mod config;
 mod idle;
+mod policy;
 
 use std::env;
 use std::ffi::OsString;
@@ -14,6 +15,7 @@ use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::Subscr
 
 use config::Config;
 use idle::{IdleEvent, IdleWatcher};
+use policy::{Input, Policy};
 
 /// The path from exactly `--config <path>`, or `None` for any other arguments.
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> Option<PathBuf> {
@@ -40,7 +42,8 @@ fn init_logging() {
         .init();
 }
 
-/// Load the config and log idle events until SIGTERM; an error ends the run.
+/// Load the config, then log idle events and the commands they lead to until SIGTERM;
+/// an error ends the run.
 async fn run(config_path: &Path) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
     let config = Config::load(config_path)?;
@@ -55,12 +58,24 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         timeouts.len(),
         config_path.display()
     );
+    let mut policy = Policy::new(config.timeouts);
     loop {
         tokio::select! {
-            idle = watcher.next() => match idle? {
-                IdleEvent::Idled(i) => info!("idle after {} s (timeout {i})", timeouts[i].0.as_secs()),
-                IdleEvent::Resumed(i) => info!("resumed (timeout {i})"),
-            },
+            idle = watcher.next() => {
+                let input = match idle? {
+                    IdleEvent::Idled(i) => {
+                        info!("idle after {} s (timeout {i})", timeouts[i].0.as_secs());
+                        Input::Idled(i)
+                    }
+                    IdleEvent::Resumed(i) => {
+                        info!("resumed (timeout {i})");
+                        Input::Resumed(i)
+                    }
+                };
+                for command in policy.handle(input) {
+                    info!("command (not run yet): {command:?}");
+                }
+            }
             _ = sigterm.recv() => return Ok(()),
         }
     }

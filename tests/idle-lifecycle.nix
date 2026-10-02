@@ -5,8 +5,9 @@
 # reads its log lines from the journal.
 #
 # Behaviours asserted:
-#   1. each timeout idles once, after its own delay, in order
-#   2. input resumes every idle timeout
+#   1. each timeout idles once, after its own delay, in order, and its
+#      command is logged
+#   2. input resumes every idle timeout, and the on-resume command is logged
 #   3. after a resume, the timers start again
 #   4. an idle inhibitor holds back every timeout but the ignore-inhibit one
 #   5. the compositor going away -> exit with a failure status
@@ -24,7 +25,7 @@ let
   config = pkgs.writeText "idle.kdl" ''
     locker "true"
     timeout 3 { lock; }
-    timeout 6 { spawn "true"; on-resume "true"; }
+    timeout 6 { spawn "true"; on-resume "true" "resumed"; }
     timeout 9 { ignore-inhibit; suspend; }
   '';
 
@@ -133,6 +134,7 @@ pkgs.testers.runNixOSTest {
         assert t[0] < t[1] < t[2], f"out of order: {t}"
         text = journal(since)
         assert text.count("idle after 3 s (timeout 0)") == 1, text
+        assert text.count("command (not run yet): StartLocker") == 1, text
 
     with subtest("input resumes every timeout"):
         since = cursor()
@@ -144,6 +146,7 @@ pkgs.testers.runNixOSTest {
         ]
         machine.log(f"resumed after {[round(x - sent, 3) for x in resumed]} s")
         assert all(x - sent < 2 for x in resumed), f"slow resume: {resumed} vs {sent}"
+        wait_for_log(since, 'command (not run yet): Spawn(["true", "resumed"])')
 
     with subtest("after a resume, the timers start again"):
         again = wait_for_log(since, "idle after 3 s (timeout 0)")

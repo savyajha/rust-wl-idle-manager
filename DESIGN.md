@@ -1,7 +1,8 @@
 # Design
 
-rust-wl-idle-manager watches the compositor's idle notifications and, for now,
-logs them. This document records why it works the way it does.
+rust-wl-idle-manager watches the compositor's idle notifications, decides what
+each one should lead to and, for now, logs those commands without running them.
+This document records why it works the way it does.
 
 ## Idle detection
 
@@ -17,6 +18,39 @@ video), the timeout does not fire. A timeout with `ignore-inhibit` uses
 `get_input_idle_notification` instead, which counts only input. That request
 needs version 2 of `ext_idle_notifier_v1`; with an older compositor, a config
 that uses `ignore-inhibit` is an error at startup.
+
+## Policy
+
+What to do is decided by a pure state machine, `Policy`, with no I/O, timers or
+clock, so every rule is unit-tested. It takes inputs (a timeout idled or
+resumed; from logind, whether an idle inhibitor is held, whether the session is
+active, lock and unlock requests, the session's `LockedHint`, sleep starting or
+ending; whether the locker unit runs; and the wait for the lock timing out) and
+returns commands for the I/O code to run. Today only the Wayland inputs are fed
+in. Its state is a set of booleans, each holding the latest value reported by
+its source, never a count, so a missed or repeated input cannot leave it skewed.
+
+- A timeout's action runs unless the session is inactive (on another VT), or a
+  logind idle inhibitor is held and the timeout is not `ignore-inhibit`.
+- Its `on-resume` command runs only if the action ran. `resumed` means "no
+  longer idle", which the compositor also sends when an inhibitor appears, so
+  it does nothing else: it never unlocks.
+- The locker is started (by `lock`, a logind lock request or sleep) only if it
+  is not already running and `LockedHint` is not set.
+- A logind unlock request unlocks the locker only while our locker unit is
+  running.
+- Before sleep, a sleep delay inhibitor holds it back: if the session is
+  already locked, the inhibitor is released at once; otherwise the locker is
+  started and the inhibitor is released when `LockedHint` is set or after a
+  timeout of about 4 seconds, so a broken locker never blocks sleep.
+- After waking, the sleep inhibitor is released if still held and taken
+  again, and every idle notification is re-created, so the timers start from
+  the wake. Before that, the `on-resume` command of every timeout whose action
+  ran is run, since the old notifications will never send `resumed`.
+- When the last logind idle inhibitor goes away, the notifications of timeouts
+  that respect inhibitors and whose action has not run are re-created, so the
+  ones it held back can fire again. Timeouts whose action ran keep their
+  notifications, so their `on-resume` still waits for the user's return.
 
 ## Event loop
 
