@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Cargo.lock (and Cargo.toml for new major versions), one grouped PR a month.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # Keeps the action versions in .github/workflows current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

@@ -1,0 +1,31 @@
+name: Update flake.lock
+
+on:
+  schedule:
+    - cron: "0 3 1 * *" # 03:00 UTC on the 1st of each month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: DeterminateSystems/update-flake-lock@v29
+        id: update
+        with:
+          pr-title: "flake.lock: Update"
+          branch: update_flake_lock_action
+
+      # PRs opened with GITHUB_TOKEN don't trigger CI, but workflow_dispatch does.
+      # The run is on the PR's head commit, so it shows up as the PR's check.
+      - name: Run CI on the update branch
+        if: steps.update.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref update_flake_lock_action

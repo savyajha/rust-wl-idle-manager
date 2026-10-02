@@ -1,0 +1,21 @@
+[package]
+name = "rust-wl-idle-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+knuffel = "3"
+miette = "5"
+tokio = { version = "1", features = ["rt", "macros", "signal", "net"] }
+tracing = "0.1"
+tracing-journald = "0.3"
+tracing-subscriber = "0.3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+# Whole-program optimisation, tuned for size: the daemon is idle, so speed does not matter.
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
