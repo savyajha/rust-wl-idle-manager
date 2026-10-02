@@ -6,7 +6,7 @@ use anyhow::{Context, ensure};
 use knuffel::ast::SpannedNode;
 use knuffel::decode::Context as DecodeContext;
 use knuffel::errors::DecodeError;
-use knuffel::traits::{DecodeScalar, ErrorSpan};
+use knuffel::traits::ErrorSpan;
 
 /// The longest timeout: ext-idle-notify takes milliseconds as a u32, about 49 days.
 const MAX_SECS: u64 = u32::MAX as u64 / 1000;
@@ -45,9 +45,22 @@ pub enum Action {
     Spawn(#[knuffel(arguments)] Vec<String>),
 }
 
-/// A child node whose arguments are an argv, such as `on-resume`.
+/// A `timeout` node as knuffel decodes it, before the checks `Timeout` adds.
 #[derive(knuffel::Decode)]
-struct Argv(#[knuffel(arguments)] Vec<String>);
+struct RawTimeout {
+    /// The delay in seconds, not yet range-checked.
+    #[knuffel(argument)]
+    secs: u64,
+    /// The `ignore-inhibit` flag node.
+    #[knuffel(child)]
+    ignore_inhibit: bool,
+    /// The `on-resume` argv, possibly empty.
+    #[knuffel(child, unwrap(arguments))]
+    on_resume: Option<Vec<String>>,
+    /// Every other child; exactly one is allowed.
+    #[knuffel(children)]
+    actions: Vec<Action>,
+}
 
 impl Config {
     /// Read, parse and validate the KDL config at `path`.
@@ -71,96 +84,43 @@ impl<S: ErrorSpan> knuffel::Decode<S> for Timeout {
         node: &SpannedNode<S>,
         ctx: &mut DecodeContext<S>,
     ) -> Result<Self, DecodeError<S>> {
-        if let Some(type_name) = &node.type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-        let mut args = node.arguments.iter();
-        let arg = args
-            .next()
-            .ok_or_else(|| DecodeError::missing(node, "expected the timeout in seconds"))?;
-        for extra in args {
-            ctx.emit_error(DecodeError::unexpected(
-                &extra.literal,
-                "argument",
-                "only one argument is allowed",
-            ));
-        }
-        let secs: u64 = DecodeScalar::decode(arg, ctx)?;
-        if !(1..=MAX_SECS).contains(&secs) {
+        let raw = RawTimeout::decode_node(node, ctx)?;
+        if !(1..=MAX_SECS).contains(&raw.secs) {
             ctx.emit_error(DecodeError::conversion(
-                &arg.literal,
+                &node.arguments[0].literal,
                 format!("expected 1 to {MAX_SECS} seconds"),
             ));
         }
-        for name in node.properties.keys() {
-            ctx.emit_error(DecodeError::unexpected(
-                name,
-                "property",
-                format!("unexpected property `{}`", name.escape_default()),
-            ));
-        }
-
-        let mut actions = Vec::new();
-        let mut on_resume = None;
-        let mut ignore_inhibit = false;
         for child in node.children() {
-            match &**child.node_name {
-                "ignore-inhibit" => {
-                    knuffel::decode::check_flag_node(child, ctx);
-                    if std::mem::replace(&mut ignore_inhibit, true) {
-                        ctx.emit_error(DecodeError::unexpected(
-                            child,
-                            "node",
-                            "ignore-inhibit is already set",
-                        ));
-                    }
-                }
-                "on-resume" => match Argv::decode_node(child, ctx) {
-                    Ok(Argv(argv)) if argv.is_empty() => {
-                        ctx.emit_error(DecodeError::missing(child, "on-resume needs a command"));
-                    }
-                    Ok(Argv(argv)) => {
-                        if on_resume.replace(argv).is_some() {
-                            ctx.emit_error(DecodeError::unexpected(
-                                child,
-                                "node",
-                                "on-resume is already set",
-                            ));
-                        }
-                    }
-                    Err(e) => ctx.emit_error(e),
-                },
-                _ => actions.push(child),
+            let name = &**child.node_name;
+            if matches!(name, "spawn" | "on-resume") && child.arguments.is_empty() {
+                ctx.emit_error(DecodeError::missing(
+                    child,
+                    format!("{name} needs a command"),
+                ));
             }
         }
-
-        let mut actions = actions.into_iter();
-        let Some(first) = actions.next() else {
-            return Err(DecodeError::missing(
-                node,
-                "expected an action for this timeout",
-            ));
-        };
-        for extra in actions {
+        let actions = node
+            .children()
+            .filter(|child| !matches!(&**child.node_name, "ignore-inhibit" | "on-resume"));
+        for extra in actions.skip(1) {
             ctx.emit_error(DecodeError::unexpected(
                 extra,
                 "node",
                 "only one action is allowed per timeout",
             ));
         }
-        let action = Action::decode_node(first, ctx)?;
-        if action == Action::Spawn(Vec::new()) {
-            ctx.emit_error(DecodeError::missing(first, "spawn needs a command"));
-        }
+        let Some(action) = raw.actions.into_iter().next() else {
+            return Err(DecodeError::missing(
+                node,
+                "expected an action for this timeout",
+            ));
+        };
         Ok(Self {
-            after: Duration::from_secs(secs),
+            after: Duration::from_secs(raw.secs),
             action,
-            on_resume,
-            ignore_inhibit,
+            on_resume: raw.on_resume,
+            ignore_inhibit: raw.ignore_inhibit,
         })
     }
 }

@@ -2,15 +2,12 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 /// Job mode that fails, rather than replacing a conflicting queued job.
 const MODE_FAIL: &str = "fail";
-
-/// D-Bus error systemd returns when a unit by the requested name is already loaded.
-const UNIT_EXISTS: &str = "org.freedesktop.systemd1.UnitExists";
 
 #[proxy(
     interface = "org.freedesktop.systemd1.Manager",
@@ -27,6 +24,9 @@ pub trait SystemdManager {
         properties: &[(&str, Value<'_>)],
         aux: &[(&str, &[(&str, Value<'_>)])],
     ) -> zbus::Result<OwnedObjectPath>;
+
+    /// Send `signal` to the processes of unit `name` that `whom` selects ("main", "all", ...).
+    fn kill_unit(&self, name: &str, whom: &str, signal: i32) -> zbus::Result<()>;
 }
 
 impl SystemdManagerProxy<'_> {
@@ -39,8 +39,7 @@ impl SystemdManagerProxy<'_> {
         argv: &[String],
     ) -> anyhow::Result<bool> {
         let path = env::var("PATH").unwrap_or_default();
-        let program = find_program(&argv[0], &path)
-            .with_context(|| format!("{} not found in PATH", argv[0]))?;
+        let program = find_program(&argv[0], &path)?;
         let properties = [
             ("Description", Value::from(description)),
             (
@@ -50,23 +49,43 @@ impl SystemdManagerProxy<'_> {
             // Unload the unit once it stops, even if it failed, so its name is free again.
             ("CollectMode", Value::from("inactive-or-failed")),
         ];
-        match self
+        let started = self
             .start_transient_unit(unit, MODE_FAIL, &properties, &[])
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(zbus::Error::MethodError(name, _, _)) if name == UNIT_EXISTS => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+            .await;
+        Ok(unless_error(started, "UnitExists")?)
+    }
+
+    /// Send `signal` to the main process of `unit`. Returns false, sending nothing, if
+    /// the unit is not loaded.
+    pub async fn signal_main(&self, unit: &str, signal: i32) -> zbus::Result<bool> {
+        unless_error(self.kill_unit(unit, "main", signal).await, "NoSuchUnit")
     }
 }
 
-/// The path to run for `program`, much like systemd-run finds it: as is if it contains
-/// a '/', otherwise the first executable file named `program` in the directories of `path`.
-fn find_program(program: &str, path: &str) -> Option<String> {
-    if program.contains('/') {
-        return Some(program.to_owned());
+/// Whether `result` is a success; `Ok(false)` for systemd's D-Bus error `error`.
+fn unless_error<T>(result: zbus::Result<T>, error: &str) -> zbus::Result<bool> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(zbus::Error::MethodError(name, ..))
+            if name.strip_prefix("org.freedesktop.systemd1.") == Some(error) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
     }
+}
+
+/// The path to run for `program`, much like systemd-run finds it: as is if absolute,
+/// otherwise the first executable file named `program` in the directories of `path`.
+/// A relative path with a '/' is an error, since systemd needs an absolute one.
+fn find_program(program: &str, path: &str) -> anyhow::Result<String> {
+    if program.starts_with('/') {
+        return Ok(program.to_owned());
+    }
+    ensure!(
+        !program.contains('/'),
+        "{program}: a program path must be absolute or a bare name"
+    );
     path.split(':')
         // systemd needs an absolute path, so skip empty and relative entries.
         .filter(|dir| dir.starts_with('/'))
@@ -74,6 +93,7 @@ fn find_program(program: &str, path: &str) -> Option<String> {
         .find(|file| {
             fs::metadata(file).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
+        .with_context(|| format!("{program} not found in PATH"))
 }
 
 #[cfg(test)]
@@ -97,12 +117,15 @@ mod tests {
             fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
         }
         let path = format!("relative::{a}:{b}");
+        let find = |program| find_program(program, &path).map_err(|e| e.to_string());
 
-        assert_eq!(find_program("both", &path), Some(format!("{a}/both")));
-        assert_eq!(find_program("plain", &path), None);
-        assert_eq!(find_program("dir", &path), None);
-        assert_eq!(find_program("missing", &path), None);
-        assert_eq!(find_program("./x", &path), Some("./x".to_owned()));
+        assert_eq!(find("both"), Ok(format!("{a}/both")));
+        assert_eq!(find("plain"), Err("plain not found in PATH".to_owned()));
+        assert_eq!(find("dir"), Err("dir not found in PATH".to_owned()));
+        assert_eq!(find("missing"), Err("missing not found in PATH".to_owned()));
+        assert_eq!(find("/x/y"), Ok("/x/y".to_owned()));
+        let relative = "./x: a program path must be absolute or a bare name";
+        assert_eq!(find("./x"), Err(relative.to_owned()));
         fs::remove_dir_all(root).unwrap();
     }
 }
