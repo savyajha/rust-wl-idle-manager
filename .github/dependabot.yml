@@ -5,6 +5,10 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    # miette must match the version knuffel implements Diagnostic for (5.x).
+    ignore:
+      - dependency-name: miette
+        update-types: ["version-update:semver-major"]
     groups:
       cargo:
         patterns: ["*"]
