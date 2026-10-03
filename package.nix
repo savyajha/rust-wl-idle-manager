@@ -12,7 +12,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   meta = with lib; {
-    description = "Idle daemon for Wayland compositors (tested with sway, intended for niri)";
+    description = "Idle daemon for Wayland compositors, built for niri";
     license = licenses.mit;
     platforms = platforms.linux;
     mainProgram = "rust-wl-idle-manager";

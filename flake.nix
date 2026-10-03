@@ -1,5 +1,5 @@
 {
-  description = "Idle daemon for Wayland compositors (tested with sway, intended for niri)";
+  description = "Idle daemon for Wayland compositors, built for niri";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

@@ -13,9 +13,10 @@ An idle daemon for Wayland compositors, meant to replace hypridle.
 > - It was written with the help of an AI assistant (Anthropic's Claude). Every
 >   change was reviewed by me, and the behaviour is covered by the tests
 >   described below, but you should review it yourself before relying on it.
-> - It is intended for [niri](https://github.com/YaLTeR/niri), but so far it
->   has only been tested with sway, in a NixOS VM test. It may work with other
->   compositors that implement `ext-idle-notify-v1`.
+> - It is built for and used with [niri](https://github.com/YaLTeR/niri) on
+>   NixOS. The automated tests run it against sway in a NixOS VM. It may work
+>   with other compositors that implement `ext-idle-notify-v1` and set logind's
+>   `LockedHint` when locked.
 
 ## Configuration
 
