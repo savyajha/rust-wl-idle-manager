@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1"
 futures-lite = { version = "2", default-features = false }
 knuffel = "3"
-miette = "5"
+miette = "7"
 tokio = { version = "1", features = ["rt", "macros", "signal", "net", "time"] }
 tracing = "0.1"
 tracing-journald = "0.3"
