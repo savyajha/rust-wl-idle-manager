@@ -51,9 +51,10 @@ compositor must support. The built-in lock screen covers every output with a
 plain colour and a password field: type your password and press Enter
 (Backspace deletes a character, Escape clears it). The field shows a dot per
 character, turns blue while the password is checked and red when it was
-wrong, and a yellow bar below it means caps lock is on. Only the right
-password or `loginctl unlock-session` unlocks it. If the daemon dies while
-locked, the session stays locked, and on its next start the daemon locks
+wrong, and a yellow bar below it means caps lock is on. After five wrong
+passwords in a row, the field turns grey and takes no input for 30 s. Only
+the right password or `loginctl unlock-session` unlocks it. If the daemon dies
+while locked, the session stays locked, and on its next start the daemon locks
 again (the compositor lets the new lock replace the dead one), so the unit
 should restart it on failure.
 

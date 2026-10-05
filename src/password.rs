@@ -4,7 +4,7 @@ use std::ptr;
 use std::sync::atomic::{Ordering, compiler_fence};
 use std::time::{Duration, Instant};
 
-use tracing::warn;
+use tracing::{info, warn};
 use xkbcommon::xkb::Keysym;
 
 /// The most bytes of UTF-8 a password can have; typing past it is ignored.
@@ -15,6 +15,10 @@ const FORGET_AFTER: Duration = Duration::from_secs(30);
 
 /// How long a failed attempt is shown.
 const FAILED_FOR: Duration = Duration::from_millis(1500);
+
+/// After every this many failed attempts in a row, no attempt is taken for `COOLDOWN`.
+const COOLDOWN_AFTER: u32 = 5;
+const COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Overwrite `bytes` with zeros, with volatile writes the compiler cannot remove as dead
 /// stores (as the zeroize crate does).
@@ -69,6 +73,8 @@ pub enum Status {
     Checking,
     /// The last attempt failed (shown for `FAILED_FOR`, or until a key is pressed).
     Failed,
+    /// Too many attempts failed: keys do nothing until the cooldown ends.
+    Cooldown,
 }
 
 /// Everything the lock screen shows of the entry; it is redrawn only when this changes.
@@ -94,7 +100,8 @@ struct Held {
 #[repr(align(4096))]
 struct Page([u8; CAPACITY]);
 
-/// The password being typed, and what the keys do to it. Pure: the time is passed in.
+/// The password being typed, and what the keys do to it. No I/O apart from one log line
+/// when a cooldown starts; the time is passed in.
 /// The password is UTF-8 in one buffer allocated at startup and never moved or grown.
 /// Its `Debug` prints nothing.
 pub struct Entry {
@@ -104,6 +111,9 @@ pub struct Entry {
     checking: bool,
     /// Until when a failed attempt is shown.
     failed_until: Option<Instant>,
+    /// Failed attempts in a row, and until when keys are ignored after too many.
+    failures: u32,
+    cooldown_until: Option<Instant>,
     /// When the password is wiped if nothing more is typed.
     forget_at: Option<Instant>,
     held: Option<Held>,
@@ -127,6 +137,8 @@ impl Entry {
             len: 0,
             checking: false,
             failed_until: None,
+            failures: 0,
+            cooldown_until: None,
             forget_at: None,
             held: None,
             repeat: None,
@@ -135,9 +147,10 @@ impl Entry {
     }
 
     /// Act on `key`, pressed at `now`; `code` identifies the physical key. Returns true
-    /// when the password is to be checked. Keys do nothing while it is being checked.
+    /// when the password is to be checked. Keys do nothing while it is being checked or
+    /// during a cooldown.
     pub fn press(&mut self, key: Key, code: u32, now: Instant) -> bool {
-        if self.checking {
+        if self.checking || self.cooldown_until.is_some() {
             return false;
         }
         self.failed_until = None;
@@ -213,15 +226,26 @@ impl Entry {
         Submission(self)
     }
 
-    /// The helper answered: show a failure, unless `ok`. Returns false, ignoring the
-    /// answer, if no check was under way (the lock ended since).
+    /// The helper answered: show a failure, unless `ok`, or start a cooldown after every
+    /// `COOLDOWN_AFTER` failures in a row. Returns false, ignoring the answer, if no check
+    /// was under way (the lock ended since).
     pub fn checked(&mut self, ok: bool, now: Instant) -> bool {
         if !self.checking {
             return false;
         }
+        let failures = if ok { 0 } else { self.failures + 1 };
         self.reset();
-        if !ok {
-            self.failed_until = Some(now + FAILED_FOR);
+        self.failures = failures;
+        match (ok, failures % COOLDOWN_AFTER) {
+            (true, _) => {}
+            (false, 0) => {
+                info!(
+                    "{COOLDOWN_AFTER} wrong passwords; waiting {} s",
+                    COOLDOWN.as_secs()
+                );
+                self.cooldown_until = Some(now + COOLDOWN);
+            }
+            (false, _) => self.failed_until = Some(now + FAILED_FOR),
         }
         true
     }
@@ -234,24 +258,26 @@ impl Entry {
         self.held = None;
     }
 
-    /// Wipe the password and forget any check or failure, as for a new lock.
+    /// Wipe the password and forget any check, failure or cooldown, as for a new lock.
     pub fn reset(&mut self) {
         self.wipe();
         self.checking = false;
         self.failed_until = None;
+        self.failures = 0;
+        self.cooldown_until = None;
     }
 
     /// When `tick` next has something to do.
     pub fn deadline(&self) -> Option<Instant> {
         let held = self.held.as_ref().map(|held| held.next);
-        [held, self.failed_until, self.forget_at]
+        [held, self.failed_until, self.cooldown_until, self.forget_at]
             .into_iter()
             .flatten()
             .min()
     }
 
-    /// Do what is due at `now`: repeat a held key, stop showing a failure, forget a
-    /// password left untouched.
+    /// Do what is due at `now`: repeat a held key, stop showing a failure, end a
+    /// cooldown, forget a password left untouched.
     pub fn tick(&mut self, now: Instant) {
         if let (Some(held), Some((_, interval))) = (&mut self.held, self.repeat)
             && held.next <= now
@@ -273,6 +299,9 @@ impl Entry {
         if self.failed_until.is_some_and(|until| until <= now) {
             self.failed_until = None;
         }
+        if self.cooldown_until.is_some_and(|until| until <= now) {
+            self.cooldown_until = None;
+        }
         if self.forget_at.is_some_and(|at| at <= now) {
             self.wipe();
         }
@@ -282,6 +311,8 @@ impl Entry {
     pub fn look(&self) -> Look {
         let status = if self.checking {
             Status::Checking
+        } else if self.cooldown_until.is_some() {
+            Status::Cooldown
         } else if self.failed_until.is_some() {
             Status::Failed
         } else if self.len > 0 {
@@ -516,6 +547,79 @@ mod tests {
         assert_eq!(entry.look().status, Status::Idle);
         assert!(!entry.press(Key::Char('x'), 1, now));
         assert_eq!(entry.bytes(), b"x");
+    }
+
+    /// Submit a password and have the helper answer `ok`.
+    fn attempt(entry: &mut Entry, ok: bool, now: Instant) {
+        type_text(entry, "pw", now);
+        assert!(entry.press(Key::Enter, 4, now));
+        assert!(entry.checked(ok, now));
+    }
+
+    #[test]
+    fn every_fifth_failure_in_a_row_starts_a_cooldown() {
+        let (mut entry, now) = entry();
+        for _ in 0..4 {
+            attempt(&mut entry, false, now);
+            assert_eq!(entry.look().status, Status::Failed);
+        }
+        attempt(&mut entry, false, now);
+        assert_eq!(entry.look().status, Status::Cooldown);
+        assert_eq!(entry.deadline(), Some(now + COOLDOWN));
+
+        // Keys type nothing and submit nothing until it ends.
+        for key in [Key::Char('x'), Key::Backspace, Key::Escape, Key::Enter] {
+            assert!(!entry.press(key, 5, now));
+        }
+        assert_eq!(entry.bytes(), b"");
+        assert_eq!(entry.deadline(), Some(now + COOLDOWN));
+        entry.tick(now + COOLDOWN - Duration::from_millis(1));
+        assert_eq!(entry.look().status, Status::Cooldown);
+        let now = now + COOLDOWN;
+        entry.tick(now);
+        assert_eq!(entry.look().status, Status::Idle);
+        assert_eq!(entry.deadline(), None);
+
+        // The count goes on: the tenth failure in a row starts another.
+        for _ in 0..4 {
+            attempt(&mut entry, false, now);
+            assert_eq!(entry.look().status, Status::Failed);
+        }
+        attempt(&mut entry, false, now);
+        assert_eq!(entry.look().status, Status::Cooldown);
+    }
+
+    #[test]
+    fn a_success_resets_the_failures() {
+        let (mut entry, now) = entry();
+        for _ in 0..4 {
+            attempt(&mut entry, false, now);
+        }
+        attempt(&mut entry, true, now);
+        for _ in 0..4 {
+            attempt(&mut entry, false, now);
+            assert_eq!(entry.look().status, Status::Failed);
+        }
+        attempt(&mut entry, false, now);
+        assert_eq!(entry.look().status, Status::Cooldown);
+    }
+
+    #[test]
+    fn a_reset_ends_a_cooldown_and_the_failures() {
+        // A reset is what an unlock (logind's or the password's) and a new lock do.
+        let (mut entry, now) = entry();
+        for _ in 0..5 {
+            attempt(&mut entry, false, now);
+        }
+        entry.reset();
+        assert_eq!(entry.look().status, Status::Idle);
+        assert_eq!(entry.deadline(), None);
+        for _ in 0..4 {
+            attempt(&mut entry, false, now);
+        }
+        entry.reset();
+        attempt(&mut entry, false, now);
+        assert_eq!(entry.look().status, Status::Failed);
     }
 
     #[test]

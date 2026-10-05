@@ -28,6 +28,8 @@
 #  10. caps lock shows its bar
 #  11. the `--auth` helper exits 0 only for the right password; the daemon is not
 #      dumpable; no password reaches the journal
+#  12. the fifth wrong password in a row starts a 30 s cooldown: the field turns
+#      grey and Enter checks nothing; after it, the right password unlocks
 
 { pkgs, idleManager }:
 
@@ -103,6 +105,7 @@ pkgs.testers.runNixOSTest {
     CHECKING = ["30", "70", "c0"]
     FAILED = ["c0", "30", "30"]
     CAPS_LOCK = ["e0", "a0", "20"]
+    COOLDOWN = ["58", "58", "58"]
 
     def uctl(cmd):
         return machine.succeed(PREFIX + cmd)
@@ -127,11 +130,11 @@ pkgs.testers.runNixOSTest {
         """The colour at (x, y) in the layout, as three hex bytes."""
         return uctl(f"WAYLAND_DISPLAY={display} grim -g '{x},{y} 1x1' -t ppm - | tail -c 3 | od -An -tx1").split()
 
-    def wait_for_pixel(want, x=5, y=5):
+    def wait_for_pixel(want, x=5, y=5, timeout=10):
         machine.wait_until_succeeds(
             PREFIX + f"WAYLAND_DISPLAY={display} grim -g '{x},{y} 1x1' -t ppm - | tail -c 3"
             + f" | od -An -tx1 | grep -qx ' {' '.join(want)}'",
-            timeout=10,
+            timeout=timeout,
         )
 
     def wait_briefly_for_pixel(want, x, y):
@@ -373,6 +376,36 @@ pkgs.testers.runNixOSTest {
         wait_for_pixel(CAPS_LOCK, *caps_bar)
         wait_for_pixel(LOCK, *caps_bar)
         unlock()
+
+    with subtest("five wrong passwords in a row start a cooldown"):
+        lock()
+        for i in range(5):
+            since = cursor()
+            type_file("/etc/wrong-password")
+            wtype("-k Return")
+            wait_for_log(since, "password rejected")
+        wait_for_log(since, "5 wrong passwords; waiting 30 s")
+        started = log_time(since, "5 wrong passwords")
+        wait_for_pixel(COOLDOWN, *centre)
+        # Typing does nothing: no dots, and Enter checks nothing.
+        since = cursor()
+        type_file("/etc/right-password")
+        wtype("-k Return")
+        machine.sleep(1)
+        assert "checking the password" not in journal(since)
+        assert pixel(*centre) == COOLDOWN
+        # Still grey 28–29 s in: the cooldown really lasts about 30 s, not just "a while".
+        machine.sleep(max(0, int(started + 28 - float(machine.succeed("date +%s.%N"))) + 1))
+        assert pixel(*centre) == COOLDOWN, "the cooldown ended before 28 s"
+        wait_for_pixel(FIELD, *centre, timeout=40)
+        ended = float(machine.succeed("date +%s.%N"))
+        machine.log(f"cooldown over after at most {ended - started:.1f} s")
+        assert ended - started >= 30
+        since = cursor()
+        type_file("/etc/right-password")
+        wtype("-k Return")
+        wait_for_log(since, "password accepted")
+        wait_for_pixel(DESKTOP)
 
     with subtest("the helper checks the password; the daemon keeps it private"):
         helper = "${idleManager}/bin/rust-wl-idle-manager --auth"

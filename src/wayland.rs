@@ -176,7 +176,8 @@ impl Wayland {
             let Some(guard) = self.queue.prepare_read() else {
                 continue;
             };
-            // The lock screen's timers: key repeat, the failure shown, forgetting the password.
+            // The lock screen's timers: key repeat, the failure shown, the cooldown, forgetting
+            // the password.
             let deadline = self.state.entry.deadline();
             let mut ready = tokio::select! {
                 ready = self.fd.readable() => ready.context("waiting for the Wayland compositor")?,

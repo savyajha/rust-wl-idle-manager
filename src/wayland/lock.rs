@@ -26,12 +26,14 @@ const fn xrgb(rgb: u32) -> [u8; 4] {
 }
 
 const BACKGROUND: [u8; 4] = xrgb(0x203040);
-/// The password field, idle or typing; its dots; checking; failed; the caps lock bar.
+/// The password field, idle or typing; its dots; checking; failed; the caps lock bar;
+/// the field during a cooldown (grey, as if disabled).
 const FIELD: [u8; 4] = xrgb(0x304860);
 const DOT: [u8; 4] = xrgb(0xe0e8f0);
 const CHECKING: [u8; 4] = xrgb(0x3070c0);
 const FAILED: [u8; 4] = xrgb(0xc03030);
 const CAPS_LOCK: [u8; 4] = xrgb(0xe0a020);
+const COOLDOWN: [u8; 4] = xrgb(0x585858);
 
 /// The password field's width and height, centred on each output, in pixels.
 const FIELD_SIZE: (usize, usize) = (300, 50);
@@ -204,6 +206,7 @@ fn draw(
         Status::Idle | Status::Typing => FIELD,
         Status::Checking => CHECKING,
         Status::Failed => FAILED,
+        Status::Cooldown => COOLDOWN,
     };
     fill(pixels, w, (x, y, field_w, field_h), field);
     let dots = look.chars.min(MAX_DOTS);

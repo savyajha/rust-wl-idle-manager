@@ -200,18 +200,19 @@ Backspace and characters repeat at the compositor's rate and delay. Binding
 the seat below version 10 keeps the compositor from repeating keys itself;
 the entry keeps its own timers instead, and `Wayland::next` waits on the
 nearest of them alongside the Wayland socket: the next key repeat, the end of
-a failure display, and forgetting the password. A repeated character is the
-password's last character typed again, so no copy of it is kept for
-repeating.
+a failure display or of a cooldown, and forgetting the password. A repeated
+character is the password's last character typed again, so no copy of it is
+kept for repeating.
 
 The password field is drawn without text: a rectangle in the middle of each
 output, with a square dot per character (at most 14 shown). Its colour shows
 the state: the usual colour while idle or typing, blue while the password is
-being checked, red for 1.5 s after a failure (or until the next key). A
-yellow bar below it shows that caps lock is on. Each time `Wayland::next`
-goes round, it compares this state with what is shown, and redraws every
-surface, in full, only if it changed. The entry's state machine, `Entry`, is
-pure, with the time passed in, and unit-tested.
+being checked, red for 1.5 s after a failure (or until the next key), grey
+during a cooldown. A yellow bar below it shows that caps lock is on. Each
+time `Wayland::next` goes round, it compares this state with what is shown,
+and redraws every surface, in full, only if it changed. The entry's state
+machine, `Entry`, does no I/O apart from one log line when a cooldown starts;
+the time is passed in, and it is unit-tested.
 
 ### Checking the password
 
@@ -229,6 +230,18 @@ The daemon unlocks only on the exit status of its own child. It waits for
 it at most 10 s, then kills it and counts a failure. One check runs at a
 time; a new one replaces (and kills) one left from a lock that has since
 ended, and an answer that arrives after its lock ended is ignored.
+
+After every fifth failed attempt in a row, a 30 s cooldown follows, in
+which keys do nothing and no password is taken. The count is kept only in
+`Entry`'s memory: it resets on a right password, on any unlock and when a
+lock starts, and is never saved. With pam_unix's delay, guessing runs at
+about 30 attempts a minute; the cooldown slows sustained guessing without
+any way to lock the user out. `pam_faillock` is deliberately not used:
+with a lock screen, it can lock the account so that the lock screen itself
+cannot unlock it, and recovering needs a TTY and root. The cooldown's
+deadline uses the same clock as the entry's other timers, `Instant`
+(`CLOCK_MONOTONIC`), which stops during suspend, so a cooldown that spans a
+suspend lasts longer; that is harmless.
 
 PAM runs in a separate process for each attempt, rather than on a thread of
 the daemon, because a PAM conversation blocks and PAM modules keep their
