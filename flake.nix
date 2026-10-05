@@ -21,6 +21,7 @@
               pkgs.cargo
             ]
             ++ tools;
+            inherit (self.packages.${system}.rust-wl-idle-manager) buildInputs;
             buildPhase = command;
             installPhase = "touch $out";
             dontFixup = true;

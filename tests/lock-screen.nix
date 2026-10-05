@@ -5,7 +5,8 @@
 # with its own ext-session-lock-v1 surfaces. sway sends `locked` as soon as it
 # accepts the lock, before anything is drawn, so the test checks the screen's
 # pixels with grim: the desktop is green, the lock screen #203040, and sway paints
-# an output red while the session is locked by a client that died.
+# an output red while the session is locked by a client that died. Keys are typed
+# with wtype, through the virtual-keyboard protocol.
 #
 # Behaviours asserted:
 #   1. an idle `lock` covers the output with the lock screen; logind unlock
@@ -21,12 +22,20 @@
 #   6. the daemon killed while locked leaves the session locked; restarted, it
 #      finds LockedHint set and locks again, without any user action
 #   7. sleep waits until the lock screen has locked
+#   8. a wrong password shows "checking", then "failed", and stays locked; the
+#      right one unlocks; Enter-to-unlocked latency is logged
+#   9. Escape clears the password, and Enter with none checks nothing
+#  10. caps lock shows its bar
+#  11. the `--auth` helper exits 0 only for the right password; the daemon is not
+#      dumpable; no password reaches the journal
 
 { pkgs, idleManager }:
 
 let
   user = "alice";
   uid = 1000;
+  password = "correct horse";
+  wrongPassword = "wrong guess";
   runtimeDir = "/run/user/${toString uid}";
 
   config = pkgs.writeText "idle.kdl" ''
@@ -40,6 +49,7 @@ let
       Type = "simple";
       ExecStart = "${idleManager}/bin/rust-wl-idle-manager --config ${config}";
       Restart = "on-failure";
+      LimitCORE = 0;
       # Long enough for the test to see the session left locked by the killed daemon.
       RestartSec = 3;
     };
@@ -51,12 +61,14 @@ pkgs.testers.runNixOSTest {
   nodes.machine = { pkgs, ... }: {
     users.users.${user} = {
       isNormalUser = true;
-      inherit uid;
+      inherit uid password;
     };
     services.getty.autologinUser = user;
     security.polkit.enable = true;
+    # The lock screen's PAM service: NixOS's default stack (pam_unix via unix_chkpwd).
+    security.pam.services.rust-wl-idle-manager = { };
 
-    environment.systemPackages = [ pkgs.sway pkgs.grim ];
+    environment.systemPackages = [ pkgs.sway pkgs.grim pkgs.wtype ];
 
     systemd.user.services.sway = {
       description = "Headless sway";
@@ -86,6 +98,11 @@ pkgs.testers.runNixOSTest {
     LOCK = ["20", "30", "40"]
     DESKTOP = ["00", "ff", "00"]
     ABANDONED = ["ff", "00", "00"]
+    FIELD = ["30", "48", "60"]
+    DOT = ["e0", "e8", "f0"]
+    CHECKING = ["30", "70", "c0"]
+    FAILED = ["c0", "30", "30"]
+    CAPS_LOCK = ["e0", "a0", "20"]
 
     def uctl(cmd):
         return machine.succeed(PREFIX + cmd)
@@ -116,6 +133,25 @@ pkgs.testers.runNixOSTest {
             + f" | od -An -tx1 | grep -qx ' {' '.join(want)}'",
             timeout=10,
         )
+
+    def wait_briefly_for_pixel(want, x, y):
+        """Poll quickly, for a colour shown only for a moment."""
+        for _ in range(100):
+            if pixel(x, y) == want:
+                return
+        assert False, f"never saw {want} at ({x}, {y}); last {pixel(x, y)}"
+
+    def wtype(args):
+        uctl(f"WAYLAND_DISPLAY={display} wtype {args}")
+
+    def type_file(path):
+        """Type a file's text: no password appears on a command line (sudo logs those)."""
+        uctl(f"sh -c 'WAYLAND_DISPLAY={display} wtype - < {path}'")
+
+    def log_time(since, text):
+        """When the first line containing `text` after `since` was logged, in seconds."""
+        out = machine.succeed(f"journalctl --no-pager -o short-unix -t rust-wl-idle-manager --after-cursor='{since}'")
+        return float(next(line for line in out.splitlines() if text in line).split()[0])
 
     def latencies(since):
         """The (drawn, locked) latencies in ms that the lock after `since` logged."""
@@ -170,6 +206,16 @@ pkgs.testers.runNixOSTest {
     display = machine.succeed("basename ${runtimeDir}/wayland-?").strip()
     uctl(f"systemctl --user set-environment WAYLAND_DISPLAY={display}")
     wait_for_pixel(DESKTOP)
+    # A persistent virtual keyboard, so the seat always has one (as a laptop does);
+    # otherwise each wtype adds the capability and its keys race the daemon's keymap.
+    uctl(f"systemd-run --user --unit=keyboard -E WAYLAND_DISPLAY={display} ${pkgs.wtype}/bin/wtype -s 3600000")
+    # Root writes the passwords to files, so that no command line carries them.
+    machine.succeed("printf %s '${password}' > /etc/right-password")
+    machine.succeed("printf %s '${wrongPassword}' > /etc/wrong-password")
+    output = [o for o in json.loads(swaymsg("-t get_outputs")) if o["name"] == "HEADLESS-1"][0]["rect"]
+    # The password field's centre (the middle dot of an odd count), and its caps lock bar.
+    centre = (output["x"] + output["width"] // 2, output["y"] + output["height"] // 2)
+    caps_bar = (centre[0], centre[1] + 25 + 10 + 3)
 
     with subtest("an idle lock shows the lock screen; logind unlock removes it"):
         since = cursor()
@@ -282,5 +328,60 @@ pkgs.testers.runNixOSTest {
         wait_for_log(since, "back from sleep", timeout=60)
         wait_for_pixel(LOCK)
         unlock()
+
+    with subtest("a wrong password fails; the right one unlocks"):
+        lock()
+        wait_for_pixel(FIELD, *centre)
+        since = cursor()
+        type_file("/etc/wrong-password")
+        wait_for_pixel(DOT, *centre)
+        wtype("-k Return")
+        wait_for_log(since, "checking the password")
+        # pam_unix delays a failure by about 2 s; then the failure shows for 1.5 s.
+        wait_briefly_for_pixel(CHECKING, *centre)
+        wait_briefly_for_pixel(FAILED, *centre)
+        wait_for_log(since, "password rejected")
+        assert pixel(5, 5) == LOCK
+        wait_for_pixel(FIELD, *centre)
+        assert main_pid() == pid, "the daemon restarted"
+        since = cursor()
+        type_file("/etc/right-password")
+        wtype("-k Return")
+        wait_for_log(since, "password accepted")
+        wait_for_log(since, f"session {session} not locked")
+        wait_for_pixel(DESKTOP)
+        unlock_ms = (log_time(since, "not locked") - log_time(since, "checking the password")) * 1000
+        machine.log(f"Enter to unlocked: {unlock_ms:.1f} ms")
+
+    with subtest("Escape clears the password; Enter with none checks nothing"):
+        since = lock()
+        wtype("abc")
+        wait_for_pixel(DOT, *centre)
+        wtype("-k Escape")
+        wait_for_pixel(FIELD, *centre)
+        wtype("-k Return")
+        machine.sleep(1)
+        assert "checking the password" not in journal(since)
+        assert pixel(*centre) == FIELD
+        unlock()
+
+    with subtest("caps lock shows its bar"):
+        lock()
+        assert pixel(*caps_bar) == LOCK
+        # Caps lock held (not toggled) for 3 s: wtype sends it as a depressed modifier.
+        uctl(f"systemd-run --user --unit=caps-lock -E WAYLAND_DISPLAY={display} ${pkgs.wtype}/bin/wtype -M capslock -s 3000 -m capslock")
+        wait_for_pixel(CAPS_LOCK, *caps_bar)
+        wait_for_pixel(LOCK, *caps_bar)
+        unlock()
+
+    with subtest("the helper checks the password; the daemon keeps it private"):
+        helper = "${idleManager}/bin/rust-wl-idle-manager --auth"
+        uctl(f"sh -c '{helper} < /etc/right-password'")
+        machine.fail(PREFIX + f"sh -c '{helper} < /etc/wrong-password'")
+        machine.fail(PREFIX + f"sh -c '{helper} < /dev/null'")
+        # Not dumpable: the daemon's /proc files belong to root.
+        machine.fail(PREFIX + f"ls /proc/{pid}/fd")
+        machine.succeed(f"ls /proc/{pid}/fd")
+        machine.fail("journalctl --no-pager -o cat | grep -F -e '${password}' -e '${wrongPassword}'")
   '';
 }

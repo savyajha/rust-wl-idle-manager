@@ -1,5 +1,7 @@
+mod auth;
 mod config;
 mod logind;
+mod password;
 mod policy;
 mod systemd;
 mod wayland;
@@ -35,10 +37,20 @@ const LOCK_WAIT: Duration = Duration::from_secs(4);
 /// The error when a system bus stream ends.
 const BUS_LOST: &str = "lost the system bus";
 
-/// The path from exactly `--config <path>`, or `None` for any other arguments.
-fn parse_args(mut args: impl Iterator<Item = OsString>) -> Option<PathBuf> {
+/// What the command line asks for.
+#[derive(Debug, PartialEq)]
+enum Mode {
+    /// `--config <path>`: run the daemon.
+    Daemon(PathBuf),
+    /// `--auth`: check the password on stdin (the lock screen's helper).
+    Auth,
+}
+
+/// The mode from exactly `--config <path>` or `--auth`, or `None` for any other arguments.
+fn parse_args(mut args: impl Iterator<Item = OsString>) -> Option<Mode> {
     match (args.next(), args.next(), args.next()) {
-        (Some(flag), Some(path), None) if flag == "--config" => Some(path.into()),
+        (Some(flag), Some(path), None) if flag == "--config" => Some(Mode::Daemon(path.into())),
+        (Some(flag), None, None) if flag == "--auth" => Some(Mode::Auth),
         _ => None,
     }
 }
@@ -78,6 +90,9 @@ fn log_input(input: Input, session: &str, timeouts: &[(Duration, bool)]) {
         Input::PrepareForSleep(true) => info!("preparing for sleep"),
         Input::PrepareForSleep(false) => info!("back from sleep"),
         Input::LockWaitTimedOut => info!("lock wait timed out; releasing the sleep inhibitor"),
+        Input::PasswordEntered => info!("checking the password"),
+        Input::Authenticated(true) => info!("password accepted"),
+        Input::Authenticated(false) => info!("password rejected"),
     }
 }
 
@@ -93,6 +108,8 @@ struct Runner {
     inhibitor: Option<OwnedFd>,
     /// When the wait for the lock before sleep runs out, while waiting.
     lock_wait: Option<Instant>,
+    /// The password check under way.
+    attempt: Option<auth::Attempt>,
 }
 
 impl Runner {
@@ -152,6 +169,25 @@ impl Runner {
                     error!("spawn unit {unit} already exists; not running {line}");
                 }
             }
+            // A new attempt replaces (and kills) any left from a lock that has ended.
+            Command::Authenticate => {
+                let entry = wayland.entry_mut();
+                // Dropping the submission wipes the password, on every path.
+                let password = entry.submission();
+                // Nothing is submitted any more after a reset, such as an unlock.
+                if password.bytes().is_empty() {
+                    return Ok(());
+                }
+                let started = auth::start(password.bytes()).await;
+                drop(password);
+                match started {
+                    Ok(attempt) => self.attempt = Some(attempt),
+                    Err(e) => {
+                        entry.checked(false, std::time::Instant::now());
+                        return Err(e).context("starting the authentication helper");
+                    }
+                }
+            }
             Command::Suspend => {
                 info!("suspending");
                 self.logind.suspend(false).await.context("suspending")?;
@@ -172,8 +208,10 @@ impl Runner {
                 self.lock_wait = Some(Instant::now() + LOCK_WAIT);
             }
             // Clearing the deadline matters: tokio's clock stops during sleep, so a timer
-            // left over would release the next sleep's inhibitor early.
+            // left over would release the next sleep's inhibitor early. A password typed
+            // on the lock screen is wiped before sleep, which may end in hibernation.
             Command::ReleaseSleepInhibitor => {
+                wayland.entry_mut().wipe();
                 self.lock_wait = None;
                 if self.inhibitor.take().is_some() {
                     info!("sleep inhibitor released");
@@ -240,6 +278,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         spawned: 0,
         inhibitor: Some(inhibitor),
         lock_wait: None,
+        attempt: None,
     };
     info!(
         "watching {} timeouts from {} in session {session_id}",
@@ -283,6 +322,13 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                     });
                 Input::LidClosed(closed && !docked)
             }
+            ok = auth::finished(&mut runner.attempt) => {
+                // An answer for a lock that has ended since is dropped.
+                if !wayland.entry_mut().checked(ok, std::time::Instant::now()) {
+                    continue;
+                }
+                Input::Authenticated(ok)
+            }
             () = time::sleep_until(runner.lock_wait.unwrap_or_else(Instant::now)),
                 if runner.lock_wait.is_some() =>
             {
@@ -300,15 +346,30 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    let Some(config_path) = parse_args(env::args_os().skip(1)) else {
-        eprintln!("usage: rust-wl-idle-manager --config <path>");
-        return ExitCode::from(2);
-    };
+fn main() -> ExitCode {
+    // No core dumps, and no ptrace or /proc/PID/mem by other processes of the user: the
+    // daemon holds the typed password, the helper a copy. Both take this path.
+    // SAFETY: PR_SET_DUMPABLE takes only integer arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        eprintln!("prctl(PR_SET_DUMPABLE, 0): {}", io::Error::last_os_error());
+    }
+    let mode = parse_args(env::args_os().skip(1));
     init_logging();
+    match mode {
+        Some(Mode::Daemon(config_path)) => daemon(&config_path),
+        // The helper needs no runtime.
+        Some(Mode::Auth) => auth::helper(),
+        None => {
+            eprintln!("usage: rust-wl-idle-manager --config <path>");
+            ExitCode::from(2)
+        }
+    }
+}
 
-    match run(&config_path).await {
+/// Run the daemon until SIGTERM or an error.
+#[tokio::main(flavor = "current_thread")]
+async fn daemon(config_path: &Path) -> ExitCode {
+    match run(config_path).await {
         Ok(()) => {
             info!("SIGTERM received, exiting");
             ExitCode::SUCCESS
@@ -325,9 +386,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_config_with_a_path_parses() {
+    fn only_config_with_a_path_or_auth_parses() {
         let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
-        assert_eq!(parse(&["--config", "a"]), Some(PathBuf::from("a")));
+        assert_eq!(
+            parse(&["--config", "a"]),
+            Some(Mode::Daemon(PathBuf::from("a")))
+        );
+        assert_eq!(parse(&["--auth"]), Some(Mode::Auth));
+        assert_eq!(parse(&["--auth", "x"]), None);
         assert_eq!(parse(&[]), None);
         assert_eq!(parse(&["--config"]), None);
         assert_eq!(parse(&["--bogus", "x"]), None);

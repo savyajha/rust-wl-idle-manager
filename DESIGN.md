@@ -114,9 +114,9 @@ inhibitor early.
 The inhibitor fd is close-on-exec, so no program the daemon executed could
 inherit it. zbus receives file descriptors without `MSG_CMSG_CLOEXEC`, but
 zvariant hands back a duplicate made with `F_DUPFD_CLOEXEC`; the original
-closes with the reply message. Nothing is executed by the daemon itself
-today, since commands run as systemd units, but the fd stays private either
-way.
+closes with the reply message. The only program the daemon executes itself
+is its authentication helper (commands run as systemd units), and the fd
+stays out of it.
 
 ### Re-creating notifications
 
@@ -137,8 +137,9 @@ within milliseconds. smithay-client-toolkit tracks the outputs and
 provides the session lock and shared-memory buffers.
 
 A lock request creates the lock and one lock surface per output. When the
-compositor configures a surface with its size, the surface is filled with one
-colour and committed; for now the lock screen shows nothing else. Buffers come
+compositor configures a surface with its size, it is drawn and committed: a
+plain background with the password field in the middle (see below); for now
+the lock screen shows nothing else. Buffers come
 from one shared-memory pool, kept between locks. While unlocked, whenever an
 output appears or changes, the pool is grown to hold a lock surface for every
 output (from its logical size) and the background is drawn into it once, so
@@ -152,10 +153,12 @@ after the requests are flushed, so logging never delays a commit.
 The `locked` event tells the policy the session is locked. niri sends it once
 every output shows a lock surface; sway sends it as soon as it accepts the
 lock. The lock ends with `unlock_and_destroy` and the surfaces are destroyed,
-and the policy hears the session is unlocked. Only a logind unlock request
-unlocks it. If that request comes before `locked`, the lock ends as soon as
-`locked` arrives, since destroying a lock the compositor has already locked is
-a protocol error.
+and the policy hears the session is unlocked. Only two things unlock it: the
+right password (the helper exiting with 0) and a logind unlock request. Not
+`resumed`, a signal, or the daemon dying. Either way the policy turns it into
+the same unlock command. If it comes before `locked`, the lock ends as soon
+as `locked` arrives, since destroying a lock the compositor has already
+locked is a protocol error.
 
 The compositor sends `finished` when it refuses the lock, for instance
 because another client holds a live lock, or ends it. The daemon logs it,
@@ -176,6 +179,102 @@ screen and a new lock, never an unlock.
 
 Without a `locker`, a compositor that lacks `ext-session-lock-v1` is an error
 at startup.
+
+### Keyboard and password field
+
+The seat is bound once, at most at version 9, and serves both the idle
+notifications and the keyboard. With the built-in lock screen, the first
+keyboard the seat offers is taken, and handled directly: its keymap is
+compiled by xkbcommon (mapped read-only from the compositor's fd), and its
+modifiers update the xkbcommon state. Keys act only while a lock exists: the
+lock surfaces are the daemon's only surfaces, so it never sees keys meant for
+anything else. Enter submits the password, Backspace deletes one character
+and Escape clears it, each recognised by its keysym. Any other key types the
+character xkbcommon gives for it as UTF-32 (`key_get_utf32`), so any layout
+works, unless it is a control character (as with Ctrl held) or Alt or Logo is
+held. There is no compose table, so a dead key types nothing. While a
+password is being checked, keys do nothing, and an empty password is never
+submitted.
+
+Backspace and characters repeat at the compositor's rate and delay. Binding
+the seat below version 10 keeps the compositor from repeating keys itself;
+the entry keeps its own timers instead, and `Wayland::next` waits on the
+nearest of them alongside the Wayland socket: the next key repeat, the end of
+a failure display, and forgetting the password. A repeated character is the
+password's last character typed again, so no copy of it is kept for
+repeating.
+
+The password field is drawn without text: a rectangle in the middle of each
+output, with a square dot per character (at most 14 shown). Its colour shows
+the state: the usual colour while idle or typing, blue while the password is
+being checked, red for 1.5 s after a failure (or until the next key). A
+yellow bar below it shows that caps lock is on. Each time `Wayland::next`
+goes round, it compares this state with what is shown, and redraws every
+surface, in full, only if it changed. The entry's state machine, `Entry`, is
+pure, with the time passed in, and unit-tested.
+
+### Checking the password
+
+On Enter, the daemon starts its helper, `rust-wl-idle-manager --auth` (from
+`/proc/self/exe`, so it is the same binary even if the file has been replaced),
+writes the password to the helper's stdin pipe and closes it. The helper
+reads it into a fixed buffer, runs PAM's `pam_authenticate` for the user it
+runs as, with the service `rust-wl-idle-manager`, wipes the buffer, and
+exits with 0 on success and 1 otherwise. Like GDM's reauthentication, a
+failing `pam_acct_mgmt` (such as an expired password) is logged but does not
+fail the check, so the lock screen can never lock its user out. pam_unix
+already delays a failure by about 2 s, so there is no extra delay.
+
+The daemon unlocks only on the exit status of its own child. It waits for
+it at most 10 s, then kills it and counts a failure. One check runs at a
+time; a new one replaces (and kills) one left from a lock that has since
+ended, and an answer that arrives after its lock ended is ignored.
+
+PAM runs in a separate process for each attempt, rather than on a thread of
+the daemon, because a PAM conversation blocks and PAM modules keep their
+own copies of the password; all of it dies with the helper. It costs about
+3 ms per attempt (process start and loading libpam), next to the
+`unix_chkpwd` process pam_unix starts anyway. The binary links
+libpam, so it is mapped in the daemon too, but only the helper calls it: PAM
+is reached only from `--auth`, which `main` handles before the daemon's
+runtime is even built.
+
+### Protecting the password
+
+The typed password necessarily lives in the daemon, which receives the
+keystrokes. It is handled like this:
+
+- It is kept in one 1 KiB buffer, page-aligned, allocated once at startup and
+  never moved or grown. Typing past its end is ignored.
+- The buffer is locked in memory with `mlock`, so it is never swapped out.
+  If that is refused (`RLIMIT_MEMLOCK`), a warning is logged once and the
+  buffer is used anyway.
+- It is wiped, with volatile writes the compiler cannot remove, as soon as
+  the helper has its copy (the password is handed out in a guard that wipes
+  it when dropped, on every path), after every answer, on Escape, on unlock,
+  when a lock starts, after 30 s without typing, and before sleep, since the
+  machine may go on to hibernate. The sleep wipe is attached to releasing the
+  sleep inhibitor: every `PrepareForSleep(true)` path ends in that release
+  (the policy's tests prove it), and sleep cannot start before it.
+- A typed character goes from xkbcommon (`key_get_utf32`) straight into the
+  buffer, never through a `String`.
+- At startup the daemon and the helper make themselves non-dumpable
+  (`prctl(PR_SET_DUMPABLE, 0)`): no core dumps, and other processes of the
+  user cannot ptrace them or read their memory; their `/proc/PID` files
+  belong to root. The unit should also set `LimitCORE=0`.
+- The buffer prints nothing as `Debug`, keys are not `Debug`, and nothing
+  derived from the password is logged or put in an error.
+- The helper gets the password only on its stdin pipe, never in its
+  arguments or environment, and reads it unbuffered into its own fixed
+  buffer, which it wipes before exiting normally. A panic or a kill ends it
+  without that wipe; its memory goes with the process.
+
+This does not protect against root or the kernel, against anything that can
+read the keystrokes on their way through the compositor and the Wayland
+socket, or against memory written to a hibernation image before the wipe
+before sleep. Raw keycodes stay in wayland-backend's receive buffers until
+overwritten (swaylock shares this limit), and the copy nonstick makes for
+PAM in the helper is not wiped.
 
 ## Running commands
 
@@ -228,8 +327,11 @@ to accept the request, not for the program to finish.
 The daemon runs on a single-threaded tokio runtime. Its one Wayland
 connection's file descriptor is registered with tokio through `AsyncFd`, and
 events are read with wayland-client's `prepare_read` and `read`, so no second
-event loop or thread is needed. Requests are flushed after every dispatch and
-right after a lock request, so a lock never waits for other work. D-Bus goes
+event loop or thread is needed. While it waits for the socket it also waits
+for the lock screen's nearest timer (key repeat and the like). The
+authentication helper is a tokio child process, awaited in the main loop.
+Requests are flushed after every dispatch and right after a lock request, so
+a lock never waits for other work. D-Bus goes
 through zbus on the same runtime. Inputs from the Wayland queue are taken
 before those from D-Bus: an unlock queues the lock screen's `Locked(false)`
 as it runs, and it must reach the policy before a lock request, which the
@@ -253,3 +355,4 @@ as structured fields, because `journalctl` shows only the message by default.
 rust-wl-idle-manager exits with 0 on SIGTERM and 1 on any error. Each error is
 logged once; on compositor loss, wayland-backend also prints its own line to
 stderr, which reaches the journal. Command-line usage errors exit with 2.
+The `--auth` helper exits with 0 for the right password and 1 otherwise.

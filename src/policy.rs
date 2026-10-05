@@ -2,7 +2,7 @@ use std::mem;
 
 use crate::config::{Action, Timeout};
 
-/// Something that happened, from Wayland or logind.
+/// Something that happened, from Wayland, logind or the authentication helper.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {
     /// The timeout at this index became idle (ext-idle-notify `idled`).
@@ -27,6 +27,10 @@ pub enum Input {
     PrepareForSleep(bool),
     /// The wait for the lock before sleep timed out.
     LockWaitTimedOut,
+    /// A password was typed on the lock screen and Enter pressed.
+    PasswordEntered,
+    /// Whether the authentication helper accepted the password.
+    Authenticated(bool),
 }
 
 /// What the I/O shell should do.
@@ -45,6 +49,8 @@ pub enum Command {
     Hibernate,
     /// Run this argv.
     Spawn(Vec<String>),
+    /// Check the lock screen's password with the authentication helper.
+    Authenticate,
     /// Start the timer that ends in `Input::LockWaitTimedOut` (about 4 s, chosen by the shell).
     WaitForLock,
     /// Let sleep go ahead, and stop waiting for the lock.
@@ -110,8 +116,10 @@ impl Policy {
                 None
             }
             Input::LockRequested => self.lock(),
-            // Unlocking when not locked does nothing; nothing else can be unlocked.
+            // Unlocking when not locked does nothing. Only these two unlock.
             Input::UnlockRequested => Some(Command::Unlock),
+            Input::Authenticated(ok) => ok.then_some(Command::Unlock),
+            Input::PasswordEntered => Some(Command::Authenticate),
             Input::Locked(locked) => {
                 self.locked = locked;
                 if locked { self.release() } else { None }
@@ -330,6 +338,15 @@ mod tests {
         assert_eq!(policy.handle(Input::UnlockRequested), vec![Unlock]);
         policy.handle(Input::Locked(true));
         assert_eq!(policy.handle(Input::UnlockRequested), vec![Unlock]);
+    }
+
+    #[test]
+    fn only_a_right_password_unlocks() {
+        let mut policy = policy();
+        policy.handle(Input::Locked(true));
+        assert_eq!(policy.handle(Input::PasswordEntered), vec![Authenticate]);
+        assert_eq!(policy.handle(Input::Authenticated(false)), vec![]);
+        assert_eq!(policy.handle(Input::Authenticated(true)), vec![Unlock]);
     }
 
     #[test]

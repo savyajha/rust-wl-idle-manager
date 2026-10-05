@@ -1,6 +1,8 @@
 {
   lib,
   rustPlatform,
+  libxkbcommon,
+  linux-pam,
 }:
 
 rustPlatform.buildRustPackage {
@@ -10,6 +12,12 @@ rustPlatform.buildRustPackage {
   src = ./.;
 
   cargoLock.lockFile = ./Cargo.lock;
+
+  # xkbcommon decodes the keyboard; PAM is called only by the `--auth` helper.
+  buildInputs = [
+    libxkbcommon
+    linux-pam
+  ];
 
   meta = with lib; {
     description = "Idle daemon for Wayland compositors, built for niri";

@@ -4,8 +4,8 @@ An idle daemon for Wayland compositors, meant to replace hypridle.
 
 > **Early work in progress.** It locks, runs commands, and suspends after
 > idle timeouts, follows logind's lock, unlock and sleep requests, and
-> honours logind idle inhibitors. Its built-in lock screen has no password
-> entry yet, so it still needs an external `locker`.
+> honours logind idle inhibitors. Its built-in lock screen unlocks with your
+> password, but is still plain: no clock, wallpaper or text yet.
 
 > **Please read before using**
 >
@@ -47,12 +47,28 @@ such as a playing video. Unknown nodes and properties are rejected.
 
 `locker` names the program that locks the session. Without it, the daemon
 locks with its own lock screen, through `ext-session-lock-v1`, which the
-compositor must support. The built-in lock screen is **not usable yet**: it
-covers every output with a plain colour and has no password entry, so only
-`loginctl unlock-session` unlocks it. If the daemon dies while locked, the
-session stays locked, and on its next start the daemon locks again (the
-compositor lets the new lock replace the dead one), so the unit should
-restart it on failure.
+compositor must support. The built-in lock screen covers every output with a
+plain colour and a password field: type your password and press Enter
+(Backspace deletes a character, Escape clears it). The field shows a dot per
+character, turns blue while the password is checked and red when it was
+wrong, and a yellow bar below it means caps lock is on. Only the right
+password or `loginctl unlock-session` unlocks it. If the daemon dies while
+locked, the session stays locked, and on its next start the daemon locks
+again (the compositor lets the new lock replace the dead one), so the unit
+should restart it on failure.
+
+The password is checked with PAM, as the PAM service `rust-wl-idle-manager`,
+by a short-lived helper process (the same binary, run as
+`rust-wl-idle-manager --auth`). The service must exist. On NixOS, add this to
+the **system** configuration:
+
+```nix
+security.pam.services.rust-wl-idle-manager = { };
+```
+
+Elsewhere, create `/etc/pam.d/rust-wl-idle-manager`, for instance with
+`auth include login`. Layouts that need dead keys or compose sequences to type
+the password's characters are not supported yet.
 
 Besides the timeouts, it follows the user's logind session:
 
@@ -91,6 +107,30 @@ grants one to an unprivileged user through polkit, so polkit must be running.
 Suspending and hibernating go through logind, so the user must be allowed to
 do so without a password (as in a local graphical session).
 
+## Running it
+
+As a systemd user unit, started with the graphical session:
+
+```ini
+[Unit]
+Description=Idle manager
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/path/to/rust-wl-idle-manager --config %h/.config/rust-wl-idle-manager/config.kdl
+Restart=on-failure
+# No core dumps: the daemon holds the password being typed.
+LimitCORE=0
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+The daemon also makes itself non-dumpable at startup, and keeps the typed
+password in a buffer locked in memory, which it wipes after each attempt;
+DESIGN.md has the details and their limits.
+
 ## Logs and exit status
 
 rust-wl-idle-manager logs to journald, or to stderr when journald is
@@ -116,7 +156,8 @@ two NixOS VM tests that run the real binary against a headless sway, in a
 logind session from an autologin on a TTY: one with an external locker,
 including the sleep handshake, and one with the built-in lock screen, which
 checks the screen's pixels while locked, after unlocking, after an output is
-added, and after the daemon is killed while locked. They need KVM.
+added, and after the daemon is killed while locked, and types right and
+wrong passwords with `wtype`. They need KVM.
 
 ## License
 

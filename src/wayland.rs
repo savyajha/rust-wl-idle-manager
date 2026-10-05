@@ -1,3 +1,4 @@
+mod keyboard;
 mod lock;
 
 use std::collections::VecDeque;
@@ -11,8 +12,10 @@ use smithay_client_toolkit::registry::RegistryState;
 use smithay_client_toolkit::session_lock::SessionLockState;
 use smithay_client_toolkit::shm::{Shm, slot::SlotPool};
 use tokio::io::unix::AsyncFd;
+use tokio::time::{self, Instant};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{
@@ -22,12 +25,14 @@ use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
     Event, ExtIdleNotificationV1,
 };
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
+use xkbcommon::xkb;
 
+use crate::password::Entry;
 use crate::policy::Input;
 use lock::Lock;
 
 /// The daemon's one connection to the compositor: an idle notification per configured
-/// timeout, and the built-in lock screen.
+/// timeout, and the built-in lock screen with its keyboard.
 pub struct Wayland {
     queue: EventQueue<State>,
     state: State,
@@ -47,6 +52,13 @@ struct State {
     inputs: VecDeque<Input>,
     registry: RegistryState,
     outputs: OutputState,
+    /// The first keyboard to appear, while the seat has one (lock screen only).
+    keyboard: Option<WlKeyboard>,
+    xkb: xkb::Context,
+    /// The keyboard's keymap and modifiers, once the compositor has sent the keymap.
+    xkb_state: Option<xkb::State>,
+    /// The password typed on the lock screen.
+    entry: Entry,
     compositor: WlCompositor,
     shm: Shm,
     /// The memory lock surfaces draw into, kept from one lock to the next.
@@ -68,7 +80,9 @@ impl Wayland {
         let (globals, queue) =
             registry_queue_init::<State>(&conn).context("listing Wayland globals")?;
         let qh = queue.handle();
-        let seat: WlSeat = globals.bind(&qh, 1..=1, ()).context("binding wl_seat")?;
+        // The first seat, for the idle notifications and the keyboard; niri has only one.
+        // Version 10 would have the compositor repeat keys, which the entry does itself.
+        let seat: WlSeat = globals.bind(&qh, 1..=9, ()).context("binding wl_seat")?;
         let notifier: ExtIdleNotifierV1 = globals
             .bind(&qh, 1..=2, ())
             .context("binding ext_idle_notifier_v1")?;
@@ -87,6 +101,10 @@ impl Wayland {
             inputs: VecDeque::new(),
             registry: RegistryState::new(&globals),
             outputs: OutputState::new(&globals, &qh),
+            keyboard: None,
+            xkb: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb_state: None,
+            entry: Entry::new(),
             compositor: globals
                 .bind(&qh, 1..=4, ())
                 .context("binding wl_compositor")?,
@@ -146,6 +164,8 @@ impl Wayland {
             self.queue
                 .dispatch_pending(&mut self.state)
                 .context("dispatching Wayland events")?;
+            // Whatever changed the password entry (keys, its timers, the helper's answer).
+            self.state.redraw();
             // Before returning, so that lock surfaces drawn while dispatching go out at once.
             self.flush()?;
             self.state.log_latencies();
@@ -156,11 +176,17 @@ impl Wayland {
             let Some(guard) = self.queue.prepare_read() else {
                 continue;
             };
-            let mut ready = self
-                .fd
-                .readable()
-                .await
-                .context("waiting for the Wayland compositor")?;
+            // The lock screen's timers: key repeat, the failure shown, forgetting the password.
+            let deadline = self.state.entry.deadline();
+            let mut ready = tokio::select! {
+                ready = self.fd.readable() => ready.context("waiting for the Wayland compositor")?,
+                () = time::sleep_until(deadline.map_or_else(Instant::now, Instant::from_std)),
+                    if deadline.is_some() =>
+                {
+                    self.state.entry.tick(std::time::Instant::now());
+                    continue;
+                }
+            };
             match guard.read() {
                 Ok(_) => {}
                 Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
@@ -197,7 +223,6 @@ impl Dispatch<ExtIdleNotificationV1, usize> for State {
     }
 }
 
-delegate_noop!(State: ignore WlSeat);
 delegate_noop!(State: ExtIdleNotifierV1);
 delegate_noop!(State: WlCompositor);
 // A lock surface covers its one output, so its enter, leave and scale events change nothing.
