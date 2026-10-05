@@ -17,8 +17,12 @@ pub enum Input {
     LockRequested,
     /// logind asked the session to unlock (`Unlock` signal).
     UnlockRequested,
-    /// The session's logind `LockedHint`, set by the compositor once the lock screen is drawn.
-    LockedHint(bool),
+    /// Whether the session is locked: from the built-in lock screen (the compositor's
+    /// `locked`, or the lock ending), or else logind's `LockedHint`, which the compositor
+    /// sets once the locker has locked.
+    Locked(bool),
+    /// logind's `LidClosed`.
+    LidClosed(bool),
     /// logind's `PrepareForSleep`: true before sleep, false after waking.
     PrepareForSleep(bool),
     /// The wait for the lock before sleep timed out.
@@ -28,10 +32,11 @@ pub enum Input {
 /// What the I/O shell should do.
 #[derive(Debug, PartialEq)]
 pub enum Command {
-    /// Start the locker unit (refused by systemd if it already runs).
-    StartLocker,
-    /// Ask the locker unit to unlock, with SIGUSR1.
-    UnlockLocker,
+    /// Lock with the built-in lock screen (unless a lock is already requested), or start
+    /// the locker unit (refused by systemd if it already runs).
+    Lock,
+    /// Unlock the built-in lock screen, or ask the locker unit to unlock, with SIGUSR1.
+    Unlock,
     /// Suspend through logind.
     Suspend,
     /// Suspend, then hibernate, through logind.
@@ -58,7 +63,8 @@ pub struct Policy {
     ran: Vec<bool>,
     inhibited: bool,
     active: bool,
-    locked_hint: bool,
+    locked: bool,
+    lid_closed: bool,
     /// Between `PrepareForSleep(true)` and releasing the sleep inhibitor.
     waiting_for_lock: bool,
 }
@@ -71,14 +77,16 @@ impl Policy {
             timeouts,
             inhibited: false,
             active: true,
-            locked_hint: false,
+            locked: false,
+            // So that a lid already closed at startup locks nothing.
+            lid_closed: true,
             waiting_for_lock: false,
         }
     }
 
     /// Update the state from `input` and return the commands to run, in order.
     ///
-    /// The order matters in three places: `StartLocker` comes before `WaitForLock`,
+    /// The order matters in three places: `Lock` comes before `WaitForLock`,
     /// `ReleaseSleepInhibitor` before `TakeSleepInhibitor`, and on-resume spawns before
     /// `Rearm`.
     pub fn handle(&mut self, input: Input) -> Vec<Command> {
@@ -102,20 +110,32 @@ impl Policy {
                 None
             }
             Input::LockRequested => self.lock(),
-            // If no locker runs, systemd refuses the signal; nothing else can be unlocked.
-            Input::UnlockRequested => Some(Command::UnlockLocker),
-            Input::LockedHint(hint) => {
-                self.locked_hint = hint;
-                if hint { self.release() } else { None }
+            // Unlocking when not locked does nothing; nothing else can be unlocked.
+            Input::UnlockRequested => Some(Command::Unlock),
+            Input::Locked(locked) => {
+                self.locked = locked;
+                if locked { self.release() } else { None }
+            }
+            Input::LidClosed(closed) => {
+                let was_closed = mem::replace(&mut self.lid_closed, closed);
+                if closed && !was_closed {
+                    self.lock()
+                } else {
+                    None
+                }
             }
             Input::PrepareForSleep(true) if self.waiting_for_lock => None,
-            Input::PrepareForSleep(true) if self.locked_hint => {
-                Some(Command::ReleaseSleepInhibitor)
+            Input::PrepareForSleep(true) if self.locked => Some(Command::ReleaseSleepInhibitor),
+            // A session in the background cannot show its lock promptly, so sleep does not
+            // wait for it.
+            Input::PrepareForSleep(true) if !self.active => {
+                return vec![Command::Lock, Command::ReleaseSleepInhibitor];
             }
-            // If the locker already runs, systemd refuses the second one; the wait still applies.
+            // A lock already under way is not started twice (systemd refuses a second locker);
+            // the wait still applies.
             Input::PrepareForSleep(true) => {
                 self.waiting_for_lock = true;
-                return vec![Command::StartLocker, Command::WaitForLock];
+                return vec![Command::Lock, Command::WaitForLock];
             }
             // Restart every timer from the wake. The old notifications never send
             // `resumed`, so pending on-resume spawns run first.
@@ -155,9 +175,9 @@ impl Policy {
         self.timeouts[i].on_resume.clone().map(Command::Spawn)
     }
 
-    /// Start the locker, unless the session is already locked.
+    /// Lock, unless the session is already locked.
     fn lock(&self) -> Option<Command> {
-        (!self.locked_hint).then_some(Command::StartLocker)
+        (!self.locked).then_some(Command::Lock)
     }
 
     /// Stop waiting for the lock and let sleep go ahead, if we were waiting.
@@ -205,7 +225,7 @@ mod tests {
             timeout(Action::Spawn(argv(&["a", "b"])), None, false),
         ]);
         let want = [
-            StartLocker,
+            Lock,
             Suspend,
             SuspendThenHibernate,
             Hibernate,
@@ -254,7 +274,7 @@ mod tests {
     fn resumed_never_unlocks() {
         let mut policy = policy();
         policy.handle(Input::Idled(0));
-        policy.handle(Input::LockedHint(true));
+        policy.handle(Input::Locked(true));
         assert_eq!(policy.handle(Input::Resumed(0)), vec![]);
     }
 
@@ -292,37 +312,37 @@ mod tests {
     }
 
     #[test]
-    fn the_locker_is_not_started_while_locked() {
+    fn no_lock_while_locked() {
         let mut policy = policy();
-        assert_eq!(policy.handle(Input::LockRequested), vec![StartLocker]);
-        // Not locked yet, so a second request starts it again; systemd refuses the duplicate.
-        assert_eq!(policy.handle(Input::LockRequested), vec![StartLocker]);
-        policy.handle(Input::LockedHint(true));
+        assert_eq!(policy.handle(Input::LockRequested), vec![Lock]);
+        // Not locked yet, so a second request locks again, which the shell makes harmless.
+        assert_eq!(policy.handle(Input::LockRequested), vec![Lock]);
+        policy.handle(Input::Locked(true));
         assert_eq!(policy.handle(Input::LockRequested), vec![]);
         assert_eq!(policy.handle(Input::Idled(0)), vec![]);
-        policy.handle(Input::LockedHint(false));
-        assert_eq!(policy.handle(Input::LockRequested), vec![StartLocker]);
+        policy.handle(Input::Locked(false));
+        assert_eq!(policy.handle(Input::LockRequested), vec![Lock]);
     }
 
     #[test]
-    fn unlock_always_signals_the_locker() {
+    fn unlock_always_unlocks() {
         let mut policy = policy();
-        assert_eq!(policy.handle(Input::UnlockRequested), vec![UnlockLocker]);
-        policy.handle(Input::LockedHint(true));
-        assert_eq!(policy.handle(Input::UnlockRequested), vec![UnlockLocker]);
+        assert_eq!(policy.handle(Input::UnlockRequested), vec![Unlock]);
+        policy.handle(Input::Locked(true));
+        assert_eq!(policy.handle(Input::UnlockRequested), vec![Unlock]);
     }
 
     #[test]
-    fn sleep_starts_the_locker_and_waits_for_the_hint() {
+    fn sleep_locks_and_waits_until_locked() {
         let mut policy = policy();
         assert_eq!(
             policy.handle(Input::PrepareForSleep(true)),
-            vec![StartLocker, WaitForLock]
+            vec![Lock, WaitForLock]
         );
         assert_eq!(policy.handle(Input::PrepareForSleep(true)), vec![]);
-        assert_eq!(policy.handle(Input::LockedHint(false)), vec![]);
+        assert_eq!(policy.handle(Input::Locked(false)), vec![]);
         assert_eq!(
-            policy.handle(Input::LockedHint(true)),
+            policy.handle(Input::Locked(true)),
             vec![ReleaseSleepInhibitor]
         );
         // The timer is stale now.
@@ -330,15 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn sleep_with_the_locker_starting_starts_it_again_and_waits() {
+    fn sleep_while_locking_locks_again_and_waits() {
         let mut policy = policy();
-        assert_eq!(policy.handle(Input::Idled(0)), vec![StartLocker]);
+        assert_eq!(policy.handle(Input::Idled(0)), vec![Lock]);
         assert_eq!(
             policy.handle(Input::PrepareForSleep(true)),
-            vec![StartLocker, WaitForLock]
+            vec![Lock, WaitForLock]
         );
         assert_eq!(
-            policy.handle(Input::LockedHint(true)),
+            policy.handle(Input::Locked(true)),
             vec![ReleaseSleepInhibitor]
         );
     }
@@ -346,7 +366,7 @@ mod tests {
     #[test]
     fn sleep_when_locked_releases_at_once() {
         let mut policy = policy();
-        policy.handle(Input::LockedHint(true));
+        policy.handle(Input::Locked(true));
         assert_eq!(
             policy.handle(Input::PrepareForSleep(true)),
             vec![ReleaseSleepInhibitor]
@@ -364,7 +384,7 @@ mod tests {
             vec![ReleaseSleepInhibitor]
         );
         assert_eq!(policy.handle(Input::LockWaitTimedOut), vec![]);
-        assert_eq!(policy.handle(Input::LockedHint(true)), vec![]);
+        assert_eq!(policy.handle(Input::Locked(true)), vec![]);
     }
 
     #[test]
@@ -374,7 +394,7 @@ mod tests {
         policy.handle(Input::Idled(2));
         assert_eq!(
             policy.handle(Input::PrepareForSleep(true)),
-            vec![StartLocker, WaitForLock]
+            vec![Lock, WaitForLock]
         );
         // Still waiting, so the held inhibitor is released before it is taken again.
         assert_eq!(
@@ -388,18 +408,48 @@ mod tests {
         );
         assert_eq!(policy.ran, [false; 3]);
         // Waiting stopped, so a late hint or timer releases nothing.
-        assert_eq!(policy.handle(Input::LockedHint(true)), vec![]);
+        assert_eq!(policy.handle(Input::Locked(true)), vec![]);
         assert_eq!(policy.handle(Input::LockWaitTimedOut), vec![]);
     }
 
     #[test]
     fn waking_after_a_release_only_retakes_the_inhibitor_and_rearms() {
         let mut policy = policy();
-        policy.handle(Input::LockedHint(true));
+        policy.handle(Input::Locked(true));
         policy.handle(Input::PrepareForSleep(true));
         assert_eq!(
             policy.handle(Input::PrepareForSleep(false)),
             vec![TakeSleepInhibitor, Rearm(vec![0, 1, 2])]
         );
+    }
+
+    #[test]
+    fn sleep_while_inactive_locks_without_waiting() {
+        let mut policy = policy();
+        policy.handle(Input::SessionActive(false));
+        assert_eq!(
+            policy.handle(Input::PrepareForSleep(true)),
+            vec![Lock, ReleaseSleepInhibitor]
+        );
+        assert_eq!(policy.handle(Input::Locked(true)), vec![]);
+        assert_eq!(policy.handle(Input::LockWaitTimedOut), vec![]);
+        policy.handle(Input::PrepareForSleep(false));
+        assert_eq!(
+            policy.handle(Input::PrepareForSleep(true)),
+            vec![ReleaseSleepInhibitor]
+        );
+    }
+
+    #[test]
+    fn closing_the_lid_locks() {
+        let mut policy = policy();
+        // Closed at startup: nothing to lock for, as the lid did not just close.
+        assert_eq!(policy.handle(Input::LidClosed(true)), vec![]);
+        assert_eq!(policy.handle(Input::LidClosed(false)), vec![]);
+        assert_eq!(policy.handle(Input::LidClosed(true)), vec![Lock]);
+        assert_eq!(policy.handle(Input::LidClosed(true)), vec![]);
+        policy.handle(Input::LidClosed(false));
+        policy.handle(Input::Locked(true));
+        assert_eq!(policy.handle(Input::LidClosed(true)), vec![]);
     }
 }

@@ -1,8 +1,8 @@
 mod config;
-mod idle;
 mod logind;
 mod policy;
 mod systemd;
+mod wayland;
 
 use std::env;
 use std::ffi::OsString;
@@ -21,10 +21,10 @@ use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::Subscr
 use zbus::Connection;
 
 use config::Config;
-use idle::IdleWatcher;
 use logind::{LogindManagerProxy, idle_inhibited};
 use policy::{Command, Input, Policy};
 use systemd::SystemdManagerProxy;
+use wayland::Wayland;
 
 /// The transient user unit the locker runs as.
 const LOCKER_UNIT: &str = "rust-wl-locker.service";
@@ -71,8 +71,10 @@ fn log_input(input: Input, session: &str, timeouts: &[(Duration, bool)]) {
         Input::SessionActive(false) => info!("session {session} inactive"),
         Input::LockRequested => info!("lock requested for session {session}"),
         Input::UnlockRequested => info!("unlock requested for session {session}"),
-        Input::LockedHint(true) => info!("session {session} locked"),
-        Input::LockedHint(false) => info!("session {session} not locked"),
+        Input::Locked(true) => info!("session {session} locked"),
+        Input::Locked(false) => info!("session {session} not locked"),
+        Input::LidClosed(true) => info!("lid closed"),
+        Input::LidClosed(false) => info!("lid open"),
         Input::PrepareForSleep(true) => info!("preparing for sleep"),
         Input::PrepareForSleep(false) => info!("back from sleep"),
         Input::LockWaitTimedOut => info!("lock wait timed out; releasing the sleep inhibitor"),
@@ -83,8 +85,8 @@ fn log_input(input: Input, session: &str, timeouts: &[(Duration, bool)]) {
 struct Runner {
     systemd: SystemdManagerProxy<'static>,
     logind: LogindManagerProxy<'static>,
-    /// The locker command.
-    locker: Vec<String>,
+    /// The locker command; without one, the built-in lock screen locks.
+    locker: Option<Vec<String>>,
     /// How many commands have been spawned, for unique unit names.
     spawned: u64,
     /// The sleep delay inhibitor; dropping it releases it.
@@ -95,22 +97,27 @@ struct Runner {
 
 impl Runner {
     /// Run one policy command.
-    async fn execute(&mut self, command: Command, watcher: &mut IdleWatcher) -> anyhow::Result<()> {
+    async fn execute(&mut self, command: Command, wayland: &mut Wayland) -> anyhow::Result<()> {
         match command {
-            Command::StartLocker => {
+            Command::Lock if let Some(locker) = &self.locker => {
                 info!("starting the locker");
                 let started = self
                     .systemd
-                    .start_service(LOCKER_UNIT, "rust-wl-idle-manager: locker", &self.locker)
+                    .start_service(LOCKER_UNIT, "rust-wl-idle-manager: locker", locker)
                     .await
                     .context("starting the locker")?;
                 if !started {
                     info!("locker already running");
                 }
             }
+            // Logged once requested, so that logging adds nothing to the lock's latency.
+            Command::Lock => {
+                wayland.lock()?;
+                info!("lock requested from the compositor");
+            }
             // Never a stop: a session-lock client that dies without unlocking leaves the
             // session locked.
-            Command::UnlockLocker => {
+            Command::Unlock if self.locker.is_some() => {
                 info!("unlocking the locker");
                 let usr1 = SignalKind::user_defined1().as_raw_value();
                 let sent = self
@@ -121,6 +128,10 @@ impl Runner {
                 if !sent {
                     info!("no locker running to unlock");
                 }
+            }
+            Command::Unlock => {
+                info!("unlocking the lock screen");
+                wayland.unlock();
             }
             Command::Spawn(argv) => {
                 let line = argv.join(" ");
@@ -175,7 +186,7 @@ impl Runner {
             }
             Command::Rearm(indices) => {
                 info!("rearming timeouts {indices:?}");
-                watcher.rearm(&indices);
+                wayland.rearm(&indices);
             }
         }
         Ok(())
@@ -204,6 +215,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let mut block_inhibited = logind.receive_block_inhibited_changed().await;
     let mut active = logind_session.receive_active_changed().await;
     let mut locked_hint = logind_session.receive_locked_hint_changed().await;
+    let mut lid_closed = logind.receive_lid_closed_changed().await;
     // A failed read here is fatal; zbus would otherwise leave those streams silent forever.
     logind
         .block_inhibited()
@@ -218,7 +230,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         .iter()
         .map(|timeout| (timeout.after, timeout.ignore_inhibit))
         .collect();
-    let mut watcher = IdleWatcher::connect(&timeouts)?;
+    let lock_screen = config.locker.is_none();
+    let mut wayland = Wayland::connect(&timeouts, lock_screen)?;
     let inhibitor = logind.sleep_inhibitor().await?;
     let mut runner = Runner {
         systemd,
@@ -233,10 +246,19 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         timeouts.len(),
         config_path.display()
     );
+    // A previous run that died while locked left the session locked; the compositor lets
+    // a new lock replace the dead one.
+    if lock_screen && logind_session.locked_hint().await? {
+        info!("session {session_id} is still locked; locking again");
+        wayland.lock()?;
+    }
     let mut policy = Policy::new(config.timeouts);
     loop {
         let input = tokio::select! {
-            idle = watcher.next() => idle?,
+            // Wayland first: after an unlock, its `Locked(false)` is already queued, and
+            // must reach the policy before a lock request that would otherwise be dropped.
+            biased;
+            wayland_input = wayland.next() => wayland_input?,
             sleep = sleeps.next() => Input::PrepareForSleep(sleep.context(BUS_LOST)?.args()?.start),
             lock = locks.next() => lock.map(|_| Input::LockRequested).context(BUS_LOST)?,
             unlock = unlocks.next() => unlock.map(|_| Input::UnlockRequested).context(BUS_LOST)?,
@@ -245,7 +267,22 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                 Input::Inhibited(idle_inhibited(&new.context(BUS_LOST)?.get().await?))
             }
             new = active.next() => Input::SessionActive(new.context(BUS_LOST)?.get().await?),
-            new = locked_hint.next() => Input::LockedHint(new.context(BUS_LOST)?.get().await?),
+            // With the built-in lock screen, the compositor's `locked` says it instead.
+            new = locked_hint.next(), if !lock_screen => {
+                Input::Locked(new.context(BUS_LOST)?.get().await?)
+            }
+            // Like logind, which ignores the lid while docked (HandleLidSwitchDocked).
+            // A failed read counts as not docked: exiting now could let the machine
+            // sleep unlocked, since logind may be about to suspend.
+            new = lid_closed.next() => {
+                let closed = new.context(BUS_LOST)?.get().await?;
+                let docked = closed
+                    && runner.logind.docked().await.unwrap_or_else(|e| {
+                        error!("reading logind's Docked: {e}; locking anyway");
+                        false
+                    });
+                Input::LidClosed(closed && !docked)
+            }
             () = time::sleep_until(runner.lock_wait.unwrap_or_else(Instant::now)),
                 if runner.lock_wait.is_some() =>
             {
@@ -256,7 +293,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         };
         log_input(input, &session_id, &timeouts);
         for command in policy.handle(input) {
-            if let Err(e) = runner.execute(command, &mut watcher).await {
+            if let Err(e) = runner.execute(command, &mut wayland).await {
                 error!("{e:#}");
             }
         }

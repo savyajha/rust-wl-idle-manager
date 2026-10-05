@@ -14,9 +14,9 @@ const MAX_SECS: u64 = u32::MAX as u64 / 1000;
 /// The rust-wl-idle-manager config file.
 #[derive(knuffel::Decode, Debug, PartialEq)]
 pub struct Config {
-    /// The locker's argv.
+    /// The locker's argv; without one, the daemon locks with its built-in lock screen.
     #[knuffel(child, unwrap(arguments))]
-    pub locker: Vec<String>,
+    pub locker: Option<Vec<String>>,
     /// The idle timeouts, in file order.
     #[knuffel(children(name = "timeout"))]
     pub timeouts: Vec<Timeout>,
@@ -74,7 +74,10 @@ impl Config {
     /// Parse and validate KDL `text`; `name` labels it in errors.
     fn parse(name: &str, text: &str) -> anyhow::Result<Self> {
         let config: Self = knuffel::parse(name, text).map_err(render)?;
-        ensure!(!config.locker.is_empty(), "locker: needs a command");
+        ensure!(
+            config.locker.as_ref().is_none_or(|argv| !argv.is_empty()),
+            "locker: needs a command"
+        );
         Ok(config)
     }
 }
@@ -162,7 +165,7 @@ mod tests {
         assert_eq!(
             config,
             Config {
-                locker: argv(&["hyprlock-wallpaper"]),
+                locker: Some(argv(&["hyprlock-wallpaper"])),
                 timeouts: vec![
                     Timeout {
                         after: Duration::from_secs(300),
@@ -185,6 +188,12 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn locker_is_optional() {
+        let config = Config::parse("test.kdl", "timeout 5 { lock; }\n").unwrap();
+        assert_eq!(config.locker, None);
     }
 
     #[test]
@@ -236,7 +245,6 @@ mod tests {
                 "expected 1 to 4294967 seconds",
             ),
             ("locker\n", "locker: needs a command"),
-            ("timeout 5 { lock; }\n", "child node `locker` is required"),
             (
                 "locker \"x\"\ntimeout 5 { spawn; }\n",
                 "spawn needs a command",

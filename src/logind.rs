@@ -36,6 +36,15 @@ pub trait LogindManager {
     #[zbus(property)]
     fn block_inhibited(&self) -> zbus::Result<String>;
 
+    /// Whether the laptop's lid is closed; false without a lid.
+    #[zbus(property)]
+    fn lid_closed(&self) -> zbus::Result<bool>;
+
+    /// Whether the system is docked or has more than one display; logind announces no
+    /// change of it, so each read asks logind.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn docked(&self) -> zbus::Result<bool>;
+
     /// Emitted with `true` before sleep, and with `false` after waking or a failed sleep.
     #[zbus(signal)]
     fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;

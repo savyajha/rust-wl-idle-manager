@@ -39,6 +39,11 @@
             inherit pkgs;
             idleManager = self.packages.${system}.rust-wl-idle-manager;
           };
+          # The built-in lock screen, checked by its pixels.
+          lock-screen = import ./tests/lock-screen.nix {
+            inherit pkgs;
+            idleManager = self.packages.${system}.rust-wl-idle-manager;
+          };
 
           fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --check";
           clippy = cargoCheck "clippy" [
