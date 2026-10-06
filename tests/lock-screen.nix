@@ -4,9 +4,11 @@
 # daemon as user services), but the config has no `locker`, so the daemon locks
 # with its own ext-session-lock-v1 surfaces. sway sends `locked` as soon as it
 # accepts the lock, before anything is drawn, so the test checks the screen's
-# pixels with grim: the desktop is green, the lock screen #203040, and sway paints
-# an output red while the session is locked by a client that died. Keys are typed
-# with wtype, through the virtual-keyboard protocol.
+# pixels with grim: the desktop is green, the lock screen's plain background
+# #202428 (where its gradients leave it alone, half-way down), and sway paints an
+# output red while the session is locked by a client that died. The config moves
+# the widgets from the default layout: the password field's top is 320 px from the
+# top, centred. Keys are typed with wtype, through the virtual-keyboard protocol.
 #
 # Behaviours asserted:
 #   1. an idle `lock` covers the output with the lock screen; logind unlock
@@ -22,14 +24,24 @@
 #   6. the daemon killed while locked leaves the session locked; restarted, it
 #      finds LockedHint set and locks again, without any user action
 #   7. sleep waits until the lock screen has locked
-#   8. a wrong password shows "checking", then "failed", and stays locked; the
-#      right one unlocks; Enter-to-unlocked latency is logged
+#   8. a wrong password shows a dot per character, then dimmed dots while
+#      checking, then the field's outline in gtk.css's error colour, and stays locked;
+#      the right one unlocks; Enter-to-unlocked latency is logged
 #   9. Escape clears the password, and Enter with none checks nothing
-#  10. caps lock shows its bar
+#  10. caps lock shows its line under the field
 #  11. the `--auth` helper exits 0 only for the right password; the daemon is not
 #      dumpable; no password reaches the journal
-#  12. the fifth wrong password in a row starts a 30 s cooldown: the field turns
-#      grey and Enter checks nothing; after it, the right password unlocks
+#  12. the fifth wrong password in a row starts a 30 s cooldown: no field, a
+#      countdown in its place, and Enter checks nothing; after it, the right
+#      password unlocks
+#  13. the clock shows text; at scale 1.5 the lock screen is prepared before the
+#      lock at the scale sway then asks for
+#  14. a PNG wallpaper, then a JPEG one, given by the wallpaper command and taken
+#      up on a reload (SIGHUP), is the background of the next lock, blurred and
+#      toned, with the gradients darkening the top
+#  15. a lock while the wallpaper is still loading shows the prepared frame at
+#      once, and the new wallpaper once it is ready
+#  16. ten reloads in a row leave the daemon's private memory as it was
 
 { pkgs, idleManager }:
 
@@ -40,8 +52,32 @@ let
   wrongPassword = "wrong guess";
   runtimeDir = "/run/user/${toString uid}";
 
+  # Solid colours: blurring changes nothing, so each pixel is the colour, toned.
+  wallpapers = pkgs.runCommand "wallpapers" { nativeBuildInputs = [ pkgs.imagemagick ]; } ''
+    mkdir $out
+    magick -size 64x36 xc:'#4080c0' $out/blue.png
+    magick -size 64x36 xc:'#c06030' -quality 95 $out/orange.jpg
+  '';
+
+  # Prints /etc/wallpaper, after the seconds in /etc/wallpaper-delay, if any.
+  wallpaperCommand = pkgs.writeShellScript "wallpaper" ''
+    ${pkgs.coreutils}/bin/sleep "$(${pkgs.coreutils}/bin/cat /etc/wallpaper-delay 2>/dev/null || echo 0)"
+    exec ${pkgs.coreutils}/bin/cat /etc/wallpaper
+  '';
+
   config = pkgs.writeText "idle.kdl" ''
     timeout 5 { lock; }
+    lock-screen {
+        background { wallpaper-command "${wallpaperCommand}"; }
+        clock {
+            anchor "top"
+            offset 0 40
+            size 100
+            weight "semibold"
+        }
+        name { anchor "bottom"; offset 0 40; }
+        password { anchor "top"; offset 0 320; }
+    }
   '';
 
   mkIdleManager = {
@@ -50,6 +86,7 @@ let
     serviceConfig = {
       Type = "simple";
       ExecStart = "${idleManager}/bin/rust-wl-idle-manager --config ${config}";
+      ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
       Restart = "on-failure";
       LimitCORE = 0;
       # Long enough for the test to see the session left locked by the killed daemon.
@@ -71,6 +108,7 @@ pkgs.testers.runNixOSTest {
     security.pam.services.rust-wl-idle-manager = { };
 
     environment.systemPackages = [ pkgs.sway pkgs.grim pkgs.wtype ];
+    fonts.packages = [ pkgs.adwaita-fonts ];
 
     systemd.user.services.sway = {
       description = "Headless sway";
@@ -97,15 +135,25 @@ pkgs.testers.runNixOSTest {
     import json, re, statistics
 
     PREFIX = "sudo -u ${user} XDG_RUNTIME_DIR=${runtimeDir} "
-    LOCK = ["20", "30", "40"]
-    DESKTOP = ["00", "ff", "00"]
-    ABANDONED = ["ff", "00", "00"]
-    FIELD = ["30", "48", "60"]
-    DOT = ["e0", "e8", "f0"]
-    CHECKING = ["30", "70", "c0"]
-    FAILED = ["c0", "30", "30"]
-    CAPS_LOCK = ["e0", "a0", "20"]
-    COOLDOWN = ["58", "58", "58"]
+    PLAIN = [0x20, 0x24, 0x28]
+    DESKTOP = [0x00, 0xff, 0x00]
+    ABANDONED = [0xff, 0x00, 0x00]
+    WHITE = [0xff, 0xff, 0xff]
+    # The error colour that gtk.css names.
+    ERROR = [0xff, 0x40, 0x40]
+
+    def over(bg, alpha, fg=WHITE):
+        """`fg` at `alpha` over `bg`."""
+        return [round(b * (1 - alpha) + f * alpha) for b, f in zip(bg, fg)]
+
+    def toned(rgb):
+        """A wallpaper colour after brightness 0.8 and saturation 1.1, as the daemon tones it."""
+        r, g, b = [c * 0.8 for c in rgb]
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return [max(0, min(255, round(luma + (c - luma) * 1.1))) for c in (r, g, b)]
+
+    def near(a, b, tolerance=3):
+        return all(abs(x - y) <= tolerance for x, y in zip(a, b))
 
     def uctl(cmd):
         return machine.succeed(PREFIX + cmd)
@@ -126,23 +174,38 @@ pkgs.testers.runNixOSTest {
     def swaymsg(args):
         return uctl(f"env SWAYSOCK=$(ls ${runtimeDir}/sway-ipc.*.sock) swaymsg {args}")
 
+    def region(x, y, w, h):
+        """The colours of a rectangle of the layout, row by row, as lists of three ints."""
+        size = w * h * 3
+        out = uctl(f"WAYLAND_DISPLAY={display} grim -g '{x},{y} {w}x{h}' -t ppm - | tail -c {size} | od -An -tu1 -v")
+        values = [int(v) for v in out.split()]
+        assert len(values) == size, f"grim gave {len(values)} values, not {size}"
+        return [values[i:i + 3] for i in range(0, size, 3)]
+
     def pixel(x, y):
-        """The colour at (x, y) in the layout, as three hex bytes."""
-        return uctl(f"WAYLAND_DISPLAY={display} grim -g '{x},{y} 1x1' -t ppm - | tail -c 3 | od -An -tx1").split()
+        return region(x, y, 1, 1)[0]
 
-    def wait_for_pixel(want, x=5, y=5, timeout=10):
-        machine.wait_until_succeeds(
-            PREFIX + f"WAYLAND_DISPLAY={display} grim -g '{x},{y} 1x1' -t ppm - | tail -c 3"
-            + f" | od -An -tx1 | grep -qx ' {' '.join(want)}'",
-            timeout=timeout,
-        )
+    def wait_for_colour(check, x, y, timeout=10, what=""):
+        """Wait until the colour at (x, y) passes `check`."""
+        def ok(_):
+            return check(pixel(x, y))
+        with machine.nested(f"waiting for {what or 'a colour'} at ({x}, {y})"):
+            retry(ok, timeout)
 
-    def wait_briefly_for_pixel(want, x, y):
+    def wait_for_pixel(want, x=None, y=None, timeout=10):
+        x, y = probe if x is None else (x, y)
+        wait_for_colour(lambda colour: colour == want, x, y, timeout, str(want))
+
+    def wait_briefly_for(check, x, y, what):
         """Poll quickly, for a colour shown only for a moment."""
         for _ in range(100):
-            if pixel(x, y) == want:
+            if check(pixel(x, y)):
                 return
-        assert False, f"never saw {want} at ({x}, {y}); last {pixel(x, y)}"
+        assert False, f"never saw {what} at ({x}, {y}); last {pixel(x, y)}"
+
+    def marked(x, y, w, h, background):
+        """How many pixels of a rectangle differ clearly from `background`: text or shapes."""
+        return sum(not near(colour, background, 40) for colour in region(x, y, w, h))
 
     def wtype(args):
         uctl(f"WAYLAND_DISPLAY={display} wtype {args}")
@@ -166,18 +229,22 @@ pkgs.testers.runNixOSTest {
         return uctl(f"systemctl --user show -p MainPID --value {unit}").strip()
 
     def memory(pid):
-        """The daemon's resident memory in kB, from /proc/<pid>/status."""
-        status = machine.succeed(f"cat /proc/{pid}/status")
-        fields = ["VmRSS", "RssAnon", "RssFile", "RssShmem"]
+        """The daemon's memory in kB: resident (/proc/<pid>/status) and proportional
+        (smaps_rollup, which shares each shared page among the processes mapping it)."""
+        status = machine.succeed(f"cat /proc/{pid}/status /proc/{pid}/smaps_rollup")
+        fields = ["VmRSS", "RssAnon", "RssFile", "RssShmem", "Pss", "Pss_Anon", "Pss_File", "Pss_Shmem"]
         return {f: int(re.findall(rf"^{f}:\s+(\d+) kB", status, re.M)[0]) for f in fields}
 
-    def lock():
+    def threads(pid):
+        return machine.succeed(f"cat /proc/{pid}/task/*/comm").splitlines()
+
+    def lock(background=PLAIN):
         """Lock through logind and wait for the lock screen."""
         since = cursor()
         machine.succeed(f"loginctl lock-session {session}")
         wait_for_log(since, f"session {session} locked")
         wait_for_log(since, "lock screen drawn")
-        wait_for_pixel(LOCK)
+        wait_for_pixel(background)
         return since
 
     def unlock():
@@ -208,32 +275,50 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds("ls ${runtimeDir}/wayland-? ${runtimeDir}/sway-ipc.*.sock")
     display = machine.succeed("basename ${runtimeDir}/wayland-?").strip()
     uctl(f"systemctl --user set-environment WAYLAND_DISPLAY={display}")
+    output = [o for o in json.loads(swaymsg("-t get_outputs")) if o["name"] == "HEADLESS-1"][0]["rect"]
+    # Half-way down the left edge, where the gradients leave the background alone.
+    probe = (output["x"] + 5, output["y"] + output["height"] // 2)
     wait_for_pixel(DESKTOP)
     # A persistent virtual keyboard, so the seat always has one (as a laptop does);
     # otherwise each wtype adds the capability and its keys race the daemon's keymap.
     uctl(f"systemd-run --user --unit=keyboard -E WAYLAND_DISPLAY={display} ${pkgs.wtype}/bin/wtype -s 3600000")
+    # GTK's font and an error colour, as GTK and matugen would leave them.
+    uctl("mkdir -p /home/${user}/.config/gtk-4.0")
+    uctl("sh -c 'printf \"[Settings]\\ngtk-font-name=Adwaita Sans 11\\n\" > /home/${user}/.config/gtk-4.0/settings.ini'")
+    uctl("sh -c 'echo \"@define-color error_color #ff4040;\" > /home/${user}/.config/gtk-4.0/gtk.css'")
     # Root writes the passwords to files, so that no command line carries them.
     machine.succeed("printf %s '${password}' > /etc/right-password")
     machine.succeed("printf %s '${wrongPassword}' > /etc/wrong-password")
-    output = [o for o in json.loads(swaymsg("-t get_outputs")) if o["name"] == "HEADLESS-1"][0]["rect"]
-    # The password field's centre (the middle dot of an odd count), and its caps lock bar.
-    centre = (output["x"] + output["width"] // 2, output["y"] + output["height"] // 2)
-    caps_bar = (centre[0], centre[1] + 25 + 10 + 3)
+    # The field is 176 × 30 with its top 320 px down: its middle dot (of an odd count),
+    # a point inside it clear of the dots and text, its top edge, and the caps lock
+    # line 10 px under it.
+    middle = output["x"] + output["width"] // 2
+    dot = (middle, output["y"] + 335)
+    inside = (middle - 70, output["y"] + 335)
+    edge = (middle - 70, output["y"] + 320)
+    caps_line = (middle - 70, output["y"] + 358, 140, 22)
+    hint = (middle - 60, output["y"] + 322, 120, 26)
+    FIELD = over(PLAIN, 0.2)
 
     with subtest("an idle lock shows the lock screen; logind unlock removes it"):
         since = cursor()
         uctl("systemctl --user start idle-manager.service")
         wait_for_log(since, f"watching 1 timeouts from ${config} in session {session}")
         pid = main_pid()
-        # Once the outputs are known and the pool is prepared, before the idle lock.
+        # Prepared before the first lock, and no wallpaper yet (/etc/wallpaper is missing).
+        wait_for_log(since, "lock screen prepared for 1280×720 at scale 1 (1280×720 px) in")
+        wait_for_log(since, "keeping the background as it was")
         machine.sleep(1)
         idle_memory = memory(pid)
+        idle_threads = threads(pid)
         wait_for_log(since, "idle after 5 s (timeout 0)", timeout=15)
         wait_for_log(since, "lock requested from the compositor")
         wait_for_log(since, f"session {session} locked")
         wait_for_log(since, "lock screen drawn")
-        wait_for_pixel(LOCK)
+        wait_for_pixel(PLAIN)
+        assert "at lock time" not in journal(since), "the lock screen was prepared at lock time"
         machine.log(f"first lock: drawn, locked after {latencies(since)} ms")
+        machine.log("startup: " + "; ".join(l for l in journal(since).splitlines() if "prepared" in l))
         unlock()
 
     with subtest("logind lock and unlock, five times"):
@@ -252,23 +337,33 @@ pkgs.testers.runNixOSTest {
             "memory idle (kB)": idle_memory,
             "memory locked (kB)": locked_memory,
             "memory after unlock (kB)": unlocked_memory,
+            "threads idle": idle_threads,
             "outputs": [(o["name"], o["rect"]) for o in json.loads(swaymsg("-t get_outputs"))],
         }
         machine.log("lock screen measurements: " + json.dumps(summary))
+
+    with subtest("the clock shows text, and the layout comes from the config"):
+        lock()
+        # The clock's 100 px digits, 40 px from the top; the field is not shown at rest.
+        assert marked(middle - 150, output["y"] + 40, 300, 120, PLAIN) > 500
+        assert pixel(*inside) == PLAIN
+        assert marked(*hint, PLAIN) > 50, "no hint where the field goes"
+        resting = region(*hint)
+        unlock()
 
     with subtest("an output added while locked gets a lock surface"):
         since = lock()
         swaymsg("create_output")
         new = [o for o in json.loads(swaymsg("-t get_outputs")) if o["name"] != "HEADLESS-1"][0]
-        x = new["rect"]["x"] + 5
+        x, y = new["rect"]["x"] + 5, new["rect"]["y"] + new["rect"]["height"] // 2
         for _ in range(50):
-            colour = pixel(x, 5)
+            colour = pixel(x, y)
             assert colour != DESKTOP, "the new output showed the desktop"
-            if colour == LOCK:
+            if colour == PLAIN:
                 break
-        assert colour == LOCK, f"the new output shows {colour}, not the lock screen"
+        assert colour == PLAIN, f"the new output shows {colour}, not the lock screen"
         swaymsg(f"output {new['name']} unplug")
-        wait_for_pixel(LOCK)
+        wait_for_pixel(PLAIN)
         unlock()
         assert main_pid() == pid, "the daemon restarted"
 
@@ -295,7 +390,7 @@ pkgs.testers.runNixOSTest {
         wait_for_log(since, "the compositor refused or ended our lock")
         assert main_pid("idle-manager-second.service") == second, "the second daemon restarted"
         uctl("systemctl --user stop idle-manager-second.service")
-        assert pixel(5, 5) == LOCK
+        assert pixel(*probe) == PLAIN
         unlock()
 
     with subtest("killed while locked, the daemon locks again on restart"):
@@ -307,7 +402,7 @@ pkgs.testers.runNixOSTest {
         wait_for_pixel(ABANDONED)
         wait_for_log(since, f"session {session} is still locked; locking again")
         wait_for_log(since, "lock screen drawn")
-        wait_for_pixel(LOCK)
+        wait_for_pixel(PLAIN)
         pid = main_pid()
         unlock()
         set_locked_hint("false")
@@ -329,23 +424,30 @@ pkgs.testers.runNixOSTest {
         assert sorted(order, key=text.index) == order, text
         assert "lock wait timed out" not in text, text
         wait_for_log(since, "back from sleep", timeout=60)
-        wait_for_pixel(LOCK)
+        wait_for_pixel(PLAIN)
         unlock()
 
     with subtest("a wrong password fails; the right one unlocks"):
         lock()
-        wait_for_pixel(FIELD, *centre)
+        assert pixel(*inside) == PLAIN
         since = cursor()
         type_file("/etc/wrong-password")
-        wait_for_pixel(DOT, *centre)
+        # The frosted field, with the middle one of 11 dots, drawn into at most two
+        # 1280×720 buffers however fast the keys come.
+        wait_for_pixel(WHITE, *dot)
+        assert memory(pid)["RssShmem"] <= 2 * 3600
+        assert near(pixel(*inside), FIELD), pixel(*inside)
         wtype("-k Return")
         wait_for_log(since, "checking the password")
-        # pam_unix delays a failure by about 2 s; then the failure shows for 1.5 s.
-        wait_briefly_for_pixel(CHECKING, *centre)
-        wait_briefly_for_pixel(FAILED, *centre)
+        # Checking: the field and its dots at half their opacity. pam_unix delays a
+        # failure by about 2 s; then the failure shows for 1.5 s, without dots.
+        dimmed = over(over(PLAIN, 0.1), 0.5)
+        wait_briefly_for(lambda c: near(c, dimmed), *dot, "dimmed dots")
+        wait_briefly_for(lambda c: c == ERROR, *edge, "the error outline")
+        assert near(pixel(*dot), FIELD), "the dots were not cleared"
         wait_for_log(since, "password rejected")
-        assert pixel(5, 5) == LOCK
-        wait_for_pixel(FIELD, *centre)
+        assert pixel(*probe) == PLAIN
+        wait_for_pixel(PLAIN, *inside)
         assert main_pid() == pid, "the daemon restarted"
         since = cursor()
         type_file("/etc/right-password")
@@ -355,26 +457,29 @@ pkgs.testers.runNixOSTest {
         wait_for_pixel(DESKTOP)
         unlock_ms = (log_time(since, "not locked") - log_time(since, "checking the password")) * 1000
         machine.log(f"Enter to unlocked: {unlock_ms:.1f} ms")
+        # The pool grew for the frames drawn while typing; the unlock replaced it.
+        machine.sleep(1)
+        machine.log("memory after typing and unlocking (kB): " + json.dumps(memory(pid)))
 
     with subtest("Escape clears the password; Enter with none checks nothing"):
         since = lock()
         wtype("abc")
-        wait_for_pixel(DOT, *centre)
+        wait_for_pixel(WHITE, *dot)
         wtype("-k Escape")
-        wait_for_pixel(FIELD, *centre)
+        wait_for_pixel(PLAIN, *inside)
         wtype("-k Return")
         machine.sleep(1)
         assert "checking the password" not in journal(since)
-        assert pixel(*centre) == FIELD
+        assert pixel(*inside) == PLAIN
         unlock()
 
-    with subtest("caps lock shows its bar"):
+    with subtest("caps lock shows its line"):
         lock()
-        assert pixel(*caps_bar) == LOCK
+        assert marked(*caps_line, PLAIN) == 0
         # Caps lock held (not toggled) for 3 s: wtype sends it as a depressed modifier.
         uctl(f"systemd-run --user --unit=caps-lock -E WAYLAND_DISPLAY={display} ${pkgs.wtype}/bin/wtype -M capslock -s 3000 -m capslock")
-        wait_for_pixel(CAPS_LOCK, *caps_bar)
-        wait_for_pixel(LOCK, *caps_bar)
+        retry(lambda _: marked(*caps_line, PLAIN) > 20, 10)
+        retry(lambda _: marked(*caps_line, PLAIN) == 0, 10)
         unlock()
 
     with subtest("five wrong passwords in a row start a cooldown"):
@@ -386,18 +491,22 @@ pkgs.testers.runNixOSTest {
             wait_for_log(since, "password rejected")
         wait_for_log(since, "5 wrong passwords; waiting 30 s")
         started = log_time(since, "5 wrong passwords")
-        wait_for_pixel(COOLDOWN, *centre)
-        # Typing does nothing: no dots, and Enter checks nothing.
+        # A countdown where the field goes: it changes from one second to the next.
+        wait_for_pixel(PLAIN, *inside)
+        first = region(*hint)
+        machine.sleep(2)
+        assert region(*hint) != first, "the countdown did not count"
+        # Typing does nothing: no field, and Enter checks nothing.
         since = cursor()
         type_file("/etc/right-password")
         wtype("-k Return")
         machine.sleep(1)
         assert "checking the password" not in journal(since)
-        assert pixel(*centre) == COOLDOWN
-        # Still grey 28–29 s in: the cooldown really lasts about 30 s, not just "a while".
+        assert pixel(*inside) == PLAIN
+        # Still counting 28–29 s in: the cooldown really lasts about 30 s, not just "a while".
         machine.sleep(max(0, int(started + 28 - float(machine.succeed("date +%s.%N"))) + 1))
-        assert pixel(*centre) == COOLDOWN, "the cooldown ended before 28 s"
-        wait_for_pixel(FIELD, *centre, timeout=40)
+        assert region(*hint) != resting, "the cooldown ended before 28 s"
+        retry(lambda _: region(*hint) == resting, 40)
         ended = float(machine.succeed("date +%s.%N"))
         machine.log(f"cooldown over after at most {ended - started:.1f} s")
         assert ended - started >= 30
@@ -406,6 +515,82 @@ pkgs.testers.runNixOSTest {
         wtype("-k Return")
         wait_for_log(since, "password accepted")
         wait_for_pixel(DESKTOP)
+
+    with subtest("at scale 1.5, the lock screen is prepared before the lock"):
+        since = cursor()
+        swaymsg("output HEADLESS-1 scale 1.5")
+        wait_for_log(since, "lock screen prepared for 853×480 at scale 1.5 (1280×720 px) in")
+        # The output is 480 px high now.
+        probe = (output["x"] + 5, output["y"] + 240)
+        lock()
+        text = journal(since)
+        assert "at lock time" not in text, text
+        machine.log(f"scale 1.5: drawn, locked after {latencies(since)} ms")
+        # Drawn pixel for pixel: the middle of three dots is white in the output's own
+        # pixels, where a buffer of the wrong size, scaled, would blur it. The field's
+        # top is at 480 of 720 px, its middle 22.5 px below, in the middle of the width.
+        wtype("abc")
+        at = len("P6\n1280 720\n255\n") + (502 * 1280 + 640) * 3
+        def dot_is_white(_):
+            uctl(f"WAYLAND_DISPLAY={display} grim -o HEADLESS-1 -t ppm /home/${user}/frame.ppm")
+            return machine.succeed(f"od -An -tu1 -j {at} -N 3 /home/${user}/frame.ppm").split() == ["255"] * 3
+        retry(dot_is_white, 10)
+        wtype("-k Escape")
+        unlock()
+        since = cursor()
+        swaymsg("output HEADLESS-1 scale 1")
+        wait_for_log(since, "lock screen prepared for 1280×720 at scale 1 (1280×720 px) in")
+        probe = (output["x"] + 5, output["y"] + output["height"] // 2)
+
+    with subtest("a wallpaper, then another, taken up on SIGHUP"):
+        for path, colour in [("${wallpapers}/blue.png", [0x40, 0x80, 0xc0]), ("${wallpapers}/orange.jpg", [0xc0, 0x60, 0x30])]:
+            since = cursor()
+            machine.succeed(f"echo {path} > /etc/wallpaper")
+            uctl("systemctl --user reload idle-manager.service")
+            wait_for_log(since, f"wallpaper {path} ready in")
+            want = toned(colour)
+            machine.succeed(f"loginctl lock-session {session}")
+            wait_for_log(since, "lock screen drawn")
+            wait_for_colour(lambda c: near(c, want), *probe, what=f"the wallpaper {want}")
+            # The top gradient darkens it.
+            top = pixel(probe[0], output["y"] + 5)
+            assert all(t <= w * 0.75 for t, w in zip(top, want)), f"{top} is not darker than {want}"
+            uctl(f"WAYLAND_DISPLAY={display} grim /home/${user}/lock-screen-{path[-3:]}.png")
+            unlock()
+        assert main_pid() == pid, "the daemon restarted"
+        machine.copy_from_machine("/home/${user}/lock-screen-jpg.png")
+
+    with subtest("a lock while the wallpaper loads shows the prepared frame, then the wallpaper"):
+        machine.succeed("echo 3 > /etc/wallpaper-delay; echo ${wallpapers}/blue.png > /etc/wallpaper")
+        since = cursor()
+        uctl("systemctl --user reload idle-manager.service")
+        machine.succeed(f"loginctl lock-session {session}")
+        wait_for_log(since, "lock screen drawn")
+        wait_for_pixel(toned([0xc0, 0x60, 0x30]))
+        assert "ready in" not in journal(since), "the wallpaper was ready before the lock"
+        assert "at lock time" not in journal(since)
+        machine.log(f"locked while loading: drawn, locked after {latencies(since)} ms")
+        wait_for_colour(lambda c: near(c, toned([0x40, 0x80, 0xc0])), *probe, what="the new wallpaper")
+        unlock()
+        machine.succeed("rm /etc/wallpaper-delay")
+
+    with subtest("ten reloads leave the private memory as it was"):
+        # Held off the 5 s idle lock, which would draw frames of its own.
+        since = cursor()
+        uctl("systemd-run --user --unit=no-idle systemd-inhibit --what=idle sleep 60")
+        wait_for_log(since, "logind idle inhibitor held")
+        before = memory(pid)
+        for _ in range(10):
+            since = cursor()
+            uctl("systemctl --user reload idle-manager.service")
+            wait_for_log(since, "wallpaper ${wallpapers}/blue.png ready in")
+            wait_for_log(since, "lock screen prepared for")
+        machine.sleep(1)
+        after = memory(pid)
+        machine.log(f"memory before ten reloads: {json.dumps(before)}; after: {json.dumps(after)}")
+        assert after["RssAnon"] - before["RssAnon"] < 1024, (before, after)
+        assert after["RssShmem"] == before["RssShmem"], (before, after)
+        uctl("systemctl --user stop no-idle.service")
 
     with subtest("the helper checks the password; the daemon keeps it private"):
         helper = "${idleManager}/bin/rust-wl-idle-manager --auth"

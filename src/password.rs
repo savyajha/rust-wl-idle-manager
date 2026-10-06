@@ -73,15 +73,16 @@ pub enum Status {
     Checking,
     /// The last attempt failed (shown for `FAILED_FOR`, or until a key is pressed).
     Failed,
-    /// Too many attempts failed: keys do nothing until the cooldown ends.
-    Cooldown,
+    /// Too many attempts failed: keys do nothing until the cooldown ends, in this many
+    /// seconds (rounded up).
+    Cooldown(u64),
 }
 
 /// Everything the lock screen shows of the entry; it is redrawn only when this changes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Look {
     pub status: Status,
-    /// How many characters are typed.
+    /// How many characters are typed, or were submitted while checking.
     pub chars: usize,
     pub caps_lock: bool,
 }
@@ -109,6 +110,8 @@ pub struct Entry {
     len: usize,
     /// The password was submitted, and the helper has not answered yet.
     checking: bool,
+    /// How many characters were submitted (only their number: the password is wiped).
+    submitted: usize,
     /// Until when a failed attempt is shown.
     failed_until: Option<Instant>,
     /// Failed attempts in a row, and until when keys are ignored after too many.
@@ -120,6 +123,8 @@ pub struct Entry {
     /// The key repeat delay and interval; `None` if keys do not repeat.
     repeat: Option<(Duration, Duration)>,
     pub caps_lock: bool,
+    /// The time last passed in, for the cooldown's countdown.
+    now: Instant,
 }
 
 impl Entry {
@@ -136,6 +141,7 @@ impl Entry {
             page,
             len: 0,
             checking: false,
+            submitted: 0,
             failed_until: None,
             failures: 0,
             cooldown_until: None,
@@ -143,6 +149,7 @@ impl Entry {
             held: None,
             repeat: None,
             caps_lock: false,
+            now: Instant::now(),
         }
     }
 
@@ -150,6 +157,7 @@ impl Entry {
     /// when the password is to be checked. Keys do nothing while it is being checked or
     /// during a cooldown.
     pub fn press(&mut self, key: Key, code: u32, now: Instant) -> bool {
+        self.now = now;
         if self.checking || self.cooldown_until.is_some() {
             return false;
         }
@@ -157,7 +165,10 @@ impl Entry {
         self.held = None;
         match key {
             // An empty password is never checked.
-            Key::Enter => self.checking = self.len > 0,
+            Key::Enter => {
+                self.checking = self.len > 0;
+                self.submitted = self.chars();
+            }
             Key::Escape => self.wipe(),
             Key::Backspace | Key::Char(_) => {
                 self.edit(key, now);
@@ -230,6 +241,7 @@ impl Entry {
     /// `COOLDOWN_AFTER` failures in a row. Returns false, ignoring the answer, if no check
     /// was under way (the lock ended since).
     pub fn checked(&mut self, ok: bool, now: Instant) -> bool {
+        self.now = now;
         if !self.checking {
             return false;
         }
@@ -262,15 +274,26 @@ impl Entry {
     pub fn reset(&mut self) {
         self.wipe();
         self.checking = false;
+        self.submitted = 0;
         self.failed_until = None;
         self.failures = 0;
         self.cooldown_until = None;
     }
 
+    /// The whole seconds the cooldown has left, rounded up, if there is one.
+    fn cooldown_seconds(&self) -> Option<u64> {
+        let left = self.cooldown_until?.saturating_duration_since(self.now);
+        Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
+    }
+
     /// When `tick` next has something to do.
     pub fn deadline(&self) -> Option<Instant> {
         let held = self.held.as_ref().map(|held| held.next);
-        [held, self.failed_until, self.cooldown_until, self.forget_at]
+        // The countdown's next whole second, the last of which ends the cooldown.
+        let second = self.cooldown_until.zip(self.cooldown_seconds());
+        let second =
+            second.map(|(until, left)| until - Duration::from_secs(left.saturating_sub(1)));
+        [held, self.failed_until, second, self.forget_at]
             .into_iter()
             .flatten()
             .min()
@@ -279,6 +302,7 @@ impl Entry {
     /// Do what is due at `now`: repeat a held key, stop showing a failure, end a
     /// cooldown, forget a password left untouched.
     pub fn tick(&mut self, now: Instant) {
+        self.now = now;
         if let (Some(held), Some((_, interval))) = (&mut self.held, self.repeat)
             && held.next <= now
         {
@@ -311,8 +335,8 @@ impl Entry {
     pub fn look(&self) -> Look {
         let status = if self.checking {
             Status::Checking
-        } else if self.cooldown_until.is_some() {
-            Status::Cooldown
+        } else if let Some(seconds) = self.cooldown_seconds() {
+            Status::Cooldown(seconds)
         } else if self.failed_until.is_some() {
             Status::Failed
         } else if self.len > 0 {
@@ -322,9 +346,18 @@ impl Entry {
         };
         Look {
             status,
-            chars: self.bytes().iter().filter(|&&b| starts_char(b)).count(),
+            chars: if self.checking {
+                self.submitted
+            } else {
+                self.chars()
+            },
             caps_lock: self.caps_lock,
         }
+    }
+
+    /// How many characters are typed.
+    fn chars(&self) -> usize {
+        self.bytes().iter().filter(|&&b| starts_char(b)).count()
     }
 }
 
@@ -564,17 +597,17 @@ mod tests {
             assert_eq!(entry.look().status, Status::Failed);
         }
         attempt(&mut entry, false, now);
-        assert_eq!(entry.look().status, Status::Cooldown);
-        assert_eq!(entry.deadline(), Some(now + COOLDOWN));
+        assert_eq!(entry.look().status, Status::Cooldown(30));
+        assert_eq!(entry.deadline(), Some(now + Duration::from_secs(1)));
 
         // Keys type nothing and submit nothing until it ends.
         for key in [Key::Char('x'), Key::Backspace, Key::Escape, Key::Enter] {
             assert!(!entry.press(key, 5, now));
         }
         assert_eq!(entry.bytes(), b"");
-        assert_eq!(entry.deadline(), Some(now + COOLDOWN));
         entry.tick(now + COOLDOWN - Duration::from_millis(1));
-        assert_eq!(entry.look().status, Status::Cooldown);
+        assert_eq!(entry.look().status, Status::Cooldown(1));
+        assert_eq!(entry.deadline(), Some(now + COOLDOWN));
         let now = now + COOLDOWN;
         entry.tick(now);
         assert_eq!(entry.look().status, Status::Idle);
@@ -586,7 +619,43 @@ mod tests {
             assert_eq!(entry.look().status, Status::Failed);
         }
         attempt(&mut entry, false, now);
-        assert_eq!(entry.look().status, Status::Cooldown);
+        assert!(matches!(entry.look().status, Status::Cooldown(_)));
+    }
+
+    #[test]
+    fn the_cooldown_counts_down_each_second() {
+        let (mut entry, now) = entry();
+        for _ in 0..5 {
+            attempt(&mut entry, false, now);
+        }
+        let mut seen = Vec::new();
+        while let Some(at) = entry.deadline() {
+            entry.tick(at);
+            seen.push((at - now, entry.look().status));
+        }
+        assert_eq!(seen.len(), 30);
+        assert_eq!(seen[0], (Duration::from_secs(1), Status::Cooldown(29)));
+        assert_eq!(seen[28], (Duration::from_secs(29), Status::Cooldown(1)));
+        assert_eq!(seen[29], (COOLDOWN, Status::Idle));
+        // From part-way through a second, the next wake is at the whole second.
+        for _ in 0..5 {
+            attempt(&mut entry, false, now);
+        }
+        entry.tick(now + Duration::from_millis(1500));
+        assert_eq!(entry.look().status, Status::Cooldown(29));
+        assert_eq!(entry.deadline(), Some(now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn checking_shows_the_number_of_characters_submitted() {
+        let (mut entry, now) = entry();
+        type_text(&mut entry, "pwé", now);
+        entry.press(Key::Enter, 4, now);
+        drop(entry.submission());
+        assert_eq!(entry.bytes(), b"");
+        assert_eq!(entry.look().chars, 3);
+        entry.checked(false, now);
+        assert_eq!(entry.look().chars, 0);
     }
 
     #[test]
@@ -601,7 +670,7 @@ mod tests {
             assert_eq!(entry.look().status, Status::Failed);
         }
         attempt(&mut entry, false, now);
-        assert_eq!(entry.look().status, Status::Cooldown);
+        assert!(matches!(entry.look().status, Status::Cooldown(_)));
     }
 
     #[test]

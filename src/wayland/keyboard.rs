@@ -59,7 +59,7 @@ impl Dispatch<WlSeat, ()> for State {
             return;
         };
         let has_keyboard = capabilities.contains(Capability::Keyboard);
-        if has_keyboard && state.lock_screen && state.keyboard.is_none() {
+        if has_keyboard && state.painter.is_some() && state.keyboard.is_none() {
             state.keyboard = Some(seat.get_keyboard(qh, ()));
         } else if !has_keyboard && let Some(keyboard) = state.keyboard.take() {
             keyboard.release();

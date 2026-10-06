@@ -111,12 +111,17 @@ clears it. tokio's clock does not advance during suspend, so a wait left over
 from an earlier sleep could otherwise end during the next one and release its
 inhibitor early.
 
-The inhibitor fd is close-on-exec, so no program the daemon executed could
+The inhibitor fd is close-on-exec, so no program the daemon executes can
 inherit it. zbus receives file descriptors without `MSG_CMSG_CLOEXEC`, but
 zvariant hands back a duplicate made with `F_DUPFD_CLOEXEC`; the original
-closes with the reply message. The only program the daemon executes itself
-is its authentication helper (commands run as systemd units), and the fd
-stays out of it.
+closes with the reply message. Until then, the daemon's own children (the
+authentication helper and the wallpaper command; other commands run as
+systemd units) could inherit that original, so between fork and exec they
+mark every fd above stderr close-on-exec (`close_range(3, ~0,
+CLOSE_RANGE_CLOEXEC)`, which keeps the pipe on which std reports a failed
+exec). This is best effort: where `close_range` fails (kernels before 5.11, or
+a seccomp filter), the child is started anyway rather than leaving the
+password unchecked.
 
 ### Re-creating notifications
 
@@ -137,18 +142,12 @@ within milliseconds. smithay-client-toolkit tracks the outputs and
 provides the session lock and shared-memory buffers.
 
 A lock request creates the lock and one lock surface per output. When the
-compositor configures a surface with its size, it is drawn and committed: a
-plain background with the password field in the middle (see below); for now
-the lock screen shows nothing else. Buffers come
-from one shared-memory pool, kept between locks. While unlocked, whenever an
-output appears or changes, the pool is grown to hold a lock surface for every
-output (from its logical size) and the background is drawn into it once, so
-even the first lock draws into pages already in memory rather than faulting
-in fresh ones. Those pages stay resident: width × height × 4 bytes per
-output. A buffer is destroyed once the compositor releases it. Each lock logs
-the time from the request to the first committed surface and to the
-compositor's `locked` event; both are measured while dispatching and logged
-after the requests are flushed, so logging never delays a commit.
+compositor configures a surface with its size, it is drawn and committed (see
+"Drawing" below). Buffers come from one shared-memory pool. A buffer is
+destroyed once the compositor releases it. Each lock logs the time from the
+request to the first committed surface and to the compositor's `locked`
+event; both are measured while dispatching and logged after the requests are
+flushed, so logging never delays a commit.
 
 The `locked` event tells the policy the session is locked. niri sends it once
 every output shows a lock surface; sway sends it as soon as it accepts the
@@ -204,15 +203,142 @@ a failure display or of a cooldown, and forgetting the password. A repeated
 character is the password's last character typed again, so no copy of it is
 kept for repeating.
 
-The password field is drawn without text: a rectangle in the middle of each
-output, with a square dot per character (at most 14 shown). Its colour shows
-the state: the usual colour while idle or typing, blue while the password is
-being checked, red for 1.5 s after a failure (or until the next key), grey
-during a cooldown. A yellow bar below it shows that caps lock is on. Each
-time `Wayland::next` goes round, it compares this state with what is shown,
-and redraws every surface, in full, only if it changed. The entry's state
-machine, `Entry`, does no I/O apart from one log line when a cooldown starts;
-the time is passed in, and it is unit-tested.
+What the lock screen shows of the entry is its `Look`: the state, the number
+of characters, and caps lock. At rest it shows "Enter Password"; while typing,
+a field with a dot per character (as many as fit); while the password is
+checked, the field and its dots at half their opacity (the entry keeps the
+number of characters submitted, never the characters, since the password is
+wiped as soon as the helper has it); for 1.5 s after a failure (or until the
+next key), the field without dots, outlined in the error colour; during a
+cooldown, "Try again in N s" in place of the field, counting down each second.
+"Caps Lock is on" shows under the field whenever caps lock is. Each time
+`Wayland::next` goes round, it compares the look with what is shown, and
+redraws every surface, in full, only if it changed. The entry's state machine,
+`Entry`, does no I/O apart from one log line when a cooldown starts; the time
+is passed in (and kept, for the countdown), and it is unit-tested.
+
+### Drawing
+
+The lock screen is drawn with cairo, and its text with Pango (through
+pangocairo), the text stack GTK uses, without GTK: the same font, optical size
+(Adwaita Sans is a variable font with a `wght` and an `opsz` axis, which Pango
+sets from the size), fallback and shaping as GTK applications. The font is
+GTK's default, `gtk-font-name` in `$XDG_CONFIG_HOME/gtk-4.0/settings.ini` (by
+default "Sans"), at the size and weight each widget asks for. Colours are
+literal `#rrggbb[aa]` or GTK's named colours from `gtk-4.0/gtk.css`: only its
+`@define-color <name> #hex;` lines are read (matugen writes them), and a
+missing file or name falls back to built-in defaults, logged.
+
+The layout comes from the config's `lock-screen` block: a widget each for the
+background, date, clock, avatar, name and password field, each placed at one
+of nine anchors of the output and moved by an offset in logical pixels, away
+from the edges it is anchored to. Without the block, the default
+(`DEFAULT_LOCK_SCREEN` in config.rs) is the look of the design it was made
+from. A widget's box is its text's logical box (as Pango lays it out), the
+avatar's circle, or the password field with the caps lock line under it.
+
+Everything a frame needs is prepared ahead of time, per output, in a `Scene`:
+the background at a quarter of the output's physical size (the blurred
+wallpaper scaled to cover it, or a plain colour, with a dark gradient at the
+top and the bottom), and every text rendered at the output's scale and placed:
+the date, clock and name, the initial, "Enter Password", "⇪ Caps Lock is on"
+and the arrow "→" (the two symbols are text too, in GTK's font or its
+fallback). Drawing a frame paints into a shared-memory buffer through a cairo
+surface over it: the background scaled up with bilinear filtering (about 4 ms
+at 2560 × 1600), the texts composited, and a few shapes filled: the frosted
+circle, field and button (white at a low opacity over the blurred background,
+with a one-pixel inner outline) and the dots.
+
+While unlocked, each output's first frame (at rest, as a lock begins) is also
+drawn ahead of time, into a buffer of its own in the pool, kept. A lock
+attaches that buffer and commits: no drawing at all between the request and
+the first commit. If the compositor still holds that buffer from the last
+lock, or it shows something else (caps lock, say), the first frame is drawn
+then instead. The frame is drawn again whenever its scene changes: at startup,
+when an output appears or changes, on a reload, and each minute the clock or
+date changes.
+
+Each output has at most two buffers: the one the compositor shows and one to
+draw the next frame in, each remembered with what it shows, so that one that
+already shows the frame wanted is attached again without drawing. When the
+compositor holds both, the output waits: its release of one is an event, which
+wakes the loop, and the latest look is drawn then. So typing never takes more
+than two frames of memory per output, and a key shows within a frame or two
+(about 1.2 ms from the key event to the commit of its frame in the VM). After
+an unlock, the pool, which grew to two frames per output (and cannot shrink),
+is replaced by a new one holding just the next lock's first frames.
+
+No font is loaded, no glyph rasterised, no image decoded and no file read on
+the way from a lock request to its first commit. Rendering while locked happens
+only for: an output that appears during a lock, or a lock surface whose
+preferred scale is not the expected one (both logged "at lock time"); a reload
+while locked (the lock screen is prepared again and redrawn); the restart
+re-lock (L9), which may lock before the outputs are known; each new minute of
+the clock; and the countdown, once a second during a cooldown (a cooldown
+never starts with a lock). A fade-in and a shake after a wrong password are
+not done (yet).
+
+A part that fails to render is logged as an error and left out; a frame
+always has at least its background, or the plain colour, so a lock never shows
+nothing. Rendering fails only when the environment does (say, a broken
+fontconfig): the config is checked when it is loaded, so that a config that
+loads can always be drawn: every number has a range (sizes up to 1000 logical
+pixels, the field up to 4000 wide), colours, formats and commands are checked,
+and a text longer than 8192 pixels is cut off.
+
+The clock is checked after each flush, so a new minute is never rendered
+between a lock request and its first commit; a timer wakes the loop at the
+next minute. The check runs once the minute changes, and compares the
+formatted text with what is shown, so it also catches up at once after a
+suspend, when tokio's timers are late.
+
+#### The wallpaper
+
+The `background` widget's `wallpaper-command` prints the wallpaper's path, on
+its first non-empty line. It runs at startup (once the sleep inhibitor is held) and on a reload
+(SIGHUP), as a child process, for at most 5 seconds. A reload while one is
+running loads the wallpaper once more after it. The file's header is read
+first, and an image over 64 megapixels is refused. It is decoded (PNG by
+cairo, JPEG by zune-jpeg, straight into cairo's pixel layout), scaled down to a
+quarter by cairo (which averages the pixels it replaces), blurred with three
+box blurs (approximating a Gaussian, with the configured radius divided by
+four), and toned (brightness, then saturation, as CSS's filters do), on one of
+tokio's blocking threads: for a 2560 × 1440 PNG, decoding alone takes about 120
+ms, which must not hold up the event loop. Only the small result is kept (640
+× 360 × 4 bytes for that wallpaper); every output's lock screen is then
+prepared again from it. If the command fails or its file cannot be decoded,
+the error is logged and the background stays as it was (at startup, the plain
+colour). The home-manager unit that follows the wallpaper reloads the daemon
+(`systemctl --user reload rust-wl-idle-manager`), which also rereads gtk.css,
+so matugen's new colours arrive with the new wallpaper.
+
+#### Scale
+
+Each output is drawn at its real scale. With `wp-fractional-scale-v1` and
+`wp-viewporter` (niri and sway have both), each lock surface gets a viewport
+whose destination is its logical size, and a buffer of logical size × scale,
+rounded as the protocol asks, except that where that is within a pixel of the
+output's mode, the mode's size is used (niri reports a 2560 px panel at 1.5×
+as 1707 logical pixels, and 1707 × 1.5 rounds to 2561). Without them, the
+output's integer scale is the buffer scale. The compositor says the scale it
+prefers only once a surface exists, so until it has, the lock screen is
+prepared at the scale it will most likely prefer: the current mode's width
+over the logical width, to the nearest 1/120. The scale it does prefer is
+kept for later locks. Text and shapes are rendered at the physical size, and
+placed on whole physical pixels.
+
+#### Memory
+
+Per output, the pool holds the prepared first frame (W × H × 4 bytes of shared
+memory: 16 MB for a 2560 × 1600 panel at 1.5×, 3.7 MB for 1280 × 720 at 1×),
+the scene holds the background at a sixteenth of that (1 MB at 2560 × 1600)
+and its texts (a few hundred kB at 1.5×, the clock being the largest), and the
+blurred wallpaper takes another megabyte or so. While locked, the pool grows
+to two frames per output, and is replaced at unlock.
+Pango, fontconfig, cairo and GLib add about 3 MB of private memory (more with
+many fonts installed), and their libraries' pages, which are shared with
+every GTK application on the system. Decoding a wallpaper briefly takes tens
+of megabytes, which are handed back to the system afterwards (`malloc_trim`).
 
 ### Checking the password
 
@@ -340,8 +466,11 @@ to accept the request, not for the program to finish.
 The daemon runs on a single-threaded tokio runtime. Its one Wayland
 connection's file descriptor is registered with tokio through `AsyncFd`, and
 events are read with wayland-client's `prepare_read` and `read`, so no second
-event loop or thread is needed. While it waits for the socket it also waits
-for the lock screen's nearest timer (key repeat and the like). The
+event loop is needed. While it waits for the socket it also waits for the lock
+screen's nearest timer (key repeat and the like) and the clock's next minute.
+The only other threads are GLib's own and, while a wallpaper is being decoded,
+one of tokio's blocking threads; cairo and Pango objects stay on the main
+thread, and the decoding thread hands back plain pixels. The
 authentication helper is a tokio child process, awaited in the main loop.
 Requests are flushed after every dispatch and right after a lock request, so
 a lock never waits for other work. D-Bus goes

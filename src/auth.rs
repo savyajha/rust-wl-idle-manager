@@ -20,6 +20,23 @@ const SERVICE: &str = "rust-wl-idle-manager";
 /// How long the helper may take before it is killed and the attempt counts as failed.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Make `command`'s child close every fd but stdin, stdout and stderr as it executes. An fd
+/// the daemon has just received over D-Bus (the sleep inhibitor's) lacks close-on-exec
+/// until zbus drops the message it came in.
+pub fn only_stdio(command: &mut Command) -> &mut Command {
+    // SAFETY: close_range is a system call, safe between fork and exec. Marking the fds
+    // close-on-exec, rather than closing them, keeps the pipe std reports exec errors on.
+    // A failure (a kernel before 5.11, or a seccomp filter) is ignored: the fds it would
+    // drop are already close-on-exec except in brief windows, and failing the spawn would
+    // stop the password check altogether.
+    unsafe {
+        command.pre_exec(|| {
+            libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as i32);
+            Ok(())
+        })
+    }
+}
+
 /// One password check: the helper process, started by `start`.
 pub struct Attempt {
     child: Child,
@@ -31,7 +48,7 @@ pub struct Attempt {
 /// which is then closed. Nothing else carries the password.
 pub async fn start(password: &[u8]) -> io::Result<Attempt> {
     // This binary, even if its file has been replaced since.
-    let mut child = Command::new("/proc/self/exe")
+    let mut child = only_stdio(&mut Command::new("/proc/self/exe"))
         .arg0("rust-wl-idle-manager")
         .arg("--auth")
         .stdin(Stdio::piped())

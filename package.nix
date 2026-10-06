@@ -1,8 +1,13 @@
 {
   lib,
   rustPlatform,
+  pkg-config,
+  adwaita-fonts,
+  cairo,
   libxkbcommon,
   linux-pam,
+  makeFontsConf,
+  pango,
 }:
 
 rustPlatform.buildRustPackage {
@@ -13,11 +18,19 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ./Cargo.lock;
 
-  # xkbcommon decodes the keyboard; PAM is called only by the `--auth` helper.
+  nativeBuildInputs = [ pkg-config ];
+  # xkbcommon decodes the keyboard; PAM is called only by the `--auth` helper; Pango and
+  # cairo draw the lock screen.
   buildInputs = [
+    cairo
     libxkbcommon
     linux-pam
+    pango
   ];
+
+  # A font for the unit tests that draw text.
+  FONTCONFIG_FILE = makeFontsConf { fontDirectories = [ adwaita-fonts ]; };
+  preCheck = "export XDG_CACHE_HOME=$TMPDIR";
 
   meta = with lib; {
     description = "Idle daemon for Wayland compositors, built for niri";

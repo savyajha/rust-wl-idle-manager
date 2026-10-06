@@ -1,14 +1,18 @@
 mod auth;
 mod config;
+mod draw;
+mod gtk;
 mod logind;
 mod password;
 mod policy;
 mod systemd;
+mod wallpaper;
 mod wayland;
 
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
+use std::mem;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
@@ -17,12 +21,13 @@ use std::time::Duration;
 use anyhow::Context;
 use futures_lite::StreamExt;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 use tracing::{error, info};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::Connection;
 
-use config::Config;
+use config::{Background, Config};
 use logind::{LogindManagerProxy, idle_inhibited};
 use policy::{Command, Input, Policy};
 use systemd::SystemdManagerProxy;
@@ -231,9 +236,21 @@ impl Runner {
     }
 }
 
+/// Start loading the wallpaper `background` names, if it names one.
+fn load_wallpaper(
+    background: &Option<Background>,
+) -> Option<JoinHandle<anyhow::Result<wallpaper::Blurred>>> {
+    let background = background
+        .clone()
+        .filter(|b| b.wallpaper_command.is_some())?;
+    Some(tokio::spawn(wallpaper::load(background)))
+}
+
 /// Load the config, then run the commands that idle and logind events lead to until
 /// SIGTERM; an error ends the run, but a failed command is only logged.
 async fn run(config_path: &Path) -> anyhow::Result<()> {
+    // First: until the handler is in place, a SIGHUP (a reload) would end the daemon.
+    let mut sighup = signal(SignalKind::hangup()).context("listening for SIGHUP")?;
     let mut sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
     let config = Config::load(config_path)?;
     let session = Connection::session()
@@ -269,12 +286,19 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         .map(|timeout| (timeout.after, timeout.ignore_inhibit))
         .collect();
     let lock_screen = config.locker.is_none();
-    let mut wayland = Wayland::connect(&timeouts, lock_screen)?;
+    let look = config.lock_screen.filter(|_| lock_screen);
+    let background = look.as_ref().and_then(|look| look.background.clone());
+    let mut wayland = Wayland::connect(&timeouts, look)?;
     let inhibitor = logind.sleep_inhibitor().await?;
+    // Only now: until its reply is dropped, zbus holds the inhibitor's fd without
+    // close-on-exec, and a command started meanwhile would inherit it.
+    let mut wallpaper = load_wallpaper(&background);
+    // A SIGHUP while the wallpaper loads: load it again once it has.
+    let mut reload = false;
     let mut runner = Runner {
         systemd,
         logind,
-        locker: config.locker,
+        locker: config.locker.as_ref().map(config::Command::argv),
         spawned: 0,
         inhibitor: Some(inhibitor),
         lock_wait: None,
@@ -334,6 +358,26 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             {
                 runner.lock_wait = None;
                 Input::LockWaitTimedOut
+            }
+            loaded = async { wallpaper.as_mut().expect("checked").await }, if wallpaper.is_some() => {
+                let blurred = loaded.context("loading the wallpaper")?.inspect_err(|e| {
+                    error!("{e:#}; keeping the background as it was");
+                });
+                wayland.set_wallpaper(blurred.ok());
+                wallpaper = mem::take(&mut reload).then(|| load_wallpaper(&background)).flatten();
+                continue;
+            }
+            _ = sighup.recv() => {
+                info!("SIGHUP: reloading the wallpaper and GTK's colours");
+                reload = wallpaper.is_some();
+                if !reload {
+                    wallpaper = load_wallpaper(&background);
+                }
+                // Without a wallpaper command, the colours are read again now.
+                if background.as_ref().is_none_or(|b| b.wallpaper_command.is_none()) {
+                    wayland.set_wallpaper(None);
+                }
+                continue;
             }
             _ = sigterm.recv() => return Ok(()),
         };

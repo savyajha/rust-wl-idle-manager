@@ -16,6 +16,7 @@ use tokio::time::{self, Instant};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
+use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{
@@ -25,11 +26,20 @@ use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
     Event, ExtIdleNotificationV1,
 };
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use xkbcommon::xkb;
 
+use crate::config::LockScreen;
+use crate::draw::{self, Painter};
 use crate::password::Entry;
 use crate::policy::Input;
-use lock::Lock;
+use lock::{Lock, Prepared};
+
+/// The globals for fractional scaling, when the compositor has both.
+type Scaling = (WpFractionalScaleManagerV1, WpViewporter);
 
 /// The daemon's one connection to the compositor: an idle notification per configured
 /// timeout, and the built-in lock screen with its keyboard.
@@ -64,8 +74,15 @@ struct State {
     /// The memory lock surfaces draw into, kept from one lock to the next.
     pool: SlotPool,
     lock_manager: SessionLockState,
-    /// Whether the built-in lock screen is in use, so the pool is prepared for it.
-    lock_screen: bool,
+    scaling: Option<Scaling>,
+    /// What draws the built-in lock screen, if it is in use.
+    painter: Option<Painter>,
+    /// Each output's lock screen, prepared ahead of the lock.
+    scenes: Vec<Prepared>,
+    /// The scale the compositor last preferred for each output's lock surface.
+    preferred: Vec<(WlOutput, u32)>,
+    /// The minute the clock was last rendered for.
+    minute: i64,
     /// The lock we requested, until it is unlocked or the compositor ends it.
     lock: Option<Lock>,
     /// Lock latencies measured while dispatching, to log once requests are flushed.
@@ -74,8 +91,11 @@ struct State {
 
 impl Wayland {
     /// Connect to the compositor and create one notification per `(timeout, ignore_inhibit)`.
-    /// With `lock_screen`, the compositor must support `ext-session-lock-v1`.
-    pub fn connect(timeouts: &[(Duration, bool)], lock_screen: bool) -> anyhow::Result<Self> {
+    /// With a `lock_screen`, the compositor must support `ext-session-lock-v1`.
+    pub fn connect(
+        timeouts: &[(Duration, bool)],
+        lock_screen: Option<LockScreen>,
+    ) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env().context("connecting to the Wayland compositor")?;
         let (globals, queue) =
             registry_queue_init::<State>(&conn).context("listing Wayland globals")?;
@@ -93,7 +113,7 @@ impl Wayland {
             list.iter()
                 .any(|global| global.interface == "ext_session_lock_manager_v1")
         });
-        if lock_screen && !can_lock {
+        if lock_screen.is_some() && !can_lock {
             bail!("the built-in lock screen needs ext-session-lock-v1, which the compositor lacks");
         }
         let shm = Shm::bind(&globals, &qh).context("binding wl_shm")?;
@@ -108,11 +128,18 @@ impl Wayland {
             compositor: globals
                 .bind(&qh, 1..=4, ())
                 .context("binding wl_compositor")?,
-            // Sized and drawn on once the outputs are known (see `prepare_pool`).
+            // Grown as the lock screen is prepared for each output.
             pool: SlotPool::new(1, &shm).context("creating the lock screen's buffer pool")?,
             shm,
             lock_manager: SessionLockState::new(&globals, &qh),
-            lock_screen,
+            scaling: globals
+                .bind(&qh, 1..=1, ())
+                .ok()
+                .zip(globals.bind(&qh, 1..=1, ()).ok()),
+            painter: lock_screen.map(Painter::new),
+            scenes: Vec::new(),
+            preferred: Vec::new(),
+            minute: draw::minute(),
             lock: None,
             latencies: Vec::new(),
         };
@@ -169,6 +196,10 @@ impl Wayland {
             // Before returning, so that lock surfaces drawn while dispatching go out at once.
             self.flush()?;
             self.state.log_latencies();
+            // After the flush, so that a new minute never delays a lock.
+            if self.state.refresh_clock() {
+                continue;
+            }
             if let Some(input) = self.state.inputs.pop_front() {
                 return Ok(input);
             }
@@ -185,6 +216,10 @@ impl Wayland {
                     if deadline.is_some() =>
                 {
                     self.state.entry.tick(std::time::Instant::now());
+                    continue;
+                }
+                // The clock's next minute.
+                () = time::sleep(draw::until_next_minute()), if self.state.painter.is_some() => {
                     continue;
                 }
             };
@@ -225,6 +260,9 @@ impl Dispatch<ExtIdleNotificationV1, usize> for State {
 }
 
 delegate_noop!(State: ExtIdleNotifierV1);
+delegate_noop!(State: WpFractionalScaleManagerV1);
+delegate_noop!(State: WpViewporter);
+delegate_noop!(State: WpViewport);
 delegate_noop!(State: WlCompositor);
 // A lock surface covers its one output, so its enter, leave and scale events change nothing.
 delegate_noop!(State: ignore WlSurface);

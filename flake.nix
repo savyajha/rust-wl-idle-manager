@@ -19,6 +19,7 @@
             nativeBuildInputs = [
               pkgs.rustPlatform.cargoSetupHook
               pkgs.cargo
+              pkgs.pkg-config
             ]
             ++ tools;
             inherit (self.packages.${system}.rust-wl-idle-manager) buildInputs;
