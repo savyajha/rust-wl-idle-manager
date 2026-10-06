@@ -3,6 +3,7 @@ mod lock;
 
 use std::collections::VecDeque;
 use std::io::ErrorKind;
+use std::mem;
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::Duration;
 
@@ -16,7 +17,6 @@ use tokio::time::{self, Instant};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
-use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{
@@ -32,42 +32,50 @@ use wayland_protocols::wp::viewporter::client::{
 };
 use xkbcommon::xkb;
 
-use crate::config::LockScreen;
+use crate::config::{LockScreen, Timeout};
 use crate::draw::{self, Painter};
-use crate::password::Entry;
+use crate::entry::Entry;
 use crate::policy::Input;
-use lock::{Lock, Prepared};
+use lock::{Lock, Output};
 
 /// The globals for fractional scaling, when the compositor has both.
 type Scaling = (WpFractionalScaleManagerV1, WpViewporter);
 
-/// The daemon's one connection to the compositor: an idle notification per configured
-/// timeout, and the built-in lock screen with its keyboard.
+/// The daemon's connection to the compositor: idle notifications and the lock screen.
 pub struct Wayland {
     queue: EventQueue<State>,
     state: State,
     seat: WlSeat,
     notifier: ExtIdleNotifierV1,
-    /// Each timeout's `(timeout, ignore_inhibit)`, as given to `connect`.
-    timeouts: Vec<(Duration, bool)>,
-    /// The notification for each timeout, by index.
+    timeouts: Vec<Idle>,
     notifications: Vec<ExtIdleNotificationV1>,
-    /// A duplicate of the connection's fd, registered with tokio.
     fd: AsyncFd<OwnedFd>,
+}
+
+#[derive(Clone, Copy)]
+struct Idle {
+    ms: u32,
+    ignore_inhibit: bool,
+}
+
+pub enum Next {
+    Input(Input),
+    /// A password was submitted on the lock screen; `Entry::submission` has it.
+    Password,
 }
 
 /// What the Wayland queue dispatches to.
 struct State {
     /// Inputs dispatched from the queue but not yet returned by `next`.
     inputs: VecDeque<Input>,
+    submitted: bool,
     registry: RegistryState,
-    outputs: OutputState,
+    output_state: OutputState,
     /// The first keyboard to appear, while the seat has one (lock screen only).
     keyboard: Option<WlKeyboard>,
     xkb: xkb::Context,
-    /// The keyboard's keymap and modifiers, once the compositor has sent the keymap.
+    /// The keymap and modifiers, once the compositor has sent the keymap.
     xkb_state: Option<xkb::State>,
-    /// The password typed on the lock screen.
     entry: Entry,
     compositor: WlCompositor,
     shm: Shm,
@@ -75,27 +83,19 @@ struct State {
     pool: SlotPool,
     lock_manager: SessionLockState,
     scaling: Option<Scaling>,
-    /// What draws the built-in lock screen, if it is in use.
     painter: Option<Painter>,
-    /// Each output's lock screen, prepared ahead of the lock.
-    scenes: Vec<Prepared>,
-    /// The scale the compositor last preferred for each output's lock surface.
-    preferred: Vec<(WlOutput, u32)>,
+    outputs: Vec<Output>,
     /// The minute the clock was last rendered for.
     minute: i64,
-    /// The lock we requested, until it is unlocked or the compositor ends it.
     lock: Option<Lock>,
     /// Lock latencies measured while dispatching, to log once requests are flushed.
     latencies: Vec<(&'static str, Duration)>,
 }
 
 impl Wayland {
-    /// Connect to the compositor and create one notification per `(timeout, ignore_inhibit)`.
-    /// With a `lock_screen`, the compositor must support `ext-session-lock-v1`.
-    pub fn connect(
-        timeouts: &[(Duration, bool)],
-        lock_screen: Option<LockScreen>,
-    ) -> anyhow::Result<Self> {
+    /// Connect to the compositor and create one notification per timeout. With a
+    /// `lock_screen`, the compositor must support `ext-session-lock-v1`.
+    pub fn connect(timeouts: &[Timeout], lock_screen: Option<LockScreen>) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env().context("connecting to the Wayland compositor")?;
         let (globals, queue) =
             registry_queue_init::<State>(&conn).context("listing Wayland globals")?;
@@ -106,7 +106,14 @@ impl Wayland {
         let notifier: ExtIdleNotifierV1 = globals
             .bind(&qh, 1..=2, ())
             .context("binding ext_idle_notifier_v1")?;
-        if notifier.version() < 2 && timeouts.iter().any(|&(_, ignore)| ignore) {
+        let timeouts: Vec<_> = timeouts
+            .iter()
+            .map(|timeout| Idle {
+                ms: u32::try_from(timeout.after.as_millis()).unwrap_or(u32::MAX),
+                ignore_inhibit: timeout.ignore_inhibit,
+            })
+            .collect();
+        if notifier.version() < 2 && timeouts.iter().any(|idle| idle.ignore_inhibit) {
             bail!("ignore-inhibit needs ext_idle_notifier_v1 version 2; the compositor has 1");
         }
         let can_lock = globals.contents().with_list(|list| {
@@ -119,8 +126,9 @@ impl Wayland {
         let shm = Shm::bind(&globals, &qh).context("binding wl_shm")?;
         let state = State {
             inputs: VecDeque::new(),
+            submitted: false,
             registry: RegistryState::new(&globals),
-            outputs: OutputState::new(&globals, &qh),
+            output_state: OutputState::new(&globals, &qh),
             keyboard: None,
             xkb: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
@@ -137,8 +145,7 @@ impl Wayland {
                 .ok()
                 .zip(globals.bind(&qh, 1..=1, ()).ok()),
             painter: lock_screen.map(Painter::new),
-            scenes: Vec::new(),
-            preferred: Vec::new(),
+            outputs: Vec::new(),
             minute: draw::minute(),
             lock: None,
             latencies: Vec::new(),
@@ -150,10 +157,10 @@ impl Wayland {
             state,
             seat,
             notifier,
-            timeouts: timeouts.to_vec(),
+            timeouts,
             notifications: Vec::new(),
         };
-        wayland.notifications = (0..timeouts.len())
+        wayland.notifications = (0..wayland.timeouts.len())
             .map(|i| wayland.notification(i))
             .collect();
         Ok(wayland)
@@ -173,8 +180,7 @@ impl Wayland {
 
     /// Ask for a notification for the timeout at `index`; it is sent on the next flush.
     fn notification(&self, index: usize) -> ExtIdleNotificationV1 {
-        let (after, ignore_inhibit) = self.timeouts[index];
-        let ms = u32::try_from(after.as_millis()).unwrap_or(u32::MAX);
+        let Idle { ms, ignore_inhibit } = self.timeouts[index];
         let qh = self.queue.handle();
         if ignore_inhibit {
             self.notifier
@@ -185,8 +191,14 @@ impl Wayland {
         }
     }
 
-    /// Wait for the next input from the compositor; an error means the compositor is gone.
-    pub async fn next(&mut self) -> anyhow::Result<Input> {
+    /// The password typed on the lock screen; changes show on the next `next`.
+    pub fn entry_mut(&mut self) -> &mut Entry {
+        &mut self.state.entry
+    }
+
+    /// Wait for the next input from the compositor, or a password submitted; an error means
+    /// the compositor is gone. Cancel-safe: what has been dispatched stays queued.
+    pub async fn next(&mut self) -> anyhow::Result<Next> {
         loop {
             self.queue
                 .dispatch_pending(&mut self.state)
@@ -200,25 +212,25 @@ impl Wayland {
             if self.state.refresh_clock() {
                 continue;
             }
+            if mem::take(&mut self.state.submitted) {
+                return Ok(Next::Password);
+            }
             if let Some(input) = self.state.inputs.pop_front() {
-                return Ok(input);
+                return Ok(Next::Input(input));
             }
             // Only the system backend returns None (events queued); dispatch_pending takes them.
             let Some(guard) = self.queue.prepare_read() else {
                 continue;
             };
-            // The lock screen's timers: key repeat, the failure shown, the cooldown, forgetting
-            // the password.
-            let deadline = self.state.entry.deadline();
+            let deadline = self.state.entry.deadline(Instant::now());
             let mut ready = tokio::select! {
                 ready = self.fd.readable() => ready.context("waiting for the Wayland compositor")?,
-                () = time::sleep_until(deadline.map_or_else(Instant::now, Instant::from_std)),
+                () = time::sleep_until(deadline.unwrap_or_else(Instant::now)),
                     if deadline.is_some() =>
                 {
-                    self.state.entry.tick(std::time::Instant::now());
+                    self.state.entry.tick(Instant::now());
                     continue;
                 }
-                // The clock's next minute.
                 () = time::sleep(draw::until_next_minute()), if self.state.painter.is_some() => {
                     continue;
                 }

@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use anyhow::Context;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -9,8 +7,8 @@ use smithay_client_toolkit::session_lock::{
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
+use tokio::time::Instant;
 use tracing::{error, info, warn};
-use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_output::{Transform, WlOutput};
 use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -20,56 +18,65 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1:
 };
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 
-use super::{Scaling, State, Wayland};
-use crate::draw::{self, Scene};
-use crate::password::{Look, Status};
+use super::{State, Wayland};
+use crate::draw::{self, Layout, Scene};
+use crate::entry::{Look, Status};
 use crate::policy::Input;
 use crate::wallpaper::Blurred;
 
-/// A session lock we requested, with a surface on each output.
+/// The most buffers an output's frames use: one the compositor shows, one to draw the next in.
+const BUFFERS: usize = 2;
+
 pub struct Lock {
     session: SessionLock,
-    surfaces: Vec<Surface>,
     /// What the surfaces show of the password entry; `None` to draw them again.
     shown: Option<Look>,
-    /// When the lock was requested, for the latency logs.
     requested: Instant,
-    /// Whether a surface has been drawn yet.
+    /// Whether a surface has been drawn yet, for the latency log.
     drawn: bool,
     /// logind asked to unlock before the compositor locked; unlock once it has.
     unlocking: bool,
 }
 
-/// A lock surface on one output.
+/// An output, with its lock screen and, while locked, its lock surface.
+pub struct Output {
+    wl: WlOutput,
+    /// The scale (in 120ths) the compositor last preferred for its lock surface.
+    preferred_scale: Option<u32>,
+    prepared: Option<Prepared>,
+    surface: Option<Surface>,
+}
+
+/// An output's lock screen, with the buffers its frames are drawn into. While unlocked, one
+/// holds the first frame a lock shows, drawn ahead, so that a lock only attaches it.
+struct Prepared {
+    scene: Scene,
+    buffers: Vec<Framebuffer>,
+}
+
+struct Framebuffer {
+    buffer: Buffer,
+    /// What it shows; `None` once that is out of date.
+    shows: Option<Look>,
+}
+
+/// A frame in one of an output's buffers, by index.
+#[derive(Debug, PartialEq)]
+enum Frame {
+    Reused(usize),
+    /// Drawn now; an index past the buffers is a new one.
+    Painted(usize),
+}
+
 struct Surface {
-    output: WlOutput,
     lock_surface: SessionLockSurface,
-    /// Its logical size once configured (until then zero).
-    size: (u32, u32),
-    /// The scale it was last drawn at, once it has been.
+    /// Its logical size, once configured.
+    size: Option<(i32, i32)>,
     drawn_at: Option<u32>,
     /// It is to be drawn again once the compositor releases one of its buffers.
     waiting: bool,
-    /// With fractional scaling: its scale object and viewport.
     scaling: Option<(WpFractionalScaleV1, WpViewport)>,
 }
-
-/// The most buffers an output's frames take from the pool: one the compositor shows and
-/// one to draw the next frame in. A frame waits for the compositor to release one.
-const BUFFERS: usize = 2;
-
-/// An output's lock screen, prepared, with the buffers its frames are drawn into. While
-/// unlocked, one is the first frame a lock shows, drawn ahead of time, so that a lock only
-/// attaches it.
-pub(super) struct Prepared {
-    output: WlOutput,
-    scene: Scene,
-    /// Each buffer, with what it shows (`None` once that is out of date).
-    buffers: Vec<(Buffer, Option<Look>)>,
-}
-
-/// An output's logical size, scale (in 120ths) and frame size in physical pixels.
-type Layout = ((u32, u32), u32, (u32, u32));
 
 impl Drop for Surface {
     fn drop(&mut self) {
@@ -77,37 +84,6 @@ impl Drop for Surface {
             fractional.destroy();
             viewport.destroy();
         }
-    }
-}
-
-impl Lock {
-    /// Give `output` a lock surface, unless it has one.
-    fn add_surface(
-        &mut self,
-        compositor: &WlCompositor,
-        scaling: Option<&Scaling>,
-        output: WlOutput,
-        qh: &QueueHandle<State>,
-    ) {
-        if self.surfaces.iter().any(|s| s.output == output) {
-            return;
-        }
-        let surface = compositor.create_surface(qh, ());
-        let scaling = scaling.map(|(fractional, viewporter)| {
-            (
-                fractional.get_fractional_scale(&surface, qh, surface.clone()),
-                viewporter.get_viewport(&surface, qh, ()),
-            )
-        });
-        let lock_surface = self.session.create_lock_surface(surface, &output, qh);
-        self.surfaces.push(Surface {
-            output,
-            lock_surface,
-            size: (0, 0),
-            drawn_at: None,
-            waiting: false,
-            scaling,
-        });
     }
 }
 
@@ -121,29 +97,27 @@ impl Wayland {
         }
         let qh = self.queue.handle();
         let state = &mut self.state;
-        let mut lock = Lock {
+        state.lock = Some(Lock {
             session: state
                 .lock_manager
                 .lock(&qh)
                 .context("requesting a session lock")?,
-            surfaces: Vec::new(),
             shown: None,
             requested: Instant::now(),
             drawn: false,
             unlocking: false,
-        };
-        for output in state.outputs.outputs() {
-            lock.add_surface(&state.compositor, state.scaling.as_ref(), output, &qh);
+        });
+        for wl in state.output_state.outputs() {
+            let i = state.output(wl);
+            state.add_surface(i, &qh);
         }
-        state.lock = Some(lock);
         let flushed = self.flush();
         // After the flush, to stay out of the lock's latency.
         self.state.entry.reset();
         flushed
     }
 
-    /// Unlock the built-in lock screen, or, if the compositor has not locked yet, unlock
-    /// once it has.
+    /// Unlock the built-in lock screen, or if the compositor has not locked yet, once it has.
     pub fn unlock(&mut self) {
         match &mut self.state.lock {
             None => info!("not locked; nothing to unlock"),
@@ -156,17 +130,16 @@ impl Wayland {
         }
     }
 
-    /// Show `wallpaper` from now on (keep the one shown without), and read GTK's colours
-    /// again: every output's lock screen is prepared again, and redrawn if locked.
-    pub fn set_wallpaper(&mut self, wallpaper: Option<Blurred>) {
+    /// Read GTK's colours again, and show `wallpaper` from now on if there is one: every
+    /// output's lock screen is prepared again, and redrawn if locked.
+    pub fn reload(&mut self, wallpaper: Option<Blurred>) {
         let Some(painter) = &mut self.state.painter else {
             return;
         };
-        if let Some(wallpaper) = wallpaper {
-            painter.set_wallpaper(wallpaper);
+        painter.reload(wallpaper);
+        for output in &mut self.state.outputs {
+            output.prepared = None;
         }
-        painter.reload_colours();
-        self.state.scenes.clear();
         self.state.prepare();
         if let Some(lock) = &mut self.state.lock {
             lock.shown = None;
@@ -175,24 +148,76 @@ impl Wayland {
 }
 
 impl State {
-    /// Drop the lock and its surfaces, report the session unlocked, and prepare the next
-    /// lock's first frames in a new pool: the old one grew for the frames drawn while
-    /// locked, and a pool cannot shrink.
+    /// The index of `wl` in `outputs`, added if missing.
+    fn output(&mut self, wl: WlOutput) -> usize {
+        if let Some(i) = self.outputs.iter().position(|output| output.wl == wl) {
+            return i;
+        }
+        self.outputs.push(Output {
+            wl,
+            preferred_scale: None,
+            prepared: None,
+            surface: None,
+        });
+        self.outputs.len() - 1
+    }
+
+    /// The index of the output whose lock surface is `wl_surface`.
+    fn surface(&self, wl_surface: &WlSurface) -> Option<usize> {
+        self.outputs.iter().position(|output| {
+            let surface = output.surface.as_ref();
+            surface.is_some_and(|surface| surface.lock_surface.wl_surface() == wl_surface)
+        })
+    }
+
+    /// Give output `i` a lock surface, unless it has one.
+    fn add_surface(&mut self, i: usize, qh: &QueueHandle<Self>) {
+        let (Some(lock), output) = (&self.lock, &mut self.outputs[i]) else {
+            return;
+        };
+        if output.surface.is_some() {
+            return;
+        }
+        let surface = self.compositor.create_surface(qh, ());
+        let scaling = self.scaling.as_ref().map(|(fractional, viewporter)| {
+            (
+                fractional.get_fractional_scale(&surface, qh, surface.clone()),
+                viewporter.get_viewport(&surface, qh, ()),
+            )
+        });
+        let lock_surface = lock.session.create_lock_surface(surface, &output.wl, qh);
+        output.surface = Some(Surface {
+            lock_surface,
+            size: None,
+            drawn_at: None,
+            waiting: false,
+            scaling,
+        });
+    }
+
+    /// End the lock, and prepare the next one's first frames in a new pool: a pool cannot shrink.
     fn end_lock(&mut self) {
         if let Some(lock) = self.lock.take() {
-            // unlock_and_destroy if it was locked; otherwise dropping it destroys it, as the
-            // protocol asks.
+            // unlock_and_destroy if locked; otherwise dropping it destroys it, as it must be.
             lock.session.unlock();
             self.inputs.push_back(Input::Locked(false));
         }
+        for output in &mut self.outputs {
+            output.surface = None;
+        }
         self.entry.reset();
-        let len = self
-            .scenes
-            .iter()
-            .map(|p| p.scene.pixels.0 * p.scene.pixels.1 * 4);
-        match SlotPool::new(len.sum::<u32>().max(1) as usize, &self.shm) {
+        let prepared = self.outputs.iter().filter_map(|o| o.prepared.as_ref());
+        let len: i32 = prepared
+            .map(|p| p.scene.layout.pixels)
+            .map(|(w, h)| w * h * 4)
+            .sum();
+        match SlotPool::new(len.max(1) as usize, &self.shm) {
             Ok(pool) => {
-                self.scenes.iter_mut().for_each(|p| p.buffers.clear());
+                for output in &mut self.outputs {
+                    if let Some(prepared) = &mut output.prepared {
+                        prepared.buffers.clear();
+                    }
+                }
                 self.pool = pool;
             }
             Err(e) => error!("creating a new buffer pool: {e}"),
@@ -200,27 +225,23 @@ impl State {
         self.prepare();
     }
 
-    /// Draw every lock surface again if what the entry shows has changed or a redraw was
-    /// asked for, and each one waiting for a buffer (one may have been released since).
+    /// Draw each lock surface again if the entry's look changed, or if it waits for a buffer.
     pub(super) fn redraw(&mut self) {
-        let look = self.entry.look();
+        let look = self.entry.look(Instant::now());
         let Some(lock) = &mut self.lock else { return };
         let changed = lock.shown.replace(look) != Some(look);
-        for i in 0..lock.surfaces.len() {
-            if changed
-                || self
-                    .lock
-                    .as_ref()
-                    .is_some_and(|lock| lock.surfaces[i].waiting)
-            {
-                self.draw(i, look);
-            }
+        let due: Vec<_> = (0..self.outputs.len())
+            .filter(|&i| {
+                let surface = self.outputs[i].surface.as_ref();
+                surface.is_some_and(|surface| changed || surface.waiting)
+            })
+            .collect();
+        for i in due {
+            self.draw(i, look);
         }
     }
 
-    /// Render the date and clock again once the minute has changed, if what they show has;
-    /// returns whether it did, and then the lock screen is drawn again, or its first frames
-    /// while unlocked.
+    /// Render the date and clock again once the minute changes; returns whether any did.
     pub(super) fn refresh_clock(&mut self) -> bool {
         let Some(painter) = &self.painter else {
             return false;
@@ -231,12 +252,11 @@ impl State {
         }
         self.minute = minute;
         let mut changed = false;
-        for prepared in &mut self.scenes {
+        for prepared in self.outputs.iter_mut().filter_map(|o| o.prepared.as_mut()) {
             if painter.refresh(&mut prepared.scene) {
-                prepared
-                    .buffers
-                    .iter_mut()
-                    .for_each(|(_, shows)| *shows = None);
+                for framebuffer in &mut prepared.buffers {
+                    framebuffer.shows = None;
+                }
                 changed = true;
             }
         }
@@ -250,7 +270,6 @@ impl State {
         true
     }
 
-    /// Log the latencies measured since the last call.
     pub(super) fn log_latencies(&mut self) {
         for (what, after) in self.latencies.drain(..) {
             info!(
@@ -260,180 +279,188 @@ impl State {
         }
     }
 
-    /// How `output` is drawn, at its logical `size` (or, without one, the size it says it
-    /// has): at the scale the compositor last preferred for it, or until it has said, the
-    /// one it most likely will (its mode's width over its logical width, with fractional
-    /// scaling; its integer scale without).
-    fn layout(&self, output: &WlOutput, size: Option<(u32, u32)>) -> Option<Layout> {
-        let info = self.outputs.info(output)?;
-        let logical = info.logical_size.map(|(w, h)| (w as u32, h as u32));
-        let size = size.or(logical)?;
+    /// How output `i` is drawn: at its lock surface's size, or else the output's, and at the
+    /// scale the compositor last preferred, or until it has said, the one it likely will.
+    fn layout(&self, i: usize) -> Option<Layout> {
+        let output = &self.outputs[i];
+        let info = self.output_state.info(&output.wl)?;
+        let size = output.surface.as_ref().and_then(|surface| surface.size);
+        let logical = size.or(info.logical_size)?;
         let sideways = matches!(
             info.transform,
             Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
         );
         let mode = info.modes.iter().find(|mode| mode.current).map(|mode| {
-            let (w, h) = (mode.dimensions.0 as u32, mode.dimensions.1 as u32);
+            let (w, h) = mode.dimensions;
             if sideways { (h, w) } else { (w, h) }
         });
-        let preferred = self.preferred.iter().find(|(o, _)| o == output);
-        let scale = match (&self.scaling, preferred, mode) {
+        let scale = match (&self.scaling, output.preferred_scale, mode) {
             (None, ..) => info.scale_factor.max(1) as u32 * 120,
-            (Some(_), Some((_, scale)), _) => *scale,
-            (Some(_), None, Some(mode)) => draw::scale_of(mode.0, size.0),
+            (Some(_), Some(scale), _) => scale,
+            (Some(_), None, Some(mode)) => draw::scale_of(mode.0, logical.0),
             (Some(_), None, None) => 120,
         };
         let mode = mode.filter(|_| self.scaling.is_some());
-        Some((size, scale, draw::pixels(size, scale, mode)))
+        Some(Layout::new(logical, scale, mode))
     }
 
-    /// The index in `scenes` of `output`'s lock screen with `layout`, prepared now if it is
-    /// missing or out of date; `when` says when, in the log.
-    fn scene(&mut self, output: &WlOutput, layout: Layout, when: &str) -> Option<usize> {
-        let (size, scale, pixels) = layout;
-        let current = self.scenes.iter().position(|p| p.output == *output);
-        if let Some(i) = current
-            && (self.scenes[i].scene.size, self.scenes[i].scene.scale) == (size, scale)
+    /// Prepare output `i`'s lock screen, unless it is prepared for its layout already;
+    /// `when` says when, in the log. Returns whether it is prepared.
+    fn prepare_output(&mut self, i: usize, when: &str) -> bool {
+        let Some(layout) = self.layout(i) else {
+            return false;
+        };
+        let output = &mut self.outputs[i];
+        if output
+            .prepared
+            .as_ref()
+            .is_some_and(|p| p.scene.layout == layout)
         {
-            return Some(i);
+            return true;
         }
+        let Some(painter) = &self.painter else {
+            return false;
+        };
         let started = Instant::now();
-        let scene = self.painter.as_ref()?.scene(size, scale, pixels);
+        let scene = painter.scene(layout);
+        let Layout {
+            logical,
+            scale,
+            pixels,
+        } = layout;
         info!(
             "lock screen prepared{when} for {}×{} at scale {} ({}×{} px) in {:.1} ms",
-            size.0,
-            size.1,
+            logical.0,
+            logical.1,
             f64::from(scale) / 120.0,
             pixels.0,
             pixels.1,
             started.elapsed().as_secs_f64() * 1000.0
         );
-        self.scenes.retain(|p| p.output != *output);
-        self.scenes.push(Prepared {
-            output: output.clone(),
+        output.prepared = Some(Prepared {
             scene,
             buffers: Vec::new(),
         });
-        Some(self.scenes.len() - 1)
+        true
     }
 
-    /// Prepare each output's lock screen that is missing or out of date, and while
-    /// unlocked, the first frame a lock will show.
+    /// Prepare each output's lock screen, and while unlocked, the first frame a lock shows.
     pub(super) fn prepare(&mut self) {
         if self.painter.is_none() {
             return;
         }
-        for output in self.outputs.outputs() {
+        for wl in self.output_state.outputs() {
+            let i = self.output(wl);
             // An output without a logical size (no xdg-output) is prepared at lock time.
-            let layout = self.layout(&output, None);
-            if let Some(i) = layout.and_then(|layout| self.scene(&output, layout, ""))
-                && self.lock.is_none()
-            {
-                self.frame(i, self.entry.look());
+            if self.prepare_output(i, "") && self.lock.is_none() {
+                self.frame(i, self.entry.look(Instant::now()));
             }
         }
     }
 
-    /// The index of a buffer of `scenes[i]` that shows `look` and that the compositor
-    /// has released: one showing it already (such as the first frame, drawn ahead), or one
-    /// drawn now; `None` while the compositor holds all `BUFFERS` of them.
-    fn frame(&mut self, i: usize, look: Look) -> Option<usize> {
-        let prepared = &mut self.scenes[i];
+    /// A buffer of output `i` that shows `look`, drawn now unless one shows it already.
+    fn frame(&mut self, i: usize, look: Look) -> Option<Frame> {
+        let prepared = self.outputs[i].prepared.as_mut()?;
         let pool = &mut self.pool;
-        let buffers = &mut prepared.buffers;
-        let free = |pool: &mut SlotPool, buffer: &Buffer| buffer.canvas(pool).is_some();
-        if let Some(at) =
-            (0..buffers.len()).find(|&at| buffers[at].1 == Some(look) && free(pool, &buffers[at].0))
-        {
-            return Some(at);
-        }
-        let at = match (0..buffers.len()).find(|&at| free(pool, &buffers[at].0)) {
-            Some(at) => at,
-            None if buffers.len() < BUFFERS => {
-                let (width, height) = (
-                    prepared.scene.pixels.0 as i32,
-                    prepared.scene.pixels.1 as i32,
-                );
-                match pool.create_buffer(width, height, width * 4, Format::Xrgb8888) {
-                    Ok((buffer, _)) => buffers.push((buffer, None)),
-                    Err(e) => {
-                        error!("allocating a buffer for the lock screen: {e}");
-                        return None;
-                    }
-                }
-                buffers.len() - 1
-            }
-            None => return None,
+        let shows: Vec<_> = prepared.buffers.iter().map(|b| b.shows).collect();
+        let released = |at: usize| prepared.buffers[at].buffer.canvas(pool).is_some();
+        let frame = pick(&shows, released, look)?;
+        let Frame::Painted(at) = frame else {
+            return Some(frame);
         };
-        let (buffer, shows) = &mut buffers[at];
-        prepared
-            .scene
-            .draw(buffer.canvas(pool).expect("a released buffer"), look);
-        *shows = Some(look);
-        Some(at)
+        if at == prepared.buffers.len() {
+            let (width, height) = prepared.scene.layout.pixels;
+            let created = pool.create_buffer(width, height, width * 4, Format::Xrgb8888);
+            let (buffer, _) = created
+                .inspect_err(|e| error!("allocating a buffer for the lock screen: {e}"))
+                .ok()?;
+            prepared.buffers.push(Framebuffer {
+                buffer,
+                shows: None,
+            });
+        }
+        let framebuffer = &mut prepared.buffers[at];
+        let canvas = framebuffer.buffer.canvas(pool).expect("a released buffer");
+        prepared.scene.draw(canvas, look);
+        framebuffer.shows = Some(look);
+        Some(frame)
     }
 
-    /// Draw `look` on the lock surface at `index`, once configured, with a buffer that
-    /// shows it (the first time, normally the frame drawn ahead); if the compositor holds
-    /// all of its output's buffers, once it releases one.
-    fn draw(&mut self, index: usize, look: Look) {
-        let Some(lock) = &self.lock else { return };
-        let surface = &lock.surfaces[index];
-        let (output, size) = (surface.output.clone(), surface.size);
-        if size == (0, 0) {
+    /// Draw `look` on output `i`'s lock surface, once configured; if the compositor holds
+    /// all of the output's buffers, once it releases one.
+    fn draw(&mut self, i: usize, look: Look) {
+        let configured = self.outputs[i].surface.as_ref().and_then(|s| s.size);
+        if configured.is_none() || !self.prepare_output(i, " at lock time") {
             return;
         }
-        let Some(layout) = self.layout(&output, Some(size)) else {
-            return;
-        };
-        let Some(i) = self.scene(&output, layout, " at lock time") else {
-            return;
-        };
-        if let (Status::Cooldown(seconds), Some(painter)) = (look.status, &self.painter) {
-            painter.countdown(&mut self.scenes[i].scene, seconds);
+        if let (Status::Cooldown(seconds), Some(painter), Some(prepared)) =
+            (look.status, &self.painter, &mut self.outputs[i].prepared)
+        {
+            painter.countdown(&mut prepared.scene, seconds);
         }
         let frame = self.frame(i, look);
-        let Some(lock) = &mut self.lock else { return };
-        let surface = &mut lock.surfaces[index];
+        let (Some(lock), output) = (&mut self.lock, &mut self.outputs[i]) else {
+            return;
+        };
+        let (Some(surface), Some(prepared)) = (&mut output.surface, &output.prepared) else {
+            return;
+        };
         surface.waiting = frame.is_none();
-        let Some(at) = frame else { return };
-        let (buffer, _) = &self.scenes[i].buffers[at];
-        let scene = &self.scenes[i].scene;
+        let Some(frame) = frame else { return };
+        let (Frame::Reused(at) | Frame::Painted(at)) = frame;
+        let layout = prepared.scene.layout;
         let wl_surface = surface.lock_surface.wl_surface();
-        if let Err(e) = buffer.attach_to(wl_surface) {
+        if let Err(e) = prepared.buffers[at].buffer.attach_to(wl_surface) {
             return error!("drawing the lock screen: {e}");
         }
-        surface.drawn_at = Some(scene.scale);
+        surface.drawn_at = Some(layout.scale);
         match &surface.scaling {
-            Some((_, viewport)) => viewport.set_destination(size.0 as i32, size.1 as i32),
-            None => wl_surface.set_buffer_scale((scene.scale / 120) as i32),
+            Some((_, viewport)) => viewport.set_destination(layout.logical.0, layout.logical.1),
+            None => wl_surface.set_buffer_scale(layout.scale as i32 / 120),
         }
-        let (width, height) = (scene.pixels.0 as i32, scene.pixels.1 as i32);
-        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.damage_buffer(0, 0, layout.pixels.0, layout.pixels.1);
         wl_surface.commit();
         if !lock.drawn {
             lock.drawn = true;
-            self.latencies
-                .push(("lock screen drawn", lock.requested.elapsed()));
+            let what = if frame == Frame::Reused(at) {
+                "lock screen drawn (attached)"
+            } else {
+                "lock screen drawn (painted)"
+            };
+            self.latencies.push((what, lock.requested.elapsed()));
         }
     }
 
-    /// The compositor prefers `scale` (in 120ths) for `surface`: draw its output at that
-    /// scale, now and in later locks.
+    /// The compositor prefers `scale` (in 120ths) for `surface`, now and in later locks.
     fn prefer_scale(&mut self, surface: &WlSurface, scale: u32) {
-        let Some(lock) = &mut self.lock else { return };
-        let surfaces = lock.surfaces.iter();
-        let Some(s) = surfaces
-            .into_iter()
-            .find(|s| s.lock_surface.wl_surface() == surface)
-        else {
+        let i = self.surface(surface);
+        let (Some(lock), Some(i)) = (&mut self.lock, i) else {
             return;
         };
-        self.preferred.retain(|(output, _)| *output != s.output);
-        self.preferred.push((s.output.clone(), scale));
-        if s.drawn_at.is_some_and(|drawn| drawn != scale) {
+        let output = &mut self.outputs[i];
+        output.preferred_scale = Some(scale);
+        let drawn_at = output.surface.as_ref().and_then(|s| s.drawn_at);
+        if drawn_at.is_some_and(|drawn| drawn != scale) {
             lock.shown = None;
         }
+    }
+}
+
+/// The buffer for a frame showing `look`, from what each buffer `shows` and whether it is
+/// `released`: one released that shows it already, else one released, else a new one
+/// while there are fewer than `BUFFERS`; `None` while the compositor holds them all.
+fn pick(
+    shows: &[Option<Look>],
+    mut released: impl FnMut(usize) -> bool,
+    look: Look,
+) -> Option<Frame> {
+    if let Some(at) = (0..shows.len()).find(|&at| shows[at] == Some(look) && released(at)) {
+        return Some(Frame::Reused(at));
+    }
+    match (0..shows.len()).find(|&at| released(at)) {
+        Some(at) => Some(Frame::Painted(at)),
+        None if shows.len() < BUFFERS => Some(Frame::Painted(shows.len())),
+        None => None,
     }
 }
 
@@ -462,16 +489,15 @@ impl SessionLockHandler for State {
         _: u32,
     ) {
         let Some(lock) = &mut self.lock else { return };
-        let look = self.entry.look();
+        let look = self.entry.look(Instant::now());
         lock.shown = Some(look);
-        let surfaces = lock.surfaces.iter_mut();
-        let Some(i) = surfaces
-            .into_iter()
-            .position(|s| s.lock_surface.wl_surface() == surface.wl_surface())
-        else {
+        let Some(i) = self.surface(surface.wl_surface()) else {
             return;
         };
-        lock.surfaces[i].size = configure.new_size;
+        let (width, height) = configure.new_size;
+        if let Some(surface) = &mut self.outputs[i].surface {
+            surface.size = Some((width as i32, height as i32));
+        }
         self.draw(i, look);
     }
 }
@@ -493,29 +519,28 @@ impl Dispatch<WpFractionalScaleV1, WlSurface> for State {
 
 impl OutputHandler for State {
     fn output_state(&mut self) -> &mut OutputState {
-        &mut self.outputs
+        &mut self.output_state
     }
 
     /// A new output gets a lock surface while locked; until then the compositor blanks it.
-    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: WlOutput) {
-        match &mut self.lock {
-            Some(lock) => lock.add_surface(&self.compositor, self.scaling.as_ref(), output, qh),
-            None => self.prepare(),
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, wl: WlOutput) {
+        let i = self.output(wl);
+        if self.lock.is_some() {
+            self.add_surface(i, qh);
+        } else {
+            self.prepare();
         }
     }
 
     /// The scale the compositor preferred may have changed with the output.
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
-        self.preferred.retain(|(o, _)| *o != output);
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, wl: WlOutput) {
+        let i = self.output(wl);
+        self.outputs[i].preferred_scale = None;
         self.prepare();
     }
 
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
-        self.scenes.retain(|p| p.output != output);
-        self.preferred.retain(|(o, _)| *o != output);
-        if let Some(lock) = &mut self.lock {
-            lock.surfaces.retain(|s| s.output != output);
-        }
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, wl: WlOutput) {
+        self.outputs.retain(|output| output.wl != wl);
     }
 }
 
@@ -534,3 +559,33 @@ impl ProvidesRegistryState for State {
 
 delegate_registry!(State);
 delegate_dispatch2!(State);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TYPING: Look = Look {
+        status: Status::Typing,
+        chars: 1,
+        caps_lock: false,
+    };
+    const MORE: Look = Look { chars: 2, ..TYPING };
+
+    #[test]
+    fn a_frame_reuses_a_released_buffer_that_shows_it() {
+        let shows = [Some(MORE), Some(TYPING)];
+        assert_eq!(pick(&shows, |_| true, TYPING), Some(Frame::Reused(1)));
+        // One the compositor holds is painted over in the other.
+        assert_eq!(pick(&shows, |at| at == 0, TYPING), Some(Frame::Painted(0)));
+    }
+
+    #[test]
+    fn a_second_buffer_is_added_then_frames_wait_for_a_release() {
+        assert_eq!(pick(&[], |_| true, TYPING), Some(Frame::Painted(0)));
+        let shows = [Some(TYPING)];
+        assert_eq!(pick(&shows, |_| false, MORE), Some(Frame::Painted(1)));
+        let shows = [Some(TYPING), Some(MORE)];
+        assert_eq!(pick(&shows, |_| false, MORE), None);
+        assert_eq!(pick(&shows, |_| false, TYPING), None);
+    }
+}

@@ -6,22 +6,33 @@ use cairo::{
     LinearGradient, Operator,
 };
 use pango::FontDescription;
+use pango::Weight;
 use pango::glib::{self, DateTime};
 use pango::prelude::FontMapExt;
 use tracing::error;
 
-use crate::config::{Anchor, LockScreen, Offset, Place, Style, Weight};
+use crate::config::{Anchor, LockScreen, Offset, Place, Style, Text};
+use crate::entry::{Look, Status};
 use crate::gtk::{self, Palette, Rgba};
-use crate::password::{Look, Status};
 use crate::wallpaper::Blurred;
 
-/// Logical pixels between the password field and the caps lock line, and between the
-/// field's edge and its arrow button.
+/// Logical pixels between the field and the caps lock line, and the field's edge and button.
 const GAP: f64 = 10.0;
 const BUTTON_INSET: f64 = 5.0;
 
-/// The opacities of white over the background that make a shape frosted: the password
-/// field, its arrow button, and the avatar; and their outlines.
+/// Text sizes in logical pixels; the hint's is also the arrow's and the countdown's, and
+/// the initial's is a fraction of the avatar's diameter. `CAPS_HEIGHT` stands in for a caps
+/// lock line that could not be rendered.
+const TEXT_SIZE: f64 = 15.0;
+const HINT_SIZE: f64 = 13.0;
+const CAPS_SIZE: f64 = 12.0;
+const CAPS_HEIGHT: f64 = 15.0;
+const INITIAL_SIZE: f64 = 26.0 / 64.0;
+
+const HINT_ALPHA: f64 = 0.75;
+const CAPS_ALPHA: f64 = 0.8;
+
+/// The opacity of white in frosted shapes (field, button, avatar) and in their outlines.
 const FIELD: f64 = 0.2;
 const BUTTON: f64 = 0.3;
 const AVATAR: f64 = 0.22;
@@ -34,15 +45,13 @@ const CHECKING: f64 = 0.5;
 /// Where the top gradient ends and the bottom one starts, as fractions of the height.
 const GRADIENTS: (f64, f64) = (0.4, 0.62);
 
-/// How much smaller than a frame the background is kept; it is blurred, so it loses
-/// nothing when scaled back up as each frame is drawn.
-const SHRINK: u32 = 4;
+/// How much smaller than a frame the background is kept; blurred, it loses nothing.
+const BACKGROUND_SHRINK: i32 = 4;
 
 /// The widest and tallest a rendered text may be, in physical pixels; more is cut off.
 const MAX_TEXT: i32 = 8192;
 
-/// Prepares each output's `Scene` ahead of time (at startup, on SIGHUP, when the
-/// wallpaper or the clock changes), so that drawing a frame only composites.
+/// Prepares each output's `Scene` ahead of time, so that drawing a frame only composites.
 pub struct Painter {
     config: LockScreen,
     fonts: pango::Context,
@@ -51,12 +60,10 @@ pub struct Painter {
     palette: Palette,
     /// The user's full name.
     name: String,
-    /// The blurred wallpaper, if there is one.
     wallpaper: Option<ImageSurface>,
 }
 
-/// How a text is rendered: its size in logical pixels, weight, spacing between
-/// characters, and colour.
+/// How a text is rendered, in logical pixels.
 struct Font {
     size: f64,
     weight: Weight,
@@ -64,223 +71,267 @@ struct Font {
     colour: Rgba,
 }
 
+/// How an output is drawn: its logical size, its scale in 120ths, and its frames' size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layout {
+    pub logical: (i32, i32),
+    pub scale: u32,
+    pub pixels: (i32, i32),
+}
+
+/// A rectangle in physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Circle {
+    centre: (f64, f64),
+    radius: f64,
+}
+
 /// Text rendered at an output's scale, with its top-left corner in physical pixels.
 struct Label {
-    /// What it says, where that can change (the date and clock); empty elsewhere.
-    text: String,
     surface: ImageSurface,
     at: (f64, f64),
 }
 
-/// A rectangle in physical pixels: x, y, width, height.
-type Rect = (f64, f64, f64, f64);
+/// A label whose text changes, such as the clock's.
+struct Rendered {
+    text: String,
+    label: Label,
+}
 
-/// One output's lock screen, ready to draw: the background and every text rendered,
-/// every shape placed, in physical pixels. A part that could not be prepared is left out.
+/// One output's lock screen, ready to draw; a part that could not be prepared is left out.
 pub struct Scene {
-    /// The output's logical size, the scale everything is drawn at (in 120ths), and the
-    /// size of its frames in physical pixels.
-    pub size: (u32, u32),
-    pub scale: u32,
-    pub pixels: (u32, u32),
-    /// The background, gradients included, at 1/`SHRINK` of a frame's size.
+    pub layout: Layout,
+    /// The background, gradients included, at 1/`BACKGROUND_SHRINK` of a frame's size.
     background: Option<ImageSurface>,
-    /// What is drawn if the background cannot be.
+    /// Drawn if the background cannot be.
     plain: Rgba,
-    /// The date and the clock.
-    times: [Option<Label>; 2],
+    date: Option<Rendered>,
+    clock: Option<Rendered>,
     name: Option<Label>,
-    /// The circle and the initial.
-    avatar: Option<(Rect, Option<Label>)>,
+    avatar: Option<Avatar>,
     field: Field,
 }
 
-/// The password field, placed.
+struct Avatar {
+    circle: Circle,
+    initial: Option<Label>,
+}
+
 struct Field {
     pill: Rect,
     radius: f64,
     /// A dot's diameter, which is also the gap between dots.
     dot: f64,
-    /// The arrow button's centre and radius.
-    button: (f64, f64, f64),
+    button: Circle,
     colour: Rgba,
     error: Rgba,
-    /// "Enter Password", the arrow and "⇪ Caps Lock is on", placed.
     hint: Option<Label>,
     arrow: Option<Label>,
     caps: Option<Label>,
-    /// "Try again in N s", with its N.
-    countdown: Option<(u64, Label)>,
+    countdown: Option<Rendered>,
 }
 
 impl Painter {
-    /// Read GTK's font and colours, and the user's name.
     pub fn new(config: LockScreen) -> Self {
+        // GLib's name for a user without one in the passwd database.
+        let name = glib::real_name().into_string().ok();
+        let name = name.filter(|name| name != "Unknown");
+        let name = name.unwrap_or_else(|| glib::user_name().to_string_lossy().into_owned());
+        let palette = Palette::load(&config);
+        Self::with(config, palette, &gtk::font(), name)
+    }
+
+    /// A painter with `palette`, `font` (as Pango describes one) and the user's `name`.
+    fn with(config: LockScreen, palette: Palette, font: &str, name: String) -> Self {
         let fonts = pangocairo::FontMap::default().create_context();
         let mut options = cairo::FontOptions::new().expect("cairo font options");
         options.set_antialias(Antialias::Gray);
         options.set_hint_style(HintStyle::Slight);
         options.set_hint_metrics(HintMetrics::Off);
         pangocairo::functions::context_set_font_options(&fonts, Some(&options));
-        // GLib's name for a user without one in the passwd database.
-        let name = glib::real_name().into_string().ok();
-        let name = name.filter(|name| name != "Unknown");
         Self {
             config,
             fonts,
-            font: FontDescription::from_string(&gtk::font()),
-            palette: Palette::load(),
-            name: name.unwrap_or_else(|| glib::user_name().to_string_lossy().into_owned()),
+            font: FontDescription::from_string(font),
+            palette,
+            name,
             wallpaper: None,
         }
     }
 
-    /// Use `wallpaper` from now on.
-    pub fn set_wallpaper(&mut self, wallpaper: Blurred) {
-        let (width, height) = (wallpaper.width as i32, wallpaper.height as i32);
-        let pixels = wallpaper.pixels;
-        self.wallpaper =
-            ImageSurface::create_for_data(pixels, Format::Rgb24, width, height, width * 4).ok();
+    /// Read GTK's colours again, and use `wallpaper` from now on if there is one.
+    pub fn reload(&mut self, wallpaper: Option<Blurred>) {
+        if let Some(wallpaper) = wallpaper {
+            let (width, height) = (wallpaper.width, wallpaper.height);
+            let pixels = wallpaper.pixels;
+            let surface =
+                ImageSurface::create_for_data(pixels, Format::Rgb24, width, height, width * 4);
+            self.wallpaper = surface
+                .inspect_err(|e| error!("using the wallpaper: {e}"))
+                .ok();
+        }
+        self.palette = Palette::load(&self.config);
     }
 
-    /// Read GTK's colours again.
-    pub fn reload_colours(&mut self) {
-        self.palette = Palette::load();
-    }
-
-    /// Prepare the lock screen for an output of logical `size`, drawn at `scale` (in
-    /// 120ths) into frames of `pixels`.
-    pub fn scene(&self, size: (u32, u32), scale: u32, pixels: (u32, u32)) -> Scene {
-        let factor = f64::from(scale) / 120.0;
-        let password = &self.config.password;
-        let colour = self.palette.get(&password.color);
-        let background = self.config.background.as_ref();
+    pub fn scene(&self, layout: Layout) -> Scene {
+        let background = self
+            .background(layout.pixels)
+            .inspect_err(|e| error!("preparing the lock screen's background: {e}"))
+            .ok();
+        let plain = self.config.background.as_ref();
+        let name = self.config.name.as_ref().and_then(|name| {
+            let font = self.font_of(&name.style);
+            let place = |size| layout.place(&name.place, size);
+            self.label(&self.name, &font, layout.factor(), place)
+        });
         let mut scene = Scene {
-            size,
-            scale,
-            pixels,
-            background: self
-                .background(pixels)
-                .inspect_err(|e| error!("preparing the lock screen's background: {e}"))
-                .ok(),
-            plain: background.map_or([0.0, 0.0, 0.0, 1.0], |b| self.palette.get(&b.color)),
-            times: [None, None],
-            name: None,
-            avatar: None,
-            field: Field {
-                pill: (0.0, 0.0, 0.0, 0.0),
-                radius: password.radius.0.min(password.height.0 / 2.0) * factor,
-                dot: password.dot_size.0 * factor,
-                button: (0.0, 0.0, 0.0),
-                colour,
-                error: self.palette.get(&password.error_color),
-                hint: None,
-                arrow: None,
-                caps: None,
-                countdown: None,
-            },
+            layout,
+            background,
+            plain: plain.map_or([0.0, 0.0, 0.0, 1.0], |b| self.palette.get(&b.color)),
+            date: None,
+            clock: None,
+            name,
+            avatar: self.avatar(layout),
+            field: self.field(layout),
         };
         self.refresh(&mut scene);
-        if let Some(name) = &self.config.name {
-            let font = self.font_of(&name.style);
-            scene.name = self.label(&self.name, &font, factor, |s| scene.place(&name.place, s));
-        }
-        if let Some(avatar) = &self.config.avatar {
-            let d = avatar.diameter.0;
-            let circle = scene.physical(scene.place_logical(&avatar.place, (d, d)), (d, d));
-            let initial: String = self
-                .name
-                .chars()
-                .take(1)
-                .flat_map(char::to_uppercase)
-                .collect();
-            let font = small(
-                d * 26.0 / 64.0,
-                Weight::Semibold,
-                self.palette.get(&avatar.color),
-            );
-            let initial = self.label(&initial, &font, factor, |s| centred(s, middle(circle)));
-            scene.avatar = Some((circle, initial));
-        }
-        let small = |size, weight, alpha| small(size, weight, fade(colour, alpha));
-        let caps_font = small(12.0, Weight::Medium, 0.8);
-        let caps = self.label("⇪ Caps Lock is on", &caps_font, factor, |_| (0.0, 0.0));
-        let caps_height = caps.as_ref().map_or(15.0, |caps| caps.size().1 / factor);
-        let (width, height) = (password.width.0, password.height.0);
-        let (x, y) = scene.place_logical(&password.place, (width, height + GAP + caps_height));
-        let pill = scene.physical((x, y), (width, height));
-        let field = &mut scene.field;
-        field.pill = pill;
-        let radius = (height / 2.0 - BUTTON_INSET) * factor;
-        let inset = BUTTON_INSET * factor;
-        field.button = (pill.0 + pill.2 - inset - radius, middle(pill).1, radius);
-        field.caps = caps.map(|caps| {
-            let top = ((y + height + GAP) * factor).round();
-            let at = (centred(caps.size(), middle(pill)).0, top);
-            Label { at, ..caps }
-        });
-        let hint = small(13.0, Weight::Normal, 0.75);
-        field.hint = self.label("Enter Password", &hint, factor, |s| {
-            centred(s, middle(pill))
-        });
-        let (cx, cy, _) = field.button;
-        let arrow = small(13.0, Weight::Bold, 1.0);
-        field.arrow = self.label("→", &arrow, factor, |s| centred(s, (cx, cy)));
         scene
     }
 
-    /// Render the date and clock again where what they show has changed (or never was);
-    /// returns whether anything did.
+    fn avatar(&self, layout: Layout) -> Option<Avatar> {
+        let avatar = self.config.avatar.as_ref()?;
+        let d = avatar.diameter.0;
+        let rect = layout.physical(layout.place_logical(&avatar.place, (d, d)), (d, d));
+        let circle = Circle {
+            centre: rect.centre(),
+            radius: rect.w / 2.0,
+        };
+        let initial: String = self
+            .name
+            .chars()
+            .take(1)
+            .flat_map(char::to_uppercase)
+            .collect();
+        let colour = self.palette.get(&avatar.color);
+        let font = Font::new(d * INITIAL_SIZE, Weight::Semibold, colour);
+        let place = |size| centred(size, circle.centre);
+        let initial = self.label(&initial, &font, layout.factor(), place);
+        Some(Avatar { circle, initial })
+    }
+
+    fn field(&self, layout: Layout) -> Field {
+        let factor = layout.factor();
+        let password = &self.config.password;
+        let colour = self.palette.get(&password.color);
+        let faded = |size, weight, alpha| Font::new(size, weight, fade(colour, alpha));
+        let caps_font = faded(CAPS_SIZE, Weight::Medium, CAPS_ALPHA);
+        let caps = self.label("⇪ Caps Lock is on", &caps_font, factor, |_| (0.0, 0.0));
+        let caps_height = caps
+            .as_ref()
+            .map_or(CAPS_HEIGHT, |caps| caps.size().1 / factor);
+        let (width, height) = (password.width.0, password.height.0);
+        let (x, y) = layout.place_logical(&password.place, (width, height + GAP + caps_height));
+        let pill = layout.physical((x, y), (width, height));
+        let radius = (height / 2.0 - BUTTON_INSET) * factor;
+        let button = Circle {
+            centre: (
+                pill.x + pill.w - BUTTON_INSET * factor - radius,
+                pill.centre().1,
+            ),
+            radius,
+        };
+        let caps = caps.map(|caps| {
+            let top = ((y + height + GAP) * factor).round();
+            let at = (centred(caps.size(), pill.centre()).0, top);
+            Label { at, ..caps }
+        });
+        let hint = faded(HINT_SIZE, Weight::Normal, HINT_ALPHA);
+        let arrow = faded(HINT_SIZE, Weight::Bold, 1.0);
+        Field {
+            pill,
+            radius: password.radius.0.min(height / 2.0) * factor,
+            dot: password.dot_size.0 * factor,
+            button,
+            colour,
+            error: self.palette.get(&password.error_color),
+            hint: self.label("Enter Password", &hint, factor, |size| {
+                centred(size, pill.centre())
+            }),
+            arrow: self.label("→", &arrow, factor, |size| centred(size, button.centre)),
+            caps,
+            countdown: None,
+        }
+    }
+
+    /// Render the date and clock again where their text has changed; returns whether any did.
     pub fn refresh(&self, scene: &mut Scene) -> bool {
         let now = DateTime::now_local().ok();
-        let factor = scene.factor();
-        let mut changed = false;
-        let times = [
-            (&self.config.date, "%A %-d %B"),
-            (&self.config.clock, "%H:%M"),
-        ];
-        for (i, (config, default)) in times.into_iter().enumerate() {
-            let Some(config) = config else { continue };
-            let format = config.format.as_ref().map_or(default, |format| &format.0);
-            let text = now.as_ref().and_then(|now| now.format(format).ok());
-            let text = text.as_deref().unwrap_or_default();
-            if scene.times[i]
-                .as_ref()
-                .is_none_or(|label| label.text != text)
-            {
-                let font = self.font_of(&config.style);
-                let label = self.label(text, &font, factor, |s| scene.place(&config.place, s));
-                let text = text.to_owned();
-                scene.times[i] = label.map(|label| Label { text, ..label });
-                changed = true;
-            }
+        let (date, clock) = (self.config.date.as_ref(), self.config.clock.as_ref());
+        let layout = scene.layout;
+        let date = self.time(&mut scene.date, date, "%A %-d %B", now.as_ref(), layout);
+        let clock = self.time(&mut scene.clock, clock, "%H:%M", now.as_ref(), layout);
+        date || clock
+    }
+
+    /// Render `config`'s time (by `default` format) into `shown`; returns whether it changed.
+    fn time(
+        &self,
+        shown: &mut Option<Rendered>,
+        config: Option<&Text>,
+        default: &str,
+        now: Option<&DateTime>,
+        layout: Layout,
+    ) -> bool {
+        let Some(config) = config else { return false };
+        let format = config.format.as_ref().map_or(default, |format| &format.0);
+        let text = now.and_then(|now| now.format(format).ok());
+        let text = text.as_deref().unwrap_or_default();
+        if shown.as_ref().is_some_and(|shown| shown.text == text) {
+            return false;
         }
-        changed
+        let font = self.font_of(&config.style);
+        let place = |size| layout.place(&config.place, size);
+        let label = self.label(text, &font, layout.factor(), place);
+        *shown = label.map(|label| Rendered {
+            text: text.to_owned(),
+            label,
+        });
+        true
     }
 
     /// Render "Try again in `seconds` s" for the password field, unless it already is.
     pub fn countdown(&self, scene: &mut Scene, seconds: u64) {
-        let field = &scene.field;
+        let text = format!("Try again in {seconds} s");
+        let field = &mut scene.field;
         if field
             .countdown
             .as_ref()
-            .is_some_and(|(shown, _)| *shown == seconds)
+            .is_some_and(|shown| shown.text == text)
         {
             return;
         }
-        let font = small(13.0, Weight::Normal, fade(field.colour, 0.75));
-        let text = format!("Try again in {seconds} s");
-        let centre = middle(field.pill);
-        let label = self.label(&text, &font, scene.factor(), |s| centred(s, centre));
-        scene.field.countdown = label.map(|label| (seconds, label));
+        let font = Font::new(HINT_SIZE, Weight::Normal, fade(field.colour, HINT_ALPHA));
+        let centre = field.pill.centre();
+        let label = self.label(&text, &font, scene.layout.factor(), |size| {
+            centred(size, centre)
+        });
+        field.countdown = label.map(|label| Rendered { text, label });
     }
 
-    /// The background for frames of `pixels`, at 1/`SHRINK` of their size: the wallpaper
-    /// scaled to cover it (or the plain colour), darkened by the gradients; black without a
-    /// `background`.
-    fn background(&self, pixels: (u32, u32)) -> Result<ImageSurface, cairo::Error> {
-        let (width, height) = ((pixels.0 / SHRINK).max(1), (pixels.1 / SHRINK).max(1));
-        let surface = ImageSurface::create(Format::Rgb24, width as i32, height as i32)?;
+    /// The background at 1/`BACKGROUND_SHRINK` of frames of `pixels`: the wallpaper covering
+    /// it or the plain colour, darkened by the gradients; black without a `background`.
+    fn background(&self, pixels: (i32, i32)) -> Result<ImageSurface, cairo::Error> {
+        let width = (pixels.0 / BACKGROUND_SHRINK).max(1);
+        let height = (pixels.1 / BACKGROUND_SHRINK).max(1);
+        let surface = ImageSurface::create(Format::Rgb24, width, height)?;
         let Some(config) = &self.config.background else {
             return Ok(surface);
         };
@@ -311,11 +362,10 @@ impl Painter {
         Ok(surface)
     }
 
-    /// How `style` renders text, with its defaults.
     fn font_of(&self, style: &Style) -> Font {
         Font {
-            size: style.size.map_or(15.0, |size| size.0),
-            weight: style.weight.unwrap_or_default(),
+            size: style.size.map_or(TEXT_SIZE, |size| size.0),
+            weight: style.weight.map_or(Weight::Normal, |weight| weight.0),
             spacing: style.letter_spacing.map_or(0.0, |spacing| spacing.0),
             colour: style
                 .color
@@ -324,9 +374,8 @@ impl Painter {
         }
     }
 
-    /// `text` rendered as `font` says at `factor` physical pixels per logical one, at the
-    /// top-left corner `place` gives a box of its physical size. A failure (only the
-    /// environment's, such as a broken fontconfig) is logged, and leaves it out.
+    /// `text` at `factor` physical pixels per logical one, where `place` puts a box of its
+    /// size. A failure (the environment's, such as a broken fontconfig) is logged.
     fn label(
         &self,
         text: &str,
@@ -339,8 +388,7 @@ impl Painter {
             .inspect_err(|e| error!("rendering {text:?}: {e}"))
             .ok()?;
         let at = place((f64::from(surface.width()), f64::from(surface.height())));
-        let text = String::new();
-        Some(Label { text, surface, at })
+        Some(Label { surface, at })
     }
 
     /// `text` rendered in GTK's font, in its logical box.
@@ -348,7 +396,7 @@ impl Painter {
         let layout = pango::Layout::new(&self.fonts);
         let mut description = self.font.clone();
         description.set_absolute_size(font.size * factor * f64::from(pango::SCALE));
-        description.set_weight(weight(font.weight));
+        description.set_weight(font.weight);
         layout.set_font_description(Some(&description));
         if font.spacing != 0.0 {
             let attributes = pango::AttrList::new();
@@ -371,44 +419,93 @@ impl Painter {
     }
 }
 
-impl Scene {
+impl Font {
+    fn new(size: f64, weight: Weight, colour: Rgba) -> Self {
+        Self {
+            size,
+            weight,
+            spacing: 0.0,
+            colour,
+        }
+    }
+}
+
+impl Layout {
+    /// An output of `logical` size at `scale`, with frames rounded as wp-fractional-scale-v1
+    /// asks, or of the output's `mode` where that is within a pixel of it (1707 × 1.5 is
+    /// 2560.5, on a 2560 px panel).
+    pub fn new(logical: (i32, i32), scale: u32, mode: Option<(i32, i32)>) -> Self {
+        let round = |size: i32| (size * scale as i32 + 60) / 120;
+        let rounded = (round(logical.0), round(logical.1));
+        let pixels = match mode {
+            Some(mode) if rounded.0.abs_diff(mode.0) <= 1 && rounded.1.abs_diff(mode.1) <= 1 => {
+                mode
+            }
+            _ => rounded,
+        };
+        Self {
+            logical,
+            scale,
+            pixels,
+        }
+    }
+
     /// Physical pixels per logical one.
-    fn factor(&self) -> f64 {
+    fn factor(self) -> f64 {
         f64::from(self.scale) / 120.0
     }
 
     /// The logical top-left corner of a widget of logical `size` at `place`.
-    fn place_logical(&self, place: &Place, size: (f64, f64)) -> (f64, f64) {
+    fn place_logical(self, place: &Place, size: (f64, f64)) -> (f64, f64) {
         let Offset(x, y) = place.offset.unwrap_or_default();
-        let screen = (f64::from(self.size.0), f64::from(self.size.1));
+        let screen = (f64::from(self.logical.0), f64::from(self.logical.1));
         self::place(place.anchor.unwrap_or_default(), (x.0, y.0), size, screen)
     }
 
-    /// The physical top-left corner, on a whole pixel, of a widget of physical `size` at
-    /// `place`.
-    fn place(&self, place: &Place, size: (f64, f64)) -> (f64, f64) {
+    /// The physical top-left corner, on a whole pixel, of a widget of physical `size`.
+    fn place(self, place: &Place, size: (f64, f64)) -> (f64, f64) {
         let factor = self.factor();
         let (x, y) = self.place_logical(place, (size.0 / factor, size.1 / factor));
         ((x * factor).round(), (y * factor).round())
     }
 
-    /// A rectangle at logical `at` of logical `size`, in physical pixels, with its corners
-    /// on whole pixels.
-    fn physical(&self, at: (f64, f64), size: (f64, f64)) -> Rect {
+    /// A rectangle at logical `at` of logical `size`, its corners on whole physical pixels.
+    fn physical(self, at: (f64, f64), size: (f64, f64)) -> Rect {
         let f = self.factor();
-        let (left, top) = ((at.0 * f).round(), (at.1 * f).round());
+        let (x, y) = ((at.0 * f).round(), (at.1 * f).round());
         let (right, bottom) = (((at.0 + size.0) * f).round(), ((at.1 + size.1) * f).round());
-        (left, top, right - left, bottom - top)
+        Rect {
+            x,
+            y,
+            w: right - x,
+            h: bottom - y,
+        }
     }
+}
 
-    /// Draw the lock screen showing `look` into `canvas`, a frame of `pixels` in
-    /// `Xrgb8888`: the background scaled up, the prepared texts, and a few shapes. A part
+impl Rect {
+    fn centre(self) -> (f64, f64) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
+    }
+}
+
+impl Circle {
+    fn trace(self, cr: &Context) {
+        cr.arc(self.centre.0, self.centre.1, self.radius, 0.0, 2.0 * PI);
+    }
+}
+
+impl Scene {
+    /// Draw the lock screen showing `look` into `canvas`, a frame in `Xrgb8888`. A part
     /// that fails is logged and left out; if even the background fails, the frame is the
     /// plain colour, so a lock never shows nothing.
     pub fn draw(&self, canvas: &mut [u8], look: Look) {
-        let (width, height) = (self.pixels.0 as i32, self.pixels.1 as i32);
-        // SAFETY: `canvas` holds `height` rows of `width * 4` bytes, cairo's Rgb24 has
-        // Xrgb8888's layout, and the surface is finished before `canvas` is used again.
+        let (width, height) = self.layout.pixels;
+        let len = width as usize * 4 * height as usize;
+        assert!(canvas.len() >= len, "a canvas too small for the frame");
+        // SAFETY: `canvas` holds `height` rows of `width * 4` bytes (asserted above),
+        // cairo's Rgb24 has Xrgb8888's layout, and the surface is finished before `canvas`
+        // is used again.
         let target = unsafe {
             ImageSurface::create_for_data_unsafe(
                 canvas.as_mut_ptr(),
@@ -436,10 +533,11 @@ impl Scene {
     fn paint(&self, target: &ImageSurface, look: Look) -> Result<(), cairo::Error> {
         let cr = Context::new(target)?;
         cr.set_operator(Operator::Source);
+        let (width, height) = self.layout.pixels;
         match &self.background {
             Some(background) => {
-                let x = f64::from(self.pixels.0) / f64::from(background.width());
-                cr.scale(x, f64::from(self.pixels.1) / f64::from(background.height()));
+                let x = f64::from(width) / f64::from(background.width());
+                cr.scale(x, f64::from(height) / f64::from(background.height()));
                 stretch(&cr, background)?;
             }
             None => {
@@ -447,22 +545,24 @@ impl Scene {
                 cr.paint()?;
             }
         }
-        let line = self.factor();
+        let line = self.layout.factor();
         let part = |paint: &dyn Fn(&Context) -> Result<(), cairo::Error>| {
             if let Err(e) = Context::new(target).and_then(|cr| paint(&cr)) {
                 error!("drawing part of the lock screen: {e}");
             }
         };
-        for label in self.times.iter().chain([&self.name]).flatten() {
+        let times = [&self.date, &self.clock].into_iter().flatten();
+        for label in times.map(|time| &time.label).chain(&self.name) {
             part(&|cr| label.paint(cr, 1.0));
         }
-        if let Some(((x, y, d, _), initial)) = &self.avatar {
+        if let Some(avatar) = &self.avatar {
             part(&|cr| {
-                cr.arc(x + d / 2.0, y + d / 2.0, d / 2.0, 0.0, 2.0 * PI);
+                avatar.circle.trace(cr);
                 frost(cr, AVATAR, [1.0, 1.0, 1.0, AVATAR_OUTLINE], line)?;
-                initial
-                    .as_ref()
-                    .map_or(Ok(()), |initial| initial.paint(cr, 1.0))
+                match &avatar.initial {
+                    Some(initial) => initial.paint(cr, 1.0),
+                    None => Ok(()),
+                }
             });
         }
         part(&|cr| self.field.paint(cr, look, line));
@@ -473,43 +573,44 @@ impl Scene {
 impl Field {
     /// Draw the field showing `look`; `line` is a logical pixel's width.
     fn paint(&self, cr: &Context, look: Look, line: f64) -> Result<(), cairo::Error> {
-        let (x, y, width, height) = self.pill;
+        let Rect { x, y, w, h } = self.pill;
         let dim = if look.status == Status::Checking {
             CHECKING
         } else {
             1.0
         };
         match look.status {
-            Status::Idle => self
-                .hint
-                .as_ref()
-                .map_or(Ok(()), |hint| hint.paint(cr, 1.0))?,
+            Status::Idle => {
+                if let Some(hint) = &self.hint {
+                    hint.paint(cr, 1.0)?;
+                }
+            }
             Status::Cooldown(_) => {
-                if let Some((_, countdown)) = &self.countdown {
-                    countdown.paint(cr, 1.0)?;
+                if let Some(countdown) = &self.countdown {
+                    countdown.label.paint(cr, 1.0)?;
                 }
             }
             Status::Typing | Status::Checking | Status::Failed => {
-                let outline = match look.status {
-                    Status::Failed => self.error,
-                    _ => [1.0, 1.0, 1.0, FIELD_OUTLINE * dim],
+                let outline = if look.status == Status::Failed {
+                    self.error
+                } else {
+                    [1.0, 1.0, 1.0, FIELD_OUTLINE * dim]
                 };
                 rounded(cr, self.pill, self.radius);
                 frost(cr, FIELD * dim, outline, line)?;
                 set_colour(cr, fade(self.colour, dim));
-                let max = ((width - 2.0 * height + self.dot) / (2.0 * self.dot)).max(1.0);
+                let max = ((w - 2.0 * h + self.dot) / (2.0 * self.dot)).max(1.0);
                 let dots = look.chars.min(max as usize);
                 // Centred on whole pixels, so that a dot is the same at any position.
                 let row = (2 * dots) as f64 * self.dot - self.dot;
-                let first = x + width / 2.0 - row / 2.0 + self.dot / 2.0;
-                let cy = (y + height / 2.0).floor() + 0.5;
+                let first = x + w / 2.0 - row / 2.0 + self.dot / 2.0;
+                let cy = (y + h / 2.0).floor() + 0.5;
                 for i in 0..dots {
                     let cx = (first + (2 * i) as f64 * self.dot).floor() + 0.5;
                     cr.arc(cx, cy, self.dot / 2.0, 0.0, 2.0 * PI);
                     cr.fill()?;
                 }
-                let (cx, cy, radius) = self.button;
-                cr.arc(cx, cy, radius, 0.0, 2.0 * PI);
+                self.button.trace(cr);
                 frost(cr, BUTTON * dim, [0.0; 4], line)?;
                 if let Some(arrow) = &self.arrow {
                     arrow.paint(cr, dim)?;
@@ -524,13 +625,11 @@ impl Field {
 }
 
 impl Label {
-    /// Draw it in its place, at `alpha` of its opacity.
     fn paint(&self, cr: &Context, alpha: f64) -> Result<(), cairo::Error> {
         cr.set_source_surface(&self.surface, self.at.0, self.at.1)?;
         cr.paint_with_alpha(alpha)
     }
 
-    /// Its size in physical pixels.
     fn size(&self) -> (f64, f64) {
         (
             f64::from(self.surface.width()),
@@ -562,9 +661,8 @@ fn frost(cr: &Context, alpha: f64, outline: Rgba, line: f64) -> Result<(), cairo
     cr.restore()
 }
 
-/// Trace a rectangle with corners of `radius`.
-fn rounded(cr: &Context, (x, y, width, height): Rect, radius: f64) {
-    let (right, bottom) = (x + width - radius, y + height - radius);
+fn rounded(cr: &Context, Rect { x, y, w, h }: Rect, radius: f64) {
+    let (right, bottom) = (x + w - radius, y + h - radius);
     cr.new_sub_path();
     cr.arc(right, y + radius, radius, -PI / 2.0, 0.0);
     cr.arc(right, bottom, radius, 0.0, PI / 2.0);
@@ -573,29 +671,12 @@ fn rounded(cr: &Context, (x, y, width, height): Rect, radius: f64) {
     cr.close_path();
 }
 
-/// Text of `size` and `weight` in `colour`, with no extra spacing.
-fn small(size: f64, weight: Weight, colour: Rgba) -> Font {
-    let spacing = 0.0;
-    Font {
-        size,
-        weight,
-        spacing,
-        colour,
-    }
-}
-
 fn set_colour(cr: &Context, [r, g, b, a]: Rgba) {
     cr.set_source_rgba(r, g, b, a);
 }
 
-/// `colour` with its opacity multiplied by `alpha`.
 fn fade([r, g, b, a]: Rgba, alpha: f64) -> Rgba {
     [r, g, b, a * alpha]
-}
-
-/// The centre of `rect`.
-fn middle((x, y, width, height): Rect) -> (f64, f64) {
-    (x + width / 2.0, y + height / 2.0)
 }
 
 /// Where a box of `size` goes for its centre to be at `centre`, on whole pixels.
@@ -604,24 +685,6 @@ fn centred(size: (f64, f64), centre: (f64, f64)) -> (f64, f64) {
         (centre.0 - size.0 / 2.0).round(),
         (centre.1 - size.1 / 2.0).round(),
     )
-}
-
-/// Pango's weight for `weight`.
-fn weight(weight: Weight) -> pango::Weight {
-    match weight {
-        Weight::Thin => pango::Weight::Thin,
-        Weight::Ultralight => pango::Weight::Ultralight,
-        Weight::Light => pango::Weight::Light,
-        Weight::Semilight => pango::Weight::Semilight,
-        Weight::Book => pango::Weight::Book,
-        Weight::Normal => pango::Weight::Normal,
-        Weight::Medium => pango::Weight::Medium,
-        Weight::Semibold => pango::Weight::Semibold,
-        Weight::Bold => pango::Weight::Bold,
-        Weight::Ultrabold => pango::Weight::Ultrabold,
-        Weight::Heavy => pango::Weight::Heavy,
-        Weight::Ultraheavy => pango::Weight::Ultraheavy,
-    }
 }
 
 /// The top-left corner of a box of `size` placed on a `screen` at `anchor`, moved by
@@ -648,27 +711,13 @@ fn place(anchor: Anchor, offset: (f64, f64), size: (f64, f64), screen: (f64, f64
     )
 }
 
-/// The size in physical pixels of a frame for an output of logical `size` at `scale` (in
-/// 120ths): rounded as wp-fractional-scale-v1 asks, or the output's `mode` where that is
-/// within a pixel of it (1707 × 1.5 is 2560.5, on a 2560 px panel).
-pub fn pixels(size: (u32, u32), scale: u32, mode: Option<(u32, u32)>) -> (u32, u32) {
-    let round = |logical: u32| (logical * scale + 60) / 120;
-    let rounded = (round(size.0), round(size.1));
-    match mode {
-        Some(mode) if rounded.0.abs_diff(mode.0) <= 1 && rounded.1.abs_diff(mode.1) <= 1 => mode,
-        _ => rounded,
-    }
-}
-
-/// The scale (in 120ths) of an output whose mode is `mode` pixels wide and shows
-/// `logical` ones, as the compositor will most likely prefer it.
-pub fn scale_of(mode: u32, logical: u32) -> u32 {
+/// The scale (in 120ths) the compositor likely prefers for `logical` pixels on a `mode`.
+pub fn scale_of(mode: i32, logical: i32) -> u32 {
     (f64::from(mode) * 120.0 / f64::from(logical.max(1)))
         .round()
         .max(1.0) as u32
 }
 
-/// How long until the clock next changes, at the next minute.
 pub fn until_next_minute() -> Duration {
     let seconds = DateTime::now_local().map_or(0.0, |now| now.seconds());
     Duration::from_secs_f64((60.0 - seconds).clamp(0.001, 60.0))
@@ -701,6 +750,7 @@ mod tests {
 
     #[test]
     fn frames_round_like_the_protocol_and_fit_the_panel() {
+        let pixels = |logical, scale, mode| Layout::new(logical, scale, mode).pixels;
         let at = |scale| pixels((1280, 720), scale, None);
         assert_eq!(
             [120, 180, 240].map(at),
@@ -717,11 +767,13 @@ mod tests {
         assert_eq!(scale_of(1920, 1920), 120);
     }
 
-    /// The default lock screen, prepared for a 1280×720 output at `scale`.
+    /// The default lock screen, prepared for a 1280×720 output at `scale`, with the
+    /// built-in colours and the font the package's tests provide.
     fn scene(scale: u32) -> (Painter, Scene) {
         let config: Config = knuffel::parse("default", DEFAULT_LOCK_SCREEN).unwrap();
-        let painter = Painter::new(config.lock_screen.unwrap());
-        let scene = painter.scene((1280, 720), scale, pixels((1280, 720), scale, None));
+        let config = config.lock_screen.unwrap();
+        let painter = Painter::with(config, Palette::parse(""), "Adwaita Sans", "Ann".into());
+        let scene = painter.scene(Layout::new((1280, 720), scale, None));
         (painter, scene)
     }
 
@@ -732,23 +784,21 @@ mod tests {
             let background = scene.background.as_ref().unwrap();
             let small = ((320.0 * factor) as i32, (180.0 * factor) as i32);
             assert_eq!((background.width(), background.height()), small);
-            let field = &scene.field;
+            let pill = scene.field.pill;
             // 176 × 30 at the bottom centre, with its bottom 56 px plus the caps line up.
-            assert_eq!(
-                (field.pill.2, field.pill.3),
-                (176.0 * factor, 30.0 * factor)
-            );
-            assert_eq!(field.pill.0, (640.0 - 88.0) * factor);
-            let caps = field.caps.as_ref().unwrap().size().1 / factor;
+            assert_eq!((pill.w, pill.h), (176.0 * factor, 30.0 * factor));
+            assert_eq!(pill.x, (640.0 - 88.0) * factor);
+            let caps = scene.field.caps.as_ref().unwrap().size().1 / factor;
             let top = 720.0 - 56.0 - caps - GAP - 30.0;
-            assert!(
-                (field.pill.1 - top * factor).abs() <= 1.0,
-                "{scale}: {:?}",
-                field.pill
-            );
-            let ((x, y, d, _), _) = scene.avatar.as_ref().unwrap();
-            let expected = [640.0 - 32.0, 720.0 - 149.0 - 64.0, 64.0].map(|v| (v * factor).round());
-            assert_eq!([*x, *y, *d], expected);
+            assert!((pill.y - top * factor).abs() <= 1.0, "{scale}: {pill:?}");
+            let circle = scene.avatar.as_ref().unwrap().circle;
+            let [x, y, d] =
+                [640.0 - 32.0, 720.0 - 149.0 - 64.0, 64.0].map(|v| (v * factor).round());
+            let want = Circle {
+                centre: (x + d / 2.0, y + d / 2.0),
+                radius: d / 2.0,
+            };
+            assert_eq!(circle, want);
         }
     }
 
@@ -756,61 +806,97 @@ mod tests {
     fn the_clock_is_rendered_again_only_when_its_text_changes() {
         let (painter, mut scene) = scene(120);
         assert!(!painter.refresh(&mut scene));
-        scene.times[1].as_mut().unwrap().text = "stale".into();
+        scene.clock.as_mut().unwrap().text = "stale".into();
         assert!(painter.refresh(&mut scene));
-        assert_ne!(scene.times[1].as_ref().unwrap().text, "stale");
+        assert_ne!(scene.clock.as_ref().unwrap().text, "stale");
         assert!(!painter.refresh(&mut scene));
     }
 
-    #[test]
-    fn the_countdown_is_rendered_once_per_second_shown() {
-        let (painter, mut scene) = scene(120);
-        let shown = |scene: &Scene| {
-            let (seconds, label) = scene.field.countdown.as_ref().unwrap();
-            (*seconds, label.surface.to_raw_none())
-        };
-        painter.countdown(&mut scene, 30);
-        let first = shown(&scene);
-        painter.countdown(&mut scene, 30);
-        // The same surface, not rendered again.
-        assert_eq!(shown(&scene), first);
-        painter.countdown(&mut scene, 29);
-        assert_eq!(shown(&scene).0, 29);
-    }
-
     /// The colour of pixel `(x, y)` of a 1280 px wide frame.
-    fn pixel(canvas: &[u8], x: usize, y: usize) -> u32 {
+    fn pixel(canvas: &[u8], (x, y): (usize, usize)) -> u32 {
         u32::from_ne_bytes(canvas.as_chunks().0[y * 1280 + x]) & 0xffffff
     }
 
-    const TYPING: Look = Look {
-        status: Status::Typing,
-        chars: 1,
-        caps_lock: false,
-    };
+    fn look(status: Status, chars: usize) -> Look {
+        Look {
+            status,
+            chars,
+            caps_lock: false,
+        }
+    }
+
+    fn frame(scene: &Scene, look: Look) -> Vec<u8> {
+        let mut canvas = vec![0; 1280 * 720 * 4];
+        scene.draw(&mut canvas, look);
+        canvas
+    }
 
     #[test]
-    fn every_state_draws() {
-        let (_, scene) = scene(120);
-        let mut canvas = vec![0; 1280 * 720 * 4];
+    fn the_countdown_shows_the_seconds_left() {
+        let (painter, mut scene) = scene(120);
+        painter.countdown(&mut scene, 30);
+        let thirty = frame(&scene, look(Status::Cooldown(30), 0));
+        painter.countdown(&mut scene, 30);
+        assert!(frame(&scene, look(Status::Cooldown(30), 0)) == thirty);
+        painter.countdown(&mut scene, 29);
+        assert!(frame(&scene, look(Status::Cooldown(29), 0)) != thirty);
+    }
+
+    #[test]
+    fn each_state_draws_what_only_it_shows() {
+        let (painter, mut scene) = scene(120);
+        painter.countdown(&mut scene, 3);
         let states = [
-            Status::Idle,
-            Status::Typing,
-            Status::Checking,
-            Status::Failed,
+            (Status::Idle, 0),
+            (Status::Typing, 1),
+            (Status::Checking, 1),
+            (Status::Failed, 0),
+            (Status::Cooldown(3), 0),
         ];
-        for status in states.into_iter().chain([Status::Cooldown(3)]) {
-            scene.draw(
-                &mut canvas,
-                Look {
-                    status,
-                    chars: 40,
-                    caps_lock: true,
-                },
-            );
-            // Half-way down the left edge, the plain background, between the gradients.
-            assert_eq!(pixel(&canvas, 5, 360), 0x202428);
+        let frames = states.map(|(status, chars)| frame(&scene, look(status, chars)));
+        let pill = scene.field.pill;
+        let (left, top) = (pill.x as usize, pill.y as usize);
+        let (cx, cy) = pill.centre();
+        let (centre, edge) = ((cx as usize, cy as usize), (cx as usize, top));
+        // Half-way down the left edge, the plain background, between the gradients.
+        assert!(frames.iter().all(|f| pixel(f, (5, 360)) == 0x202428));
+        // Typing: a dot in the middle; checking: dimmed; a failure: the error outline.
+        assert_eq!(pixel(&frames[1], centre), 0xffffff);
+        assert_ne!(pixel(&frames[2], centre), pixel(&frames[1], centre));
+        assert_eq!(pixel(&frames[3], edge), 0xffb4ab);
+        assert_ne!(pixel(&frames[1], edge), 0xffb4ab);
+        // Each state has a pixel in the field that no other state draws so.
+        let field = (top..top + pill.h as usize)
+            .flat_map(|y| (left..left + pill.w as usize).map(move |x| (x, y)));
+        for (i, (status, _)) in states.iter().enumerate() {
+            let only = |at: (usize, usize)| {
+                let mine = pixel(&frames[i], at);
+                (frames.iter().enumerate()).all(|(j, f)| j == i || pixel(f, at) != mine)
+            };
+            assert!(field.clone().any(only), "{status:?}");
         }
+    }
+
+    #[test]
+    fn caps_lock_shows_under_the_field() {
+        let (_, scene) = scene(120);
+        let idle = look(Status::Idle, 0);
+        let caps = frame(
+            &scene,
+            Look {
+                caps_lock: true,
+                ..idle
+            },
+        );
+        let line = scene.field.caps.as_ref().unwrap();
+        let (x, y) = (line.at.0 as usize, line.at.1 as usize);
+        let (w, h) = line.size();
+        let area = (y..y + h as usize).flat_map(|y| (x..x + w as usize).map(move |x| (x, y)));
+        let without = frame(&scene, idle);
+        assert!(
+            area.into_iter()
+                .any(|at| pixel(&caps, at) != pixel(&without, at))
+        );
     }
 
     #[test]
@@ -819,16 +905,23 @@ mod tests {
         let broken = ImageSurface::create(Format::ARgb32, 10, 10).unwrap();
         broken.finish();
         scene.name.as_mut().unwrap().surface = broken.clone();
-        let mut canvas = vec![0; 1280 * 720 * 4];
-        scene.draw(&mut canvas, TYPING);
-        assert_eq!(pixel(&canvas, 5, 360), 0x202428);
+        let canvas = frame(&scene, look(Status::Typing, 1));
+        assert_eq!(pixel(&canvas, (5, 360)), 0x202428);
         // The field, frosted, is drawn after the name.
-        let (x, y, ..) = scene.field.pill;
-        assert_ne!(pixel(&canvas, x as usize + 20, y as usize + 15), 0x202428);
+        let pill = scene.field.pill;
+        let inside = (pill.x as usize + 20, pill.y as usize + 15);
+        assert_ne!(pixel(&canvas, inside), 0x202428);
         // Without the background, the frame is the plain colour.
         scene.background = Some(broken);
-        scene.draw(&mut canvas, TYPING);
+        let canvas = frame(&scene, look(Status::Typing, 1));
         let plain = |p: &[u8; 4]| u32::from_ne_bytes(*p) & 0xffffff == 0x202428;
         assert!(canvas.as_chunks().0.iter().all(plain));
+    }
+
+    #[test]
+    #[should_panic(expected = "a canvas too small")]
+    fn a_canvas_too_small_for_the_frame_is_refused() {
+        let (_, scene) = scene(120);
+        scene.draw(&mut [0; 4], look(Status::Idle, 0));
     }
 }

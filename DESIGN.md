@@ -215,7 +215,9 @@ cooldown, "Try again in N s" in place of the field, counting down each second.
 `Wayland::next` goes round, it compares the look with what is shown, and
 redraws every surface, in full, only if it changed. The entry's state machine,
 `Entry`, does no I/O apart from one log line when a cooldown starts; the time
-is passed in (and kept, for the countdown), and it is unit-tested.
+is passed in, and it is unit-tested. The password itself is kept by a type of
+its own, `Password` (the buffer described under "Protecting the password"),
+which holds all of its unsafe code.
 
 ### Drawing
 
@@ -227,7 +229,10 @@ GTK's default, `gtk-font-name` in `$XDG_CONFIG_HOME/gtk-4.0/settings.ini` (by
 default "Sans"), at the size and weight each widget asks for. Colours are
 literal `#rrggbb[aa]` or GTK's named colours from `gtk-4.0/gtk.css`: only its
 `@define-color <name> #hex;` lines are read (matugen writes them), and a
-missing file or name falls back to built-in defaults, logged.
+missing file or name falls back to built-in defaults, logged. Colours are
+parsed once, when the config is loaded, and names are checked each time
+gtk.css is read (at startup and on a reload): each one it lacks is logged then,
+once, and shows white.
 
 The layout comes from the config's `lock-screen` block: a widget each for the
 background, date, clock, avatar, name and password field, each placed at one
@@ -254,9 +259,10 @@ drawn ahead of time, into a buffer of its own in the pool, kept. A lock
 attaches that buffer and commits: no drawing at all between the request and
 the first commit. If the compositor still holds that buffer from the last
 lock, or it shows something else (caps lock, say), the first frame is drawn
-then instead. The frame is drawn again whenever its scene changes: at startup,
-when an output appears or changes, on a reload, and each minute the clock or
-date changes.
+then instead. The log says which: "lock screen drawn (attached)" or
+"(painted)", with the time since the request. The frame is drawn again
+whenever its scene changes: at startup, when an output appears or changes, on
+a reload, and each minute the clock or date changes.
 
 Each output has at most two buffers: the one the compositor shows and one to
 draw the next frame in, each remembered with what it shows, so that one that
@@ -347,7 +353,10 @@ On Enter, the daemon starts its helper, `rust-wl-idle-manager --auth` (from
 writes the password to the helper's stdin pipe and closes it. The helper
 reads it into a fixed buffer, runs PAM's `pam_authenticate` for the user it
 runs as, with the service `rust-wl-idle-manager`, wipes the buffer, and
-exits with 0 on success and 1 otherwise. Like GDM's reauthentication, a
+exits with 0 on success and 1 otherwise. The PAM conversation answers the
+first password prompt with the password and aborts on a second one, as
+swaylock does: pam_systemd_home asks again itself after a wrong password, and
+there is no second password to give. Like GDM's reauthentication, a
 failing `pam_acct_mgmt` (such as an expired password) is logged but does not
 fail the check, so the lock screen can never lock its user out. pam_unix
 already delays a failure by about 2 s, so there is no extra delay.
@@ -401,8 +410,8 @@ keystrokes. It is handled like this:
   (`prctl(PR_SET_DUMPABLE, 0)`): no core dumps, and other processes of the
   user cannot ptrace them or read their memory; their `/proc/PID` files
   belong to root. The unit should also set `LimitCORE=0`.
-- The buffer prints nothing as `Debug`, keys are not `Debug`, and nothing
-  derived from the password is logged or put in an error.
+- Neither the buffer nor a key is `Debug`, and nothing derived from the
+  password is logged or put in an error.
 - The helper gets the password only on its stdin pipe, never in its
   arguments or environment, and reads it unbuffered into its own fixed
   buffer, which it wipes before exiting normally. A panic or a kill ends it

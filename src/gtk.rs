@@ -5,74 +5,79 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use crate::config::Colour;
+use crate::config::{Colour, ColourName, LockScreen};
 
 /// Red, green, blue and alpha, each from 0 to 1, not premultiplied.
 pub type Rgba = [f64; 4];
 
-/// Named colours used by the defaults, for when gtk.css lacks them.
-const BUILT_IN: [(&str, &str); 1] = [("error_color", "#ffb4ab")];
+/// The error colour the default lock screen names, for when gtk.css lacks it.
+const ERROR_COLOR: &str = "#ffb4ab";
 
 /// GTK's named colours, as matugen writes them to `gtk-4.0/gtk.css`.
 pub struct Palette(HashMap<String, Rgba>);
 
 impl Palette {
-    /// The built-in colours, overridden by GTK's gtk.css; a missing file is logged, and
-    /// leaves the built-in ones.
-    pub fn load() -> Self {
-        let path = file("gtk.css");
-        let css = fs::read_to_string(&path).unwrap_or_else(|e| {
-            info!("no GTK colours from {}: {e}", path.display());
-            String::new()
+    /// The colours gtk.css defines, over the built-in one; a missing file is logged. So is
+    /// each colour `config` names that neither defines.
+    pub fn load(config: &LockScreen) -> Self {
+        let css = file("gtk.css").and_then(|path| {
+            fs::read_to_string(&path)
+                .inspect_err(|e| info!("no GTK colours from {}: {e}", path.display()))
+                .ok()
         });
-        Self::parse(&css)
+        let palette = Self::parse(&css.unwrap_or_default());
+        for colour in config.colours() {
+            if let ColourName::Named(name) = &colour.name
+                && !palette.0.contains_key(name)
+            {
+                warn!("unknown colour {name:?}; using white");
+            }
+        }
+        palette
     }
 
-    /// The built-in colours, and those `css` defines with `@define-color <name> #hex;`
-    /// lines; everything else is ignored.
-    fn parse(css: &str) -> Self {
+    /// The built-in colour, and those `css` defines in `@define-color <name> #hex;` lines.
+    pub fn parse(css: &str) -> Self {
         let defined = css.lines().filter_map(|line| {
             let mut words = line.strip_prefix("@define-color")?.split_whitespace();
-            let name = words.next()?;
+            let name = words.next()?.to_owned();
             Some((name, hex(words.next()?.strip_suffix(';')?)?))
         });
-        let built_in = BUILT_IN
-            .iter()
-            .map(|&(name, value)| (name, hex(value).unwrap()));
-        Self(
-            built_in
-                .chain(defined)
-                .map(|(name, rgba)| (name.to_owned(), rgba))
-                .collect(),
-        )
+        let built_in = (
+            "error_color".to_owned(),
+            hex(ERROR_COLOR).expect("a colour"),
+        );
+        Self([built_in].into_iter().chain(defined).collect())
     }
 
-    /// The colour `colour` names, with its opacity applied; an unknown name is logged and
-    /// gives white.
+    /// `colour`, with its opacity applied; an unknown name gives white.
     pub fn get(&self, colour: &Colour) -> Rgba {
-        let name = colour.name.0.as_str();
-        let named = || self.0.get(name).copied();
-        let [r, g, b, a] = hex(name).or_else(named).unwrap_or_else(|| {
-            warn!("unknown colour {name:?}; using white");
-            [1.0; 4]
-        });
+        let [r, g, b, a] = match &colour.name {
+            ColourName::Literal(rgba) => *rgba,
+            ColourName::Named(name) => self.0.get(name).copied().unwrap_or([1.0; 4]),
+        };
         [r, g, b, a * colour.alpha.0]
     }
 }
 
 /// `name` in GTK 4's config directory, `$XDG_CONFIG_HOME/gtk-4.0` (by default
-/// `~/.config/gtk-4.0`).
-fn file(name: &str) -> PathBuf {
+/// `~/.config/gtk-4.0`); `None`, logged, if neither variable is set.
+fn file(name: &str) -> Option<PathBuf> {
     let config = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    config.unwrap_or_default().join("gtk-4.0").join(name)
+    if config.is_none() {
+        warn!("neither XDG_CONFIG_HOME nor HOME is set; not reading gtk-4.0/{name}");
+    }
+    Some(config?.join("gtk-4.0").join(name))
 }
 
 /// GTK's default font, `gtk-font-name` in its settings.ini, or "Sans".
 pub fn font() -> String {
-    let settings = fs::read_to_string(file("settings.ini")).unwrap_or_default();
-    font_in(&settings).unwrap_or("Sans").to_owned()
+    let settings = file("settings.ini").and_then(|path| fs::read_to_string(path).ok());
+    font_in(&settings.unwrap_or_default())
+        .unwrap_or("Sans")
+        .to_owned()
 }
 
 /// The `gtk-font-name` in settings.ini's `text`.
@@ -88,9 +93,9 @@ fn font_in(text: &str) -> Option<&str> {
 }
 
 /// `#rrggbb` or `#rrggbbaa`.
-fn hex(text: &str) -> Option<Rgba> {
+pub fn hex(text: &str) -> Option<Rgba> {
     let digits = text.strip_prefix('#')?;
-    if !matches!(digits.len(), 6 | 8) || !digits.is_ascii() {
+    if !matches!(digits.len(), 6 | 8) || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let byte = |i: usize| u8::from_str_radix(digits.get(i..i + 2)?, 16).ok();
@@ -105,7 +110,7 @@ mod tests {
 
     fn colour(name: &str, alpha: f64) -> Colour {
         Colour {
-            name: crate::config::ColourName(name.into()),
+            name: name.parse().unwrap(),
             alpha: Number(alpha),
         }
     }
@@ -121,7 +126,9 @@ mod tests {
     fn hex_colours_parse() {
         assert_eq!(hex("#ff0080"), Some([1.0, 0.0, 128.0 / 255.0, 1.0]));
         assert_eq!(hex("#00000000"), Some([0.0; 4]));
-        for bad in ["ff0080", "#ff008", "#ff00800", "#gg0080", "#ff0é0"] {
+        for bad in [
+            "ff0080", "#ff008", "#ff00800", "#gg0080", "#ff0é0", "#+f+f+f",
+        ] {
             assert_eq!(hex(bad), None, "{bad}");
         }
     }

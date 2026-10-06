@@ -20,7 +20,6 @@ pub trait LogindManager {
         mode: &str,
     ) -> zbus::Result<zvariant::OwnedFd>;
 
-    /// The object path of the session with this ID.
     fn get_session(&self, session_id: &str) -> zbus::Result<OwnedObjectPath>;
 
     /// Suspend the system; with `interactive` false, polkit never asks for a password.
@@ -29,14 +28,12 @@ pub trait LogindManager {
     /// Suspend, then hibernate after `HibernateDelaySec` or on low battery.
     fn suspend_then_hibernate(&self, interactive: bool) -> zbus::Result<()>;
 
-    /// Hibernate the system.
     fn hibernate(&self, interactive: bool) -> zbus::Result<()>;
 
     /// What block-mode inhibitors are held for, colon-separated, e.g. "idle:sleep".
     #[zbus(property)]
     fn block_inhibited(&self) -> zbus::Result<String>;
 
-    /// Whether the laptop's lid is closed; false without a lid.
     #[zbus(property)]
     fn lid_closed(&self) -> zbus::Result<bool>;
 
@@ -66,11 +63,9 @@ pub trait LogindUser {
     default_service = "org.freedesktop.login1"
 )]
 pub trait LogindSession {
-    /// Asks the session's screen locker to lock, e.g. from `loginctl lock-session`.
     #[zbus(signal)]
     fn lock(&self) -> zbus::Result<()>;
 
-    /// Asks the session's screen locker to unlock, e.g. from `loginctl unlock-session`.
     #[zbus(signal)]
     fn unlock(&self) -> zbus::Result<()>;
 
@@ -104,7 +99,6 @@ impl LogindManagerProxy<'_> {
         Ok((id, LogindSessionProxy::new(conn, path).await?))
     }
 
-    /// Take a delay inhibitor for sleep, held until the returned fd is dropped.
     pub async fn sleep_inhibitor(&self) -> anyhow::Result<OwnedFd> {
         let fd = self
             .inhibit(
@@ -115,8 +109,6 @@ impl LogindManagerProxy<'_> {
             )
             .await
             .context("taking the sleep inhibitor")?;
-        // zbus receives fds without MSG_CMSG_CLOEXEC, but zvariant hands back a duplicate
-        // made with F_DUPFD_CLOEXEC; the original closes with the reply.
         Ok(fd.into())
     }
 }

@@ -1,25 +1,17 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use tokio::time::Instant;
 use tracing::error;
 use wayland_client::protocol::wl_keyboard::{self, KeyState, KeymapFormat, WlKeyboard};
 use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use xkbcommon::xkb;
 
-use super::{State, Wayland};
-use crate::password::{Entry, Key};
-use crate::policy::Input;
-
-impl Wayland {
-    /// The password typed on the lock screen; changes show on the next `next`.
-    pub fn entry_mut(&mut self) -> &mut Entry {
-        &mut self.state.entry
-    }
-}
+use super::State;
+use crate::entry::{Key, Repeat};
 
 impl State {
-    /// Act on the key with evdev code `code`, pressed. Only while locked: the lock screen
-    /// is the daemon's only surface, so there is nothing else to type into.
+    /// Act on the key with evdev `code`, pressed; only while locked, so it is meant for us.
     fn press(&mut self, code: u32) {
         let Some(xkb) = self.lock.as_ref().and(self.xkb_state.as_ref()) else {
             return;
@@ -37,7 +29,7 @@ impl State {
         if let Some(key) = key
             && self.entry.press(key, code, Instant::now())
         {
-            self.inputs.push_back(Input::PasswordEntered);
+            self.submitted = true;
         }
     }
 }
@@ -131,11 +123,9 @@ impl Dispatch<WlKeyboard, ()> for State {
             }
             // A rate of 0 means no repeat; clamped so a bad compositor can't panic or spin us.
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
-                state.entry.set_repeat((rate > 0).then(|| {
-                    (
-                        Duration::from_millis(delay.max(0) as u64),
-                        rate.min(1000) as u32,
-                    )
+                state.entry.set_repeat((rate > 0).then(|| Repeat {
+                    delay: Duration::from_millis(delay.max(0) as u64),
+                    interval: Duration::from_secs(1) / rate.min(1000) as u32,
                 }))
             }
             _ => {}

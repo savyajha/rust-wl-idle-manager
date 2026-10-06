@@ -1,23 +1,22 @@
 use std::fs;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, bail, ensure};
 use cairo::{Context, Filter, Format, ImageSurface};
 use tokio::process::Command;
-use tokio::time;
+use tokio::time::{self, Instant};
 use tracing::info;
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
-use crate::auth;
-use crate::config::Background;
+use crate::cloexec_above_stderr;
+use crate::config::Argv;
 
-/// How much smaller than the wallpaper the blurred copy is kept: blurred, it loses
-/// nothing when scaled back up.
-const SHRINK: i32 = 4;
+/// How much smaller than the wallpaper the blurred copy is; blurred, it loses nothing.
+const WALLPAPER_SHRINK: i32 = 4;
 
 /// How many box blurs in a row approximate a Gaussian one.
 const PASSES: usize = 3;
@@ -31,28 +30,31 @@ const MAX_PIXELS: usize = 64_000_000;
 /// The wallpaper, shrunk, blurred and toned, as cairo's `Rgb24` pixels (0x00RRGGBB in
 /// native byte order), row after row.
 pub struct Blurred {
-    pub width: usize,
-    pub height: usize,
+    pub width: i32,
+    pub height: i32,
     pub pixels: Vec<u8>,
 }
 
-/// Run `background`'s wallpaper command, then decode, shrink, blur and tone the PNG or
-/// JPEG whose path it prints first, on a blocking thread.
-pub async fn load(background: Background) -> anyhow::Result<Blurred> {
-    let argv = background
-        .wallpaper_command
-        .as_ref()
-        .context("no wallpaper command")?;
-    let argv = argv.argv();
-    let program = &argv[0];
-    let running = auth::only_stdio(&mut Command::new(program))
-        .args(&argv[1..])
+/// Run `command`, then decode the PNG or JPEG whose path it prints first, shrink it, blur
+/// it by the radius `blur`, and tone it, on a blocking thread.
+pub async fn load(
+    command: Argv,
+    blur: f64,
+    brightness: f64,
+    saturation: f64,
+) -> anyhow::Result<Blurred> {
+    let program = &command.0[0];
+    let running = cloexec_above_stderr(&mut Command::new(program))
+        .args(&command.0[1..])
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output();
     let output = time::timeout(TIMEOUT, running)
         .await
-        .with_context(|| format!("the wallpaper command {program} took over 5 s"))?
+        .with_context(|| {
+            let seconds = TIMEOUT.as_secs();
+            format!("the wallpaper command {program} took over {seconds} s")
+        })?
         .with_context(|| format!("running the wallpaper command {program}"))?;
     ensure!(
         output.status.success(),
@@ -71,7 +73,7 @@ pub async fn load(background: Background) -> anyhow::Result<Blurred> {
             .and_then(decode)
             .and_then(|image| shrink(&image))
             .with_context(|| format!("decoding the wallpaper {path}"))?;
-        let (width, height) = (small.width() as usize, small.height() as usize);
+        let (width, height) = (small.width(), small.height());
         let data = small.take_data()?;
         let mut pixels: Vec<u32> = data
             .as_chunks()
@@ -80,18 +82,18 @@ pub async fn load(background: Background) -> anyhow::Result<Blurred> {
             .map(|p| u32::from_ne_bytes(*p))
             .collect();
         drop(data);
-        let radius = (background.blur.0 / f64::from(SHRINK)).round() as usize;
+        let radius = (blur / f64::from(WALLPAPER_SHRINK)).round() as usize;
         for _ in 0..PASSES {
-            let across = blur_rows_transposed(&pixels, width, radius);
-            pixels = blur_rows_transposed(&across, height, radius);
+            let across = blur_rows_transposed(&pixels, width as usize, radius);
+            pixels = blur_rows_transposed(&across, height as usize, radius);
         }
+        let pixels = tone(&pixels, brightness, saturation);
         // Give the decoding's tens of megabytes back to the system; glibc would keep them
         // in this thread's arena.
         // SAFETY: malloc_trim has no preconditions.
         unsafe { libc::malloc_trim(0) };
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
         info!("wallpaper {path} ready in {elapsed:.0} ms");
-        let pixels = tone(&pixels, background.brightness.0, background.saturation.0);
         Ok(Blurred {
             width,
             height,
@@ -137,12 +139,11 @@ fn decode(bytes: Vec<u8>) -> anyhow::Result<ImageSurface> {
     )?)
 }
 
-/// `image` at 1/`SHRINK` of its size, scaled down by cairo, which averages the pixels it
-/// replaces.
+/// `image` at 1/`WALLPAPER_SHRINK` of its size; cairo averages the pixels it replaces.
 fn shrink(image: &ImageSurface) -> anyhow::Result<ImageSurface> {
     let (width, height) = (
-        (image.width() / SHRINK).max(1),
-        (image.height() / SHRINK).max(1),
+        (image.width() / WALLPAPER_SHRINK).max(1),
+        (image.height() / WALLPAPER_SHRINK).max(1),
     );
     let small = ImageSurface::create(Format::Rgb24, width, height)?;
     let cr = Context::new(&small)?;
@@ -157,7 +158,6 @@ fn shrink(image: &ImageSurface) -> anyhow::Result<ImageSurface> {
     Ok(small)
 }
 
-/// The red, green and blue of an 0x00RRGGBB pixel.
 fn channels(pixel: u32) -> [u32; 3] {
     [pixel >> 16 & 0xff, pixel >> 8 & 0xff, pixel & 0xff]
 }
@@ -173,7 +173,8 @@ fn blur_rows_transposed(pixels: &[u32], width: usize, radius: usize) -> Vec<u32>
         let radius = radius as isize;
         let mut sum = [0; 3];
         for x in -radius..=radius {
-            sum = [0, 1, 2].map(|c| sum[c] + at(x)[c]);
+            let pixel = at(x);
+            sum = [0, 1, 2].map(|c| sum[c] + pixel[c]);
         }
         for x in 0..width {
             let [r, g, b] = sum.map(|s| (s + count / 2) / count);
@@ -185,8 +186,7 @@ fn blur_rows_transposed(pixels: &[u32], width: usize, radius: usize) -> Vec<u32>
     out
 }
 
-/// `pixels` with their brightness and saturation multiplied (as CSS's filters do), as
-/// cairo's bytes.
+/// `pixels` toned as CSS's brightness and saturation filters do, as cairo's bytes.
 fn tone(pixels: &[u32], brightness: f64, saturation: f64) -> Vec<u8> {
     let tone = |pixel: u32| {
         let [r, g, b] = channels(pixel).map(|c| f64::from(c) * brightness);

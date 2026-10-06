@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::{CStr, OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read};
@@ -12,6 +13,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{self, Instant};
 use tracing::{error, info, warn};
 
+use crate::cloexec_above_stderr;
 use crate::password::{self, CAPACITY};
 
 /// The PAM service; NixOS needs `security.pam.services.rust-wl-idle-manager = { };`.
@@ -20,27 +22,9 @@ const SERVICE: &str = "rust-wl-idle-manager";
 /// How long the helper may take before it is killed and the attempt counts as failed.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Make `command`'s child close every fd but stdin, stdout and stderr as it executes. An fd
-/// the daemon has just received over D-Bus (the sleep inhibitor's) lacks close-on-exec
-/// until zbus drops the message it came in.
-pub fn only_stdio(command: &mut Command) -> &mut Command {
-    // SAFETY: close_range is a system call, safe between fork and exec. Marking the fds
-    // close-on-exec, rather than closing them, keeps the pipe std reports exec errors on.
-    // A failure (a kernel before 5.11, or a seccomp filter) is ignored: the fds it would
-    // drop are already close-on-exec except in brief windows, and failing the spawn would
-    // stop the password check altogether.
-    unsafe {
-        command.pre_exec(|| {
-            libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as i32);
-            Ok(())
-        })
-    }
-}
-
-/// One password check: the helper process, started by `start`.
+/// One password check: the helper process, killed at `deadline` if it has not answered.
 pub struct Attempt {
     child: Child,
-    /// When the helper is killed if it has not answered.
     deadline: Instant,
 }
 
@@ -48,7 +32,7 @@ pub struct Attempt {
 /// which is then closed. Nothing else carries the password.
 pub async fn start(password: &[u8]) -> io::Result<Attempt> {
     // This binary, even if its file has been replaced since.
-    let mut child = only_stdio(&mut Command::new("/proc/self/exe"))
+    let mut child = cloexec_above_stderr(&mut Command::new("/proc/self/exe"))
         .arg0("rust-wl-idle-manager")
         .arg("--auth")
         .stdin(Stdio::piped())
@@ -109,8 +93,7 @@ pub fn helper() -> ExitCode {
     }
 }
 
-/// Read stdin into `buffer` until it ends or `buffer` is full. Unbuffered, so that no
-/// other copy is made.
+/// Read stdin into `buffer`, unbuffered, until it ends or `buffer` is full.
 fn read_all(buffer: &mut [u8]) -> io::Result<usize> {
     let mut stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
     let mut len = 0;
@@ -133,7 +116,7 @@ fn check(password: &[u8]) -> bool {
     };
     let pam = TransactionBuilder::new_with_service(SERVICE)
         .username(&user)
-        .build(Conversation(password).into_conversation());
+        .build(Conversation::new(password).into_conversation());
     let mut pam = match pam {
         Ok(pam) => pam,
         Err(e) => {
@@ -161,8 +144,21 @@ fn user_name() -> Option<OsString> {
     }
 }
 
-/// Answers PAM's password prompt with the password; there are no other prompts.
-struct Conversation<'a>(&'a [u8]);
+/// Answers PAM's first password prompt with the password. A second one aborts, as in
+/// swaylock: pam_systemd_home asks again itself after a wrong password.
+struct Conversation<'a> {
+    password: &'a [u8],
+    answered: Cell<bool>,
+}
+
+impl<'a> Conversation<'a> {
+    fn new(password: &'a [u8]) -> Self {
+        Self {
+            password,
+            answered: Cell::new(false),
+        }
+    }
+}
 
 impl ConversationAdapter for Conversation<'_> {
     fn prompt(&self, _: impl AsRef<OsStr>) -> nonstick::Result<OsString> {
@@ -171,7 +167,10 @@ impl ConversationAdapter for Conversation<'_> {
 
     /// nonstick takes an owned copy, which it cannot wipe; it dies with this process.
     fn masked_prompt(&self, _: impl AsRef<OsStr>) -> nonstick::Result<OsString> {
-        Ok(OsStr::from_bytes(self.0).to_owned())
+        if self.answered.replace(true) {
+            return Err(ErrorCode::Abort);
+        }
+        Ok(OsStr::from_bytes(self.password).to_owned())
     }
 
     fn error_msg(&self, message: impl AsRef<OsStr>) {
@@ -180,5 +179,61 @@ impl ConversationAdapter for Conversation<'_> {
 
     fn info_msg(&self, message: impl AsRef<OsStr>) {
         info!("PAM: {}", message.as_ref().display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn only_the_first_password_prompt_is_answered() {
+        let conversation = Conversation::new(b"pw");
+        assert_eq!(conversation.masked_prompt("Password: ").unwrap(), "pw");
+        let again = conversation.masked_prompt("Password: ");
+        assert!(matches!(again, Err(ErrorCode::Abort)));
+        assert!(conversation.prompt("Login: ").is_err());
+    }
+
+    fn attempt(program: &str, args: &[&str], deadline: Duration) -> Option<Attempt> {
+        let child = Command::new(program)
+            .args(args)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + deadline;
+        Some(Attempt { child, deadline })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_exit_status_is_the_answer() {
+        let mut slot = attempt("true", &[], TIMEOUT);
+        assert!(finished(&mut slot).await);
+        assert!(slot.is_none());
+        let mut slot = attempt("false", &[], TIMEOUT);
+        assert!(!finished(&mut slot).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_helper_that_takes_too_long_is_killed_and_fails() {
+        let mut slot = attempt("sleep", &["60"], Duration::from_millis(50));
+        let pid = slot.as_ref().unwrap().child.id().unwrap();
+        assert!(!finished(&mut slot).await);
+        assert!(slot.is_none());
+        // Gone, or a zombie until tokio reaps it.
+        let dead = || {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            stat.is_empty() || stat.contains(") Z ")
+        };
+        for _ in 0..100 {
+            if dead() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the helper {pid} is still running");
     }
 }

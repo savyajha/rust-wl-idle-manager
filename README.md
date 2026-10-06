@@ -45,8 +45,9 @@ Each `timeout` takes its delay in seconds and exactly one action: `lock`,
 `ignore-inhibit` makes a timeout count only input, ignoring idle inhibitors
 such as a playing video. Unknown nodes and properties are rejected.
 
-`locker` names the program that locks the session. Without it, the daemon
-locks with its own lock screen, through `ext-session-lock-v1`, which the
+`locker` names the program that locks the session; a config with a `locker`
+cannot also have a `lock-screen` block. Without it, the daemon locks with its
+own lock screen, through `ext-session-lock-v1`, which the
 compositor must support. The built-in lock screen covers every output with
 the blurred wallpaper, the date and a large clock at the top, and your
 initial, name and a password field at the bottom: type your password and
@@ -167,7 +168,7 @@ properties and values of the wrong type:
 | `gradient`, a colour's opacity | 0 to 1 |
 | a colour | `#` and 6 or 8 hex digits, or a name of letters, digits, `_` and `-` |
 | `format` | one GLib can use |
-| `wallpaper-command`, `locker` | a program, then any arguments |
+| `wallpaper-command`, `locker`, `spawn`, `on-resume` | a program, then any arguments |
 
 A text too long for its size is cut off at 8192 pixels.
 

@@ -6,17 +6,12 @@ use anyhow::{Context, ensure};
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
-/// Job mode that fails, rather than replacing a conflicting queued job.
-const MODE_FAIL: &str = "fail";
-
 #[proxy(
     interface = "org.freedesktop.systemd1.Manager",
     default_service = "org.freedesktop.systemd1",
     default_path = "/org/freedesktop/systemd1"
 )]
 pub trait SystemdManager {
-    /// Create the unit `name` from `properties` and start it; `aux` holds further units
-    /// to create alongside it.
     fn start_transient_unit(
         &self,
         name: &str,
@@ -49,8 +44,9 @@ impl SystemdManagerProxy<'_> {
             // Unload the unit once it stops, even if it failed, so its name is free again.
             ("CollectMode", Value::from("inactive-or-failed")),
         ];
+        // Job mode "fail": refuse a conflicting job rather than replace it.
         let started = self
-            .start_transient_unit(unit, MODE_FAIL, &properties, &[])
+            .start_transient_unit(unit, "fail", &properties, &[])
             .await;
         Ok(unless_error(started, "UnitExists")?)
     }

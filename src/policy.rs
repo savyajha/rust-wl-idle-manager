@@ -1,63 +1,47 @@
 use std::mem;
 
-use crate::config::{Action, Timeout};
+use crate::config::{Action, Argv, Timeout};
 
 /// Something that happened, from Wayland, logind or the authentication helper.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {
-    /// The timeout at this index became idle (ext-idle-notify `idled`).
+    /// ext-idle-notify's `idled` and `resumed`, for the timeout at this index.
     Idled(usize),
-    /// The timeout at this index is no longer idle (`resumed`).
     Resumed(usize),
     /// Whether a logind `idle` inhibitor is held (from `BlockInhibited`).
     Inhibited(bool),
-    /// Whether our logind session is active (the `Active` property; false on another VT).
+    /// logind's `Active`: false while another session is in the foreground.
     SessionActive(bool),
-    /// logind asked the session to lock (`Lock` signal, e.g. `loginctl lock-session`).
     LockRequested,
-    /// logind asked the session to unlock (`Unlock` signal).
     UnlockRequested,
-    /// Whether the session is locked: from the built-in lock screen (the compositor's
-    /// `locked`, or the lock ending), or else logind's `LockedHint`, which the compositor
-    /// sets once the locker has locked.
+    /// From the built-in lock screen (the compositor's `locked`, or the lock ending), or
+    /// else logind's `LockedHint`, which the compositor sets once the locker has locked.
     Locked(bool),
-    /// logind's `LidClosed`.
     LidClosed(bool),
     /// logind's `PrepareForSleep`: true before sleep, false after waking.
     PrepareForSleep(bool),
-    /// The wait for the lock before sleep timed out.
     LockWaitTimedOut,
-    /// A password was typed on the lock screen and Enter pressed.
-    PasswordEntered,
-    /// Whether the authentication helper accepted the password.
     Authenticated(bool),
 }
 
 /// What the I/O shell should do.
 #[derive(Debug, PartialEq)]
 pub enum Command {
-    /// Lock with the built-in lock screen (unless a lock is already requested), or start
-    /// the locker unit (refused by systemd if it already runs).
+    /// Lock with the built-in lock screen, unless a lock is under way, or start the locker.
     Lock,
     /// Unlock the built-in lock screen, or ask the locker unit to unlock, with SIGUSR1.
     Unlock,
-    /// Suspend through logind.
     Suspend,
-    /// Suspend, then hibernate, through logind.
     SuspendThenHibernate,
-    /// Hibernate through logind.
     Hibernate,
-    /// Run this argv.
-    Spawn(Vec<String>),
-    /// Check the lock screen's password with the authentication helper.
-    Authenticate,
+    Spawn(Argv),
     /// Start the timer that ends in `Input::LockWaitTimedOut` (about 4 s, chosen by the shell).
     WaitForLock,
     /// Let sleep go ahead, and stop waiting for the lock.
     ReleaseSleepInhibitor,
     /// Take a new sleep delay inhibitor, replacing any still held.
     TakeSleepInhibitor,
-    /// Re-create the idle notifications at these indices so their timers start again.
+    /// Re-create the idle notifications at these indices, so their timers start again.
     Rearm(Vec<usize>),
 }
 
@@ -76,7 +60,6 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// A policy for `timeouts`, indexed as in `Input::Idled` and `Input::Resumed`.
     pub fn new(timeouts: Vec<Timeout>) -> Self {
         Self {
             ran: vec![false; timeouts.len()],
@@ -90,21 +73,19 @@ impl Policy {
         }
     }
 
-    /// Update the state from `input` and return the commands to run, in order.
-    ///
-    /// The order matters in three places: `Lock` comes before `WaitForLock`,
-    /// `ReleaseSleepInhibitor` before `TakeSleepInhibitor`, and on-resume spawns before
-    /// `Rearm`.
+    /// Update the state from `input` and return the commands to run, in order. The order
+    /// matters in three places: `Lock` before `WaitForLock`, `ReleaseSleepInhibitor` before
+    /// `TakeSleepInhibitor`, and on-resume spawns before `Rearm`.
     pub fn handle(&mut self, input: Input) -> Vec<Command> {
         let command = match input {
             Input::Idled(i) => self.idled(i),
             Input::Resumed(i) => self.resume(i),
             Input::Inhibited(inhibited) => {
-                if !mem::replace(&mut self.inhibited, inhibited) || inhibited {
+                let was_inhibited = mem::replace(&mut self.inhibited, inhibited);
+                if inhibited || !was_inhibited {
                     return Vec::new();
                 }
-                // Restart the timers the inhibitor held back. Timeouts whose action ran
-                // keep their notifications, so their `resumed` still arrives.
+                // Restart the timers it held back; the others' `resumed` is still to come.
                 let held: Vec<_> = (0..self.ran.len())
                     .filter(|&i| !self.ran[i] && !self.timeouts[i].ignore_inhibit)
                     .collect();
@@ -119,7 +100,6 @@ impl Policy {
             // Unlocking when not locked does nothing. Only these two unlock.
             Input::UnlockRequested => Some(Command::Unlock),
             Input::Authenticated(ok) => ok.then_some(Command::Unlock),
-            Input::PasswordEntered => Some(Command::Authenticate),
             Input::Locked(locked) => {
                 self.locked = locked;
                 if locked { self.release() } else { None }
@@ -134,19 +114,16 @@ impl Policy {
             }
             Input::PrepareForSleep(true) if self.waiting_for_lock => None,
             Input::PrepareForSleep(true) if self.locked => Some(Command::ReleaseSleepInhibitor),
-            // A session in the background cannot show its lock promptly, so sleep does not
-            // wait for it.
+            // A session in the background cannot show its lock promptly.
             Input::PrepareForSleep(true) if !self.active => {
                 return vec![Command::Lock, Command::ReleaseSleepInhibitor];
             }
-            // A lock already under way is not started twice (systemd refuses a second locker);
-            // the wait still applies.
+            // A lock already under way is requested again, harmlessly; the wait still applies.
             Input::PrepareForSleep(true) => {
                 self.waiting_for_lock = true;
                 return vec![Command::Lock, Command::WaitForLock];
             }
-            // Restart every timer from the wake. The old notifications never send
-            // `resumed`, so pending on-resume spawns run first.
+            // The old notifications never send `resumed`, so pending on-resume spawns run first.
             Input::PrepareForSleep(false) => {
                 let mut commands = Vec::from_iter(self.release());
                 commands.push(Command::TakeSleepInhibitor);
@@ -160,7 +137,6 @@ impl Policy {
         command.into_iter().collect()
     }
 
-    /// Run timeout `i`'s action, unless the session is inactive or an inhibitor applies.
     fn idled(&mut self, i: usize) -> Option<Command> {
         if !self.active || (self.inhibited && !self.timeouts[i].ignore_inhibit) {
             return None;
@@ -183,12 +159,10 @@ impl Policy {
         self.timeouts[i].on_resume.clone().map(Command::Spawn)
     }
 
-    /// Lock, unless the session is already locked.
     fn lock(&self) -> Option<Command> {
         (!self.locked).then_some(Command::Lock)
     }
 
-    /// Stop waiting for the lock and let sleep go ahead, if we were waiting.
     fn release(&mut self) -> Option<Command> {
         mem::take(&mut self.waiting_for_lock).then_some(Command::ReleaseSleepInhibitor)
     }
@@ -201,8 +175,8 @@ mod tests {
     use super::*;
     use Command::*;
 
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+    fn argv(args: &[&str]) -> Argv {
+        Argv(args.iter().map(|s| s.to_string()).collect())
     }
 
     fn timeout(action: Action, on_resume: Option<&[&str]>, ignore_inhibit: bool) -> Timeout {
@@ -251,7 +225,12 @@ mod tests {
         assert_eq!(policy.handle(Input::Idled(0)), vec![]);
         assert_eq!(policy.handle(Input::Idled(1)), vec![Spawn(argv(&["off"]))]);
         assert_eq!(policy.handle(Input::Idled(2)), vec![]);
-        assert_eq!(policy.ran, [false, true, false]);
+        // Only timeout 1 ran: the others are held back, and its on-resume runs.
+        assert_eq!(
+            policy.handle(Input::Inhibited(false)),
+            vec![Rearm(vec![0, 2])]
+        );
+        assert_eq!(policy.handle(Input::Resumed(1)), vec![Spawn(argv(&["on"]))]);
     }
 
     #[test]
@@ -261,7 +240,7 @@ mod tests {
         for i in 0..3 {
             assert_eq!(policy.handle(Input::Idled(i)), vec![]);
         }
-        assert_eq!(policy.ran, [false; 3]);
+        assert_eq!(policy.handle(Input::Resumed(1)), vec![]);
         assert_eq!(policy.handle(Input::SessionActive(true)), vec![]);
         assert_eq!(policy.handle(Input::Idled(2)), vec![Suspend]);
     }
@@ -308,7 +287,6 @@ mod tests {
         assert_eq!(policy.handle(Input::Idled(2)), vec![]);
         // Monitors stay off: timeout 1 ran, so it is not re-created and its on-resume waits.
         assert_eq!(policy.handle(Input::Inhibited(false)), vec![Rearm(vec![2])]);
-        assert_eq!(policy.ran, [true, true, false]);
         assert_eq!(policy.handle(Input::Resumed(1)), vec![Spawn(argv(&["on"]))]);
     }
 
@@ -344,7 +322,6 @@ mod tests {
     fn only_a_right_password_unlocks() {
         let mut policy = policy();
         policy.handle(Input::Locked(true));
-        assert_eq!(policy.handle(Input::PasswordEntered), vec![Authenticate]);
         assert_eq!(policy.handle(Input::Authenticated(false)), vec![]);
         assert_eq!(policy.handle(Input::Authenticated(true)), vec![Unlock]);
     }
@@ -423,7 +400,8 @@ mod tests {
                 Rearm(vec![0, 1, 2])
             ]
         );
-        assert_eq!(policy.ran, [false; 3]);
+        // Each on-resume ran once.
+        assert_eq!(policy.handle(Input::Resumed(1)), vec![]);
         // Waiting stopped, so a late hint or timer releases nothing.
         assert_eq!(policy.handle(Input::Locked(true)), vec![]);
         assert_eq!(policy.handle(Input::LockWaitTimedOut), vec![]);

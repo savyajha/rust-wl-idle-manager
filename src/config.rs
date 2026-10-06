@@ -8,22 +8,23 @@ use knuffel::ast::{Literal, SpannedNode, TypeName};
 use knuffel::decode::{Context as DecodeContext, Kind};
 use knuffel::errors::DecodeError;
 use knuffel::span::Spanned;
-use knuffel::traits::ErrorSpan;
-use pango::glib::DateTime;
+use knuffel::traits::{DecodeChildren, ErrorSpan};
+use pango::glib::prelude::StaticType;
+use pango::glib::{DateTime, EnumClass};
+
+use crate::gtk::{self, Rgba};
 
 /// The longest timeout: ext-idle-notify takes milliseconds as a u32, about 49 days.
 const MAX_SECS: u64 = u32::MAX as u64 / 1000;
 
-/// The rust-wl-idle-manager config file.
 #[derive(knuffel::Decode, Debug, PartialEq)]
 pub struct Config {
     /// The locker; without one, the daemon locks with its built-in lock screen.
     #[knuffel(child)]
-    pub locker: Option<Command>,
-    /// The idle timeouts, in file order.
+    pub locker: Option<Argv>,
     #[knuffel(children(name = "timeout"))]
     pub timeouts: Vec<Timeout>,
-    /// The built-in lock screen's widgets; `DEFAULT_LOCK_SCREEN` if the block is absent.
+    /// The built-in lock screen's widgets, unless there is a `locker`.
     #[knuffel(child)]
     pub lock_screen: Option<LockScreen>,
 }
@@ -52,9 +53,7 @@ pub struct Number<const MIN: i32, const MAX: i32>(pub f64);
 pub type Size = Number<1, 1000>;
 /// A distance in logical pixels that may be negative.
 pub type Distance = Number<-10000, 10000>;
-/// An opacity or another fraction.
 pub type Fraction = Number<0, 1>;
-/// A factor, such as a brightness.
 pub type Factor = Number<0, 10>;
 
 /// One of nine points of the output a widget is placed at.
@@ -72,27 +71,12 @@ pub enum Anchor {
     BottomRight,
 }
 
-/// A font weight, as Pango names them.
-#[derive(knuffel::DecodeScalar, Clone, Copy, Debug, Default, PartialEq)]
-pub enum Weight {
-    Thin,
-    Ultralight,
-    Light,
-    Semilight,
-    Book,
-    #[default]
-    Normal,
-    Medium,
-    Semibold,
-    Bold,
-    Ultrabold,
-    Heavy,
-    Ultraheavy,
-}
+/// A font weight, by Pango's name for it, such as "semibold".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Weight(pub pango::Weight);
 
-/// Where a widget goes: at `anchor` (by default the centre), moved by `offset` (x, y) in
-/// logical pixels away from the edges it is anchored to (inwards), and right or down along
-/// a centred axis.
+/// Where a widget goes: at `anchor` (by default the centre), moved by `offset` in logical
+/// pixels away from the edges it is anchored to, and right or down along a centred axis.
 #[derive(knuffel::Decode, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Place {
     #[knuffel(child, unwrap(argument))]
@@ -115,8 +99,7 @@ pub struct Gradient(
     #[knuffel(argument)] pub Fraction,
 );
 
-/// A colour: a GTK colour name (defined in gtk.css) or `#rrggbb[aa]`, and an opacity it is
-/// multiplied by.
+/// A colour, and an opacity it is multiplied by.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub struct Colour {
     #[knuffel(argument, str)]
@@ -125,26 +108,31 @@ pub struct Colour {
     pub alpha: Fraction,
 }
 
-/// A colour's name: `#` and six or eight hex digits, or a GTK colour name (a letter or `_`,
-/// then letters, digits, `_` and `-`).
+/// `#` and six or eight hex digits, or a GTK colour name (a letter or `_`, then letters,
+/// digits, `_` and `-`), which gtk.css may define.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ColourName(pub String);
+pub enum ColourName {
+    Literal(Rgba),
+    Named(String),
+}
 
 /// A strftime-like format that GLib can use.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Format(pub String);
 
-/// A command: a program and its arguments.
-#[derive(knuffel::Decode, Clone, Debug, PartialEq)]
-pub struct Command {
+/// A program and its arguments; never empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Argv(pub Vec<String>);
+
+#[derive(knuffel::Decode)]
+struct RawArgv {
     #[knuffel(argument)]
     program: String,
     #[knuffel(arguments)]
     args: Vec<String>,
 }
 
-/// The lock screen's widgets; an absent one is not drawn, but the password field must be
-/// there, or nothing could unlock.
+/// The lock screen's widgets; only `password` is required, or nothing could unlock.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub struct LockScreen {
     #[knuffel(child)]
@@ -166,7 +154,7 @@ pub struct LockScreen {
 pub struct Background {
     /// A command that prints the wallpaper's path.
     #[knuffel(child)]
-    pub wallpaper_command: Option<Command>,
+    pub wallpaper_command: Option<Argv>,
     /// The blur's radius, in the wallpaper's pixels.
     #[knuffel(child, unwrap(argument), default = Number(24.0))]
     pub blur: Number<0, 500>,
@@ -187,9 +175,8 @@ pub struct Background {
 pub struct Style {
     #[knuffel(child, unwrap(argument))]
     pub size: Option<Size>,
-    #[knuffel(child, unwrap(argument))]
+    #[knuffel(child, unwrap(argument, str))]
     pub weight: Option<Weight>,
-    /// Added between characters.
     #[knuffel(child, unwrap(argument))]
     pub letter_spacing: Option<Number<-100, 100>>,
     #[knuffel(child)]
@@ -207,7 +194,6 @@ pub struct Text {
     pub format: Option<Format>,
 }
 
-/// The user's name.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub struct Name {
     #[knuffel(flatten(child))]
@@ -249,21 +235,25 @@ pub struct Password {
     pub error_color: Colour,
 }
 
-impl Command {
-    /// The program, then its arguments.
-    pub fn argv(&self) -> Vec<String> {
-        [&self.program]
-            .into_iter()
-            .chain(&self.args)
-            .cloned()
-            .collect()
+impl LockScreen {
+    pub fn colours(&self) -> impl Iterator<Item = &Colour> {
+        let texts = [&self.date, &self.clock].into_iter().flatten();
+        let styles = texts
+            .map(|text| &text.style)
+            .chain(self.name.as_ref().map(|name| &name.style));
+        let backgrounds = self.background.as_ref().map(|background| &background.color);
+        let avatars = self.avatar.as_ref().map(|avatar| &avatar.color);
+        styles
+            .filter_map(|style| style.color.as_ref())
+            .chain(backgrounds)
+            .chain(avatars)
+            .chain([&self.password.color, &self.password.error_color])
     }
 }
 
-/// `name` at full opacity.
 fn colour(name: &str) -> Colour {
     Colour {
-        name: ColourName(name.to_owned()),
+        name: name.parse().expect("a valid colour"),
         alpha: Number(1.0),
     }
 }
@@ -271,45 +261,40 @@ fn colour(name: &str) -> Colour {
 /// One `timeout` node: what to do after a period of idleness.
 #[derive(Debug, PartialEq)]
 pub struct Timeout {
-    /// How long the session must be idle.
     pub after: Duration,
-    /// What to do once it is.
     pub action: Action,
-    /// The argv to run when the session is no longer idle.
-    pub on_resume: Option<Vec<String>>,
-    /// Count only input, ignoring idle inhibitors.
+    /// What to run when the session is no longer idle.
+    pub on_resume: Option<Argv>,
     pub ignore_inhibit: bool,
 }
 
-/// The action of a timeout.
 #[derive(knuffel::Decode, Debug, PartialEq)]
 pub enum Action {
     Lock,
     Suspend,
     SuspendThenHibernate,
     Hibernate,
-    Spawn(#[knuffel(arguments)] Vec<String>),
+    Spawn(Argv),
 }
 
 /// A `timeout` node as knuffel decodes it, before the checks `Timeout` adds.
 #[derive(knuffel::Decode)]
 struct RawTimeout {
-    /// The delay in seconds, not yet range-checked.
     #[knuffel(argument)]
     secs: u64,
-    /// The `ignore-inhibit` flag node.
     #[knuffel(child)]
     ignore_inhibit: bool,
-    /// The `on-resume` argv, possibly empty.
-    #[knuffel(child, unwrap(arguments))]
-    on_resume: Option<Vec<String>>,
+    #[knuffel(child)]
+    on_resume: Option<Argv>,
     /// Every other child; exactly one is allowed.
     #[knuffel(children)]
     actions: Vec<Action>,
 }
 
+/// The config file's nodes: a `Config`, without a `lock-screen` if there is a `locker`.
+struct Document(Config);
+
 impl Config {
-    /// Read, parse and validate the KDL config at `path`.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
@@ -319,7 +304,7 @@ impl Config {
 
     /// Parse and validate KDL `text`; `name` labels it in errors.
     fn parse(name: &str, text: &str) -> anyhow::Result<Self> {
-        let mut config: Self = knuffel::parse(name, text).map_err(render)?;
+        let Document(mut config) = knuffel::parse(name, text).map_err(render)?;
         if config.locker.is_none() && config.lock_screen.is_none() {
             let default: Self = knuffel::parse("DEFAULT_LOCK_SCREEN", DEFAULT_LOCK_SCREEN)
                 .expect("the default lock screen parses");
@@ -340,15 +325,6 @@ impl<S: ErrorSpan> knuffel::Decode<S> for Timeout {
                 &node.arguments[0].literal,
                 format!("expected 1 to {MAX_SECS} seconds"),
             ));
-        }
-        for child in node.children() {
-            let name = &**child.node_name;
-            if matches!(name, "spawn" | "on-resume") && child.arguments.is_empty() {
-                ctx.emit_error(DecodeError::missing(
-                    child,
-                    format!("{name} needs a command"),
-                ));
-            }
         }
         let actions = node
             .children()
@@ -372,6 +348,36 @@ impl<S: ErrorSpan> knuffel::Decode<S> for Timeout {
             on_resume: raw.on_resume,
             ignore_inhibit: raw.ignore_inhibit,
         })
+    }
+}
+
+impl<S: ErrorSpan> DecodeChildren<S> for Document {
+    fn decode_children(
+        nodes: &[SpannedNode<S>],
+        ctx: &mut DecodeContext<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let config = Config::decode_children(nodes, ctx)?;
+        let lock_screen = nodes.iter().find(|node| &**node.node_name == "lock-screen");
+        if config.locker.is_some()
+            && let Some(node) = lock_screen
+        {
+            ctx.emit_error(DecodeError::unexpected(
+                node,
+                "node",
+                "lock-screen has no effect with locker",
+            ));
+        }
+        Ok(Self(config))
+    }
+}
+
+impl<S: ErrorSpan> knuffel::Decode<S> for Argv {
+    fn decode_node(
+        node: &SpannedNode<S>,
+        ctx: &mut DecodeContext<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let RawArgv { program, args } = RawArgv::decode_node(node, ctx)?;
+        Ok(Self([program].into_iter().chain(args).collect()))
     }
 }
 
@@ -402,14 +408,29 @@ impl FromStr for ColourName {
     type Err = &'static str;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
-        let hex = |digits: &str| {
-            matches!(digits.len(), 6 | 8) && digits.bytes().all(|b| b.is_ascii_hexdigit())
-        };
-        let gtk = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        let named = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
             && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b));
-        match name.strip_prefix('#').map_or(gtk, hex) {
-            true => Ok(Self(name.to_owned())),
-            false => Err("expected #rrggbb, #rrggbbaa or a GTK colour name"),
+        if let Some(rgba) = gtk::hex(name) {
+            Ok(Self::Literal(rgba))
+        } else if named {
+            Ok(Self::Named(name.to_owned()))
+        } else {
+            Err("expected #rrggbb, #rrggbbaa or a GTK colour name")
+        }
+    }
+}
+
+impl FromStr for Weight {
+    type Err = &'static str;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let weights = EnumClass::with_type(pango::Weight::static_type()).expect("an enum");
+        let value = weights
+            .value_by_nick(name)
+            .map(|value| value.to_value(&weights));
+        match value.map(|value| value.get::<pango::Weight>()) {
+            Some(Ok(weight)) => Ok(Self(weight)),
+            _ => Err("expected a weight such as normal, semibold or bold"),
         }
     }
 }
@@ -463,10 +484,7 @@ mod tests {
         assert_eq!(
             config,
             Config {
-                locker: Some(Command {
-                    program: "hyprlock-wallpaper".into(),
-                    args: Vec::new(),
-                }),
+                locker: Some(Argv(argv(&["hyprlock-wallpaper"]))),
                 timeouts: vec![
                     Timeout {
                         after: Duration::from_secs(300),
@@ -476,8 +494,8 @@ mod tests {
                     },
                     Timeout {
                         after: Duration::from_secs(600),
-                        action: Action::Spawn(power("power-off-monitors")),
-                        on_resume: Some(power("power-on-monitors")),
+                        action: Action::Spawn(Argv(power("power-off-monitors"))),
+                        on_resume: Some(Argv(power("power-on-monitors"))),
                         ignore_inhibit: true,
                     },
                     Timeout {
@@ -493,19 +511,14 @@ mod tests {
     }
 
     #[test]
-    fn locker_is_optional() {
-        let config = Config::parse("test.kdl", "timeout 5 { lock; }\n").unwrap();
-        assert_eq!(config.locker, None);
-    }
-
-    #[test]
     fn without_a_lock_screen_block_the_default_is_used() {
         let config = Config::parse("test.kdl", "timeout 5 { lock; }\n").unwrap();
+        assert_eq!(config.locker, None);
         let lock_screen = config.lock_screen.unwrap();
         assert_eq!(lock_screen.password.place.anchor, Some(Anchor::Bottom));
         assert_eq!(
             lock_screen.clock.unwrap().style.weight,
-            Some(Weight::Semibold)
+            Some(Weight(pango::Weight::Semibold))
         );
     }
 
@@ -524,8 +537,8 @@ mod tests {
             .unwrap();
         let background = lock_screen.background.unwrap();
         assert_eq!(
-            background.wallpaper_command.unwrap().argv(),
-            argv(&["cat", "/x"])
+            background.wallpaper_command,
+            Some(Argv(argv(&["cat", "/x"])))
         );
         assert_eq!(
             (background.blur, background.brightness),
@@ -534,10 +547,10 @@ mod tests {
         let name = lock_screen.name.unwrap();
         assert_eq!(
             (name.style.weight, name.style.size),
-            (Some(Weight::Bold), None)
+            (Some(Weight(pango::Weight::Bold)), None)
         );
         let colour = Colour {
-            name: ColourName("accent_color".into()),
+            name: ColourName::Named("accent_color".into()),
             alpha: Number(0.5),
         };
         assert_eq!(name.style.color, Some(colour));
@@ -545,6 +558,41 @@ mod tests {
         assert_eq!(place.anchor, Some(Anchor::TopLeft));
         assert_eq!(place.offset, Some(Offset(Number(10.0), Number(-2.5))));
         assert_eq!(lock_screen.clock, None);
+        let white = ColourName::Literal([1.0; 4]);
+        assert_eq!(lock_screen.password.color.name, white);
+    }
+
+    #[test]
+    fn every_pango_weight_name_parses() {
+        let names = [
+            "thin",
+            "ultralight",
+            "light",
+            "semilight",
+            "book",
+            "normal",
+            "medium",
+            "semibold",
+            "bold",
+            "ultrabold",
+            "heavy",
+            "ultraheavy",
+        ];
+        for name in names {
+            assert!(name.parse::<Weight>().is_ok(), "{name}");
+        }
+        assert_eq!("bold".parse(), Ok(Weight(pango::Weight::Bold)));
+        assert!("boldest".parse::<Weight>().is_err());
+    }
+
+    #[test]
+    fn a_lock_screen_with_a_locker_is_rejected_where_it_is() {
+        let err = parse_err("locker \"x\"\nlock-screen { password; }\n");
+        assert!(
+            err.contains("lock-screen has no effect with locker"),
+            "{err}"
+        );
+        assert!(err.contains("at line 2, columns 1"), "{err}");
     }
 
     #[test]
@@ -571,6 +619,10 @@ mod tests {
                 "expected -100 to 100",
             ),
             ("password; date { weight 600; }", "expected string"),
+            (
+                "password; date { weight \"heavyish\"; }",
+                "expected a weight such as normal",
+            ),
             (
                 "password; date { color \"#fff\"; }",
                 "expected #rrggbb, #rrggbbaa or a GTK colour name",
@@ -663,11 +715,11 @@ mod tests {
             ("locker\n", "additional argument `program` is required"),
             (
                 "locker \"x\"\ntimeout 5 { spawn; }\n",
-                "spawn needs a command",
+                "additional argument `program` is required",
             ),
             (
                 "locker \"x\"\ntimeout 5 { lock; on-resume; }\n",
-                "on-resume needs a command",
+                "additional argument `program` is required",
             ),
         ] {
             let err = parse_err(text);

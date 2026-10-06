@@ -222,7 +222,7 @@ pkgs.testers.runNixOSTest {
     def latencies(since):
         """The (drawn, locked) latencies in ms that the lock after `since` logged."""
         text = journal(since)
-        ms = lambda what: float(re.findall(rf"{what} ([0-9.]+) ms after the request", text)[0])
+        ms = lambda what: float(re.findall(rf"{what}[^0-9]* ([0-9.]+) ms after the request", text)[0])
         return ms("lock screen drawn"), ms("locked")
 
     def main_pid(unit="idle-manager.service"):

@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod draw;
+mod entry;
 mod gtk;
 mod logind;
 mod password;
@@ -27,22 +28,21 @@ use tracing::{error, info};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::Connection;
 
-use config::{Background, Config};
+use config::{Argv, Background, Config};
+use entry::Entry;
 use logind::{LogindManagerProxy, idle_inhibited};
 use policy::{Command, Input, Policy};
 use systemd::SystemdManagerProxy;
-use wayland::Wayland;
+use wallpaper::Blurred;
+use wayland::{Next, Wayland};
 
-/// The transient user unit the locker runs as.
 const LOCKER_UNIT: &str = "rust-wl-locker.service";
 
 /// How long sleep waits for the lock: under logind's default `InhibitDelayMaxSec` of 5 s.
 const LOCK_WAIT: Duration = Duration::from_secs(4);
 
-/// The error when a system bus stream ends.
 const BUS_LOST: &str = "lost the system bus";
 
-/// What the command line asks for.
 #[derive(Debug, PartialEq)]
 enum Mode {
     /// `--config <path>`: run the daemon.
@@ -77,10 +77,23 @@ fn init_logging() {
         .init();
 }
 
-/// Log `input` in words; `session` is our session's ID.
-fn log_input(input: Input, session: &str, timeouts: &[(Duration, bool)]) {
+/// Mark every fd above stderr close-on-exec in `command`'s child as it executes. An fd the
+/// daemon has just received over D-Bus (the sleep inhibitor's) lacks close-on-exec until
+/// zbus drops the message it came in (DESIGN.md has the details).
+pub fn cloexec_above_stderr(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    // SAFETY: close_range is a system call, safe between fork and exec. It keeps the pipe std
+    // reports a failed exec on; a failure (before Linux 5.11, or seccomp) is ignored.
+    unsafe {
+        command.pre_exec(|| {
+            libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as i32);
+            Ok(())
+        })
+    }
+}
+
+fn log_input(input: Input, session: &str, delays: &[Duration]) {
     match input {
-        Input::Idled(i) => info!("idle after {} s (timeout {i})", timeouts[i].0.as_secs()),
+        Input::Idled(i) => info!("idle after {} s (timeout {i})", delays[i].as_secs()),
         Input::Resumed(i) => info!("resumed (timeout {i})"),
         Input::Inhibited(true) => info!("logind idle inhibitor held"),
         Input::Inhibited(false) => info!("no logind idle inhibitor"),
@@ -95,7 +108,6 @@ fn log_input(input: Input, session: &str, timeouts: &[(Duration, bool)]) {
         Input::PrepareForSleep(true) => info!("preparing for sleep"),
         Input::PrepareForSleep(false) => info!("back from sleep"),
         Input::LockWaitTimedOut => info!("lock wait timed out; releasing the sleep inhibitor"),
-        Input::PasswordEntered => info!("checking the password"),
         Input::Authenticated(true) => info!("password accepted"),
         Input::Authenticated(false) => info!("password rejected"),
     }
@@ -105,27 +117,24 @@ fn log_input(input: Input, session: &str, timeouts: &[(Duration, bool)]) {
 struct Runner {
     systemd: SystemdManagerProxy<'static>,
     logind: LogindManagerProxy<'static>,
-    /// The locker command; without one, the built-in lock screen locks.
-    locker: Option<Vec<String>>,
+    /// Without one, the built-in lock screen locks.
+    locker: Option<Argv>,
     /// How many commands have been spawned, for unique unit names.
     spawned: u64,
     /// The sleep delay inhibitor; dropping it releases it.
     inhibitor: Option<OwnedFd>,
-    /// When the wait for the lock before sleep runs out, while waiting.
     lock_wait: Option<Instant>,
-    /// The password check under way.
     attempt: Option<auth::Attempt>,
 }
 
 impl Runner {
-    /// Run one policy command.
     async fn execute(&mut self, command: Command, wayland: &mut Wayland) -> anyhow::Result<()> {
         match command {
             Command::Lock if let Some(locker) = &self.locker => {
                 info!("starting the locker");
                 let started = self
                     .systemd
-                    .start_service(LOCKER_UNIT, "rust-wl-idle-manager: locker", locker)
+                    .start_service(LOCKER_UNIT, "rust-wl-idle-manager: locker", &locker.0)
                     .await
                     .context("starting the locker")?;
                 if !started {
@@ -137,8 +146,7 @@ impl Runner {
                 wayland.lock()?;
                 info!("lock requested from the compositor");
             }
-            // Never a stop: a session-lock client that dies without unlocking leaves the
-            // session locked.
+            // Never a stop: a lock client that dies without unlocking leaves the session locked.
             Command::Unlock if self.locker.is_some() => {
                 info!("unlocking the locker");
                 let usr1 = SignalKind::user_defined1().as_raw_value();
@@ -155,7 +163,7 @@ impl Runner {
                 info!("unlocking the lock screen");
                 wayland.unlock();
             }
-            Command::Spawn(argv) => {
+            Command::Spawn(Argv(argv)) => {
                 let line = argv.join(" ");
                 info!("spawning {line}");
                 let unit = format!(
@@ -172,25 +180,6 @@ impl Runner {
                     .with_context(|| format!("spawning {line}"))?;
                 if !started {
                     error!("spawn unit {unit} already exists; not running {line}");
-                }
-            }
-            // A new attempt replaces (and kills) any left from a lock that has ended.
-            Command::Authenticate => {
-                let entry = wayland.entry_mut();
-                // Dropping the submission wipes the password, on every path.
-                let password = entry.submission();
-                // Nothing is submitted any more after a reset, such as an unlock.
-                if password.bytes().is_empty() {
-                    return Ok(());
-                }
-                let started = auth::start(password.bytes()).await;
-                drop(password);
-                match started {
-                    Ok(attempt) => self.attempt = Some(attempt),
-                    Err(e) => {
-                        entry.checked(false, std::time::Instant::now());
-                        return Err(e).context("starting the authentication helper");
-                    }
                 }
             }
             Command::Suspend => {
@@ -212,11 +201,10 @@ impl Runner {
                 info!("waiting up to {} s for the lock", LOCK_WAIT.as_secs());
                 self.lock_wait = Some(Instant::now() + LOCK_WAIT);
             }
-            // Clearing the deadline matters: tokio's clock stops during sleep, so a timer
-            // left over would release the next sleep's inhibitor early. A password typed
-            // on the lock screen is wiped before sleep, which may end in hibernation.
             Command::ReleaseSleepInhibitor => {
+                // Sleep may end in hibernation, which saves memory to disk.
                 wayland.entry_mut().wipe();
+                // tokio's clock stops in sleep; a timer left over would release the next early.
                 self.lock_wait = None;
                 if self.inhibitor.take().is_some() {
                     info!("sleep inhibitor released");
@@ -234,16 +222,36 @@ impl Runner {
         }
         Ok(())
     }
+
+    /// Check the submitted password, replacing (and killing) any check left from a past lock.
+    async fn authenticate(&mut self, entry: &mut Entry) -> anyhow::Result<()> {
+        // Dropping the submission wipes the password, on every path.
+        let password = entry.submission();
+        // Nothing is submitted any more after a reset, such as an unlock.
+        if password.bytes().is_empty() {
+            return Ok(());
+        }
+        info!("checking the password");
+        let started = auth::start(password.bytes()).await;
+        drop(password);
+        match started {
+            Ok(attempt) => self.attempt = Some(attempt),
+            Err(e) => {
+                entry.checked(false, Instant::now());
+                return Err(e).context("starting the authentication helper");
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Start loading the wallpaper `background` names, if it names one.
-fn load_wallpaper(
-    background: &Option<Background>,
-) -> Option<JoinHandle<anyhow::Result<wallpaper::Blurred>>> {
-    let background = background
-        .clone()
-        .filter(|b| b.wallpaper_command.is_some())?;
-    Some(tokio::spawn(wallpaper::load(background)))
+fn load_wallpaper(background: &Background) -> Option<JoinHandle<anyhow::Result<Blurred>>> {
+    let command = background.wallpaper_command.clone()?;
+    let blur = background.blur.0;
+    let (brightness, saturation) = (background.brightness.0, background.saturation.0);
+    Some(tokio::spawn(wallpaper::load(
+        command, blur, brightness, saturation,
+    )))
 }
 
 /// Load the config, then run the commands that idle and logind events lead to until
@@ -280,25 +288,24 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         .active()
         .await
         .context("reading the session's properties")?;
-    let timeouts: Vec<_> = config
-        .timeouts
-        .iter()
-        .map(|timeout| (timeout.after, timeout.ignore_inhibit))
-        .collect();
-    let lock_screen = config.locker.is_none();
-    let look = config.lock_screen.filter(|_| lock_screen);
-    let background = look.as_ref().and_then(|look| look.background.clone());
-    let mut wayland = Wayland::connect(&timeouts, look)?;
+    let delays: Vec<_> = config.timeouts.iter().map(|t| t.after).collect();
+    let lock_screen = config.lock_screen.is_some();
+    let background = config
+        .lock_screen
+        .as_ref()
+        .and_then(|look| look.background.clone());
+    let mut wayland = Wayland::connect(&config.timeouts, config.lock_screen)?;
     let inhibitor = logind.sleep_inhibitor().await?;
-    // Only now: until its reply is dropped, zbus holds the inhibitor's fd without
-    // close-on-exec, and a command started meanwhile would inherit it.
-    let mut wallpaper = load_wallpaper(&background);
+    // After the inhibitor is taken: see `cloexec_above_stderr`.
+    let load = || background.as_ref().and_then(load_wallpaper);
+    let mut loading = load();
     // A SIGHUP while the wallpaper loads: load it again once it has.
     let mut reload = false;
+    let mut idle_inhibitor = None;
     let mut runner = Runner {
         systemd,
         logind,
-        locker: config.locker.as_ref().map(config::Command::argv),
+        locker: config.locker,
         spawned: 0,
         inhibitor: Some(inhibitor),
         lock_wait: None,
@@ -306,11 +313,10 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     };
     info!(
         "watching {} timeouts from {} in session {session_id}",
-        timeouts.len(),
+        delays.len(),
         config_path.display()
     );
-    // A previous run that died while locked left the session locked; the compositor lets
-    // a new lock replace the dead one.
+    // A run that died while locked left the session locked; a new lock replaces the dead one.
     if lock_screen && logind_session.locked_hint().await? {
         info!("session {session_id} is still locked; locking again");
         wayland.lock()?;
@@ -321,22 +327,32 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             // Wayland first: after an unlock, its `Locked(false)` is already queued, and
             // must reach the policy before a lock request that would otherwise be dropped.
             biased;
-            wayland_input = wayland.next() => wayland_input?,
+            next = wayland.next() => match next? {
+                Next::Input(input) => input,
+                Next::Password => {
+                    if let Err(e) = runner.authenticate(wayland.entry_mut()).await {
+                        error!("{e:#}");
+                    }
+                    continue;
+                }
+            },
             sleep = sleeps.next() => Input::PrepareForSleep(sleep.context(BUS_LOST)?.args()?.start),
             lock = locks.next() => lock.map(|_| Input::LockRequested).context(BUS_LOST)?,
             unlock = unlocks.next() => unlock.map(|_| Input::UnlockRequested).context(BUS_LOST)?,
-            // Property values come from zbus's cache, which every PropertiesChanged updates.
+            // logind announces BlockInhibited when any block inhibitor comes or goes.
             new = block_inhibited.next() => {
-                Input::Inhibited(idle_inhibited(&new.context(BUS_LOST)?.get().await?))
+                let held = idle_inhibited(&new.context(BUS_LOST)?.get().await?);
+                if idle_inhibitor.replace(held) == Some(held) {
+                    continue;
+                }
+                Input::Inhibited(held)
             }
             new = active.next() => Input::SessionActive(new.context(BUS_LOST)?.get().await?),
             // With the built-in lock screen, the compositor's `locked` says it instead.
             new = locked_hint.next(), if !lock_screen => {
                 Input::Locked(new.context(BUS_LOST)?.get().await?)
             }
-            // Like logind, which ignores the lid while docked (HandleLidSwitchDocked).
-            // A failed read counts as not docked: exiting now could let the machine
-            // sleep unlocked, since logind may be about to suspend.
+            // A failed read of Docked locks, since logind may be about to suspend.
             new = lid_closed.next() => {
                 let closed = new.context(BUS_LOST)?.get().await?;
                 let docked = closed
@@ -348,7 +364,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             }
             ok = auth::finished(&mut runner.attempt) => {
                 // An answer for a lock that has ended since is dropped.
-                if !wayland.entry_mut().checked(ok, std::time::Instant::now()) {
+                if !wayland.entry_mut().checked(ok, Instant::now()) {
                     continue;
                 }
                 Input::Authenticated(ok)
@@ -359,29 +375,30 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                 runner.lock_wait = None;
                 Input::LockWaitTimedOut
             }
-            loaded = async { wallpaper.as_mut().expect("checked").await }, if wallpaper.is_some() => {
+            loaded = async { loading.as_mut().expect("checked").await }, if loading.is_some() => {
                 let blurred = loaded.context("loading the wallpaper")?.inspect_err(|e| {
                     error!("{e:#}; keeping the background as it was");
                 });
-                wayland.set_wallpaper(blurred.ok());
-                wallpaper = mem::take(&mut reload).then(|| load_wallpaper(&background)).flatten();
+                wayland.reload(blurred.ok());
+                loading = if mem::take(&mut reload) { load() } else { None };
                 continue;
             }
             _ = sighup.recv() => {
                 info!("SIGHUP: reloading the wallpaper and GTK's colours");
-                reload = wallpaper.is_some();
-                if !reload {
-                    wallpaper = load_wallpaper(&background);
-                }
-                // Without a wallpaper command, the colours are read again now.
-                if background.as_ref().is_none_or(|b| b.wallpaper_command.is_none()) {
-                    wayland.set_wallpaper(None);
+                if loading.is_some() {
+                    reload = true;
+                } else {
+                    loading = load();
+                    // Without a wallpaper to wait for, the colours are read again now.
+                    if loading.is_none() {
+                        wayland.reload(None);
+                    }
                 }
                 continue;
             }
             _ = sigterm.recv() => return Ok(()),
         };
-        log_input(input, &session_id, &timeouts);
+        log_input(input, &session_id, &delays);
         for command in policy.handle(input) {
             if let Err(e) = runner.execute(command, &mut wayland).await {
                 error!("{e:#}");
@@ -391,8 +408,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
-    // No core dumps, and no ptrace or /proc/PID/mem by other processes of the user: the
-    // daemon holds the typed password, the helper a copy. Both take this path.
+    // No core dumps, ptrace or /proc/PID/mem by the user's other processes: the daemon holds
+    // the typed password, the helper a copy.
     // SAFETY: PR_SET_DUMPABLE takes only integer arguments.
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
         eprintln!("prctl(PR_SET_DUMPABLE, 0): {}", io::Error::last_os_error());
@@ -410,7 +427,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the daemon until SIGTERM or an error.
 #[tokio::main(flavor = "current_thread")]
 async fn daemon(config_path: &Path) -> ExitCode {
     match run(config_path).await {
