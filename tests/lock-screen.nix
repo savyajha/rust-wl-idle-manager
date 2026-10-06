@@ -129,6 +129,12 @@ pkgs.testers.runNixOSTest {
     systemd.user.services.idle-manager-second = mkIdleManager;
 
     virtualisation.memorySize = 1024;
+    # QEMU's guest has no working S3 (virtio-pci refuses it), so suspend fails at once.
+    # Only "deep": systemd would otherwise fall back to s2idle, which can freeze the guest.
+    systemd.sleep.settings.Sleep = {
+      SuspendState = "mem";
+      MemorySleepMode = "deep";
+    };
   };
 
   testScript = ''
@@ -409,6 +415,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("sleep waits until the lock screen has locked"):
         since = cursor()
+        machine.log("/sys/power: " + machine.succeed("cat /sys/power/state /sys/power/mem_sleep").replace("\n", "; "))
         machine.succeed("systemctl suspend")
         wait_for_log(since, "preparing for sleep")
         wait_for_log(since, "sleep inhibitor released")

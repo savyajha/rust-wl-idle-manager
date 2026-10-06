@@ -128,6 +128,12 @@ pkgs.testers.runNixOSTest {
     systemd.user.services.idle-manager-bad = mkIdleManager badConfig;
 
     virtualisation.memorySize = 1024;
+    # QEMU's guest has no working S3 (virtio-pci refuses it), so suspend fails at once.
+    # Only "deep": systemd would otherwise fall back to s2idle, which can freeze the guest.
+    systemd.sleep.settings.Sleep = {
+      SuspendState = "mem";
+      MemorySleepMode = "deep";
+    };
   };
 
   testScript = ''
@@ -192,6 +198,7 @@ pkgs.testers.runNixOSTest {
     def suspend():
         """Ask logind to suspend; the suspend fails in this VM, after the full handshake."""
         since = cursor()
+        machine.log("/sys/power: " + machine.succeed("cat /sys/power/state /sys/power/mem_sleep").replace("\n", "; "))
         machine.succeed("systemctl suspend")
         return since
 
@@ -211,6 +218,11 @@ pkgs.testers.runNixOSTest {
         since = cursor()
         uctl("systemctl --user start idle-manager.service")
         t0 = wait_for_log(since, f"watching 3 timeouts from ${config} in session {session}")
+        pid = uctl("systemctl --user show -p MainPID --value idle-manager.service").strip()
+        status = machine.succeed(f"cat /proc/{pid}/status").splitlines()
+        fields = ("VmRSS", "RssAnon", "RssFile", "RssShmem")
+        memory = [" ".join(line.split()) for line in status if line.split(":")[0] in fields]
+        machine.log("memory idle with a locker: " + "; ".join(memory))
         t = [
             wait_for_log(since, f"idle after {secs} s (timeout {i})")
             for i, secs in enumerate([3, 6, 9])

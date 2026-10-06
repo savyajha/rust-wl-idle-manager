@@ -7,8 +7,7 @@ use tracing::warn;
 /// The most bytes of UTF-8 a password can have; typing past it is ignored.
 pub const CAPACITY: usize = 1024;
 
-/// Overwrite `bytes` with zeros, with volatile writes the compiler cannot remove as dead
-/// stores (as the zeroize crate does).
+/// Zero `bytes` with volatile writes, which the compiler cannot remove as dead stores.
 pub fn wipe(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
         // SAFETY: `byte` is a valid, aligned, exclusive reference.
@@ -29,8 +28,6 @@ pub struct Password {
 }
 
 impl Password {
-    /// Allocate the buffer and lock it in memory; a refusal (such as `RLIMIT_MEMLOCK`) is
-    /// logged, and the buffer is used anyway.
     pub fn new() -> Self {
         let page = Box::new(Page([0; CAPACITY]));
         // SAFETY: the range is the buffer's own memory, which lives as long as `page`.
@@ -49,7 +46,6 @@ impl Password {
         self.bytes().iter().filter(|&&b| starts_char(b)).count()
     }
 
-    /// Add `c`, encoded straight into the buffer, unless it does not fit.
     pub fn push(&mut self, c: char) {
         let end = self.len + c.len_utf8();
         if end <= CAPACITY {
@@ -58,7 +54,6 @@ impl Password {
         }
     }
 
-    /// Remove the last character, wiping its bytes.
     pub fn pop(&mut self) {
         if let Some(start) = self.last_start() {
             wipe(&mut self.page.0[start..self.len]);
@@ -66,7 +61,6 @@ impl Password {
         }
     }
 
-    /// The last character, decoded in place.
     pub fn last(&self) -> Option<char> {
         let start = self.last_start()?;
         str::from_utf8(&self.page.0[start..self.len])

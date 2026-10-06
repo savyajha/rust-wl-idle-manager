@@ -69,7 +69,7 @@ pub struct Repeat {
 }
 
 struct Held {
-    /// The key's code, to match its release.
+    /// The key's code, which its release matches.
     code: u32,
     repeats: Repeats,
     next: Instant,
@@ -82,19 +82,18 @@ enum Repeats {
     LastChar,
 }
 
-/// The password being typed, and what the keys do to it. No I/O apart from one log line
-/// when a cooldown starts; the time is passed in.
+/// The password being typed and what keys do to it; no I/O but a log line, and the time
+/// is passed in.
 pub struct Entry {
     password: Password,
-    /// The password was submitted, and the helper has not answered yet.
     checking: bool,
     /// How many characters were submitted (only their number: the password is wiped).
     submitted: usize,
     failed_until: Option<Instant>,
-    /// Failed attempts in a row, and until when keys are ignored after too many.
+    /// Failed attempts in a row.
     failures: u32,
+    /// Keys are ignored until then, after too many failures.
     cooldown_until: Option<Instant>,
-    /// When the password is wiped if nothing more is typed.
     forget_at: Option<Instant>,
     held: Option<Held>,
     repeat: Option<Repeat>,
@@ -156,18 +155,15 @@ impl Entry {
         }
     }
 
-    /// Stop repeating: the keyboard left the lock screen, and the release may go elsewhere.
     pub fn stop_repeat(&mut self) {
         self.held = None;
     }
 
-    /// A key already held stops repeating.
     pub fn set_repeat(&mut self, repeat: Option<Repeat>) {
         self.repeat = repeat;
         self.held = None;
     }
 
-    /// Delete or type one character, and restart the countdown to forgetting it all.
     fn edit(&mut self, key: Key, now: Instant) {
         match key {
             Key::Backspace => self.password.pop(),
@@ -177,15 +173,13 @@ impl Entry {
         self.forget_at = (!self.password.bytes().is_empty()).then(|| now + FORGET_AFTER);
     }
 
-    /// The password submitted for checking (empty if none is); it is wiped when the
-    /// returned guard is dropped, on every path.
+    /// The submitted password (empty if none is), wiped when the guard is dropped.
     pub fn submission(&mut self) -> Submission<'_> {
         Submission(self)
     }
 
-    /// The helper answered: show a failure, unless `ok`, or start a cooldown after every
-    /// `COOLDOWN_AFTER` failures in a row. Returns false, ignoring the answer, if no check
-    /// was under way (the lock ended since).
+    /// The helper answered: show a failure unless `ok`, or start a cooldown. Returns false,
+    /// ignoring the answer, if no check was under way (the lock ended since).
     pub fn checked(&mut self, ok: bool, now: Instant) -> bool {
         if !self.checking {
             return false;
@@ -224,13 +218,11 @@ impl Entry {
         self.cooldown_until = None;
     }
 
-    /// The whole seconds the cooldown has left at `now`, rounded up, if there is one.
     fn cooldown_seconds(&self, now: Instant) -> Option<u64> {
         let left = self.cooldown_until?.saturating_duration_since(now);
         Some(left.as_secs() + u64::from(left.subsec_nanos() > 0))
     }
 
-    /// When `tick` next has something to do, as of `now`.
     pub fn deadline(&self, now: Instant) -> Option<Instant> {
         let held = self.held.as_ref().map(|held| held.next);
         // The countdown's next whole second, the last of which ends the cooldown.
@@ -243,7 +235,6 @@ impl Entry {
             .min()
     }
 
-    /// Do what is due at `now`: repeat a key, end a failure or cooldown, forget the password.
     pub fn tick(&mut self, now: Instant) {
         if let (Some(held), Some(repeat)) = (&mut self.held, self.repeat)
             && held.next <= now
@@ -293,11 +284,9 @@ impl Entry {
     }
 }
 
-/// The password submitted for checking, wiped when this is dropped.
 pub struct Submission<'a>(&'a mut Entry);
 
 impl Submission<'_> {
-    /// The password, or nothing if none was submitted (such as after a reset).
     pub fn bytes(&self) -> &[u8] {
         if self.0.checking {
             self.0.password.bytes()

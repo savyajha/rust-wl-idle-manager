@@ -20,7 +20,6 @@ pub trait SystemdManager {
         aux: &[(&str, &[(&str, Value<'_>)])],
     ) -> zbus::Result<OwnedObjectPath>;
 
-    /// Send `signal` to the processes of unit `name` that `whom` selects ("main", "all", ...).
     fn kill_unit(&self, name: &str, whom: &str, signal: i32) -> zbus::Result<()>;
 }
 
@@ -83,7 +82,6 @@ fn find_program(program: &str, path: &str) -> anyhow::Result<String> {
         "{program}: a program path must be absolute or a bare name"
     );
     path.split(':')
-        // systemd needs an absolute path, so skip empty and relative entries.
         .filter(|dir| dir.starts_with('/'))
         .map(|dir| format!("{dir}/{program}"))
         .find(|file| {

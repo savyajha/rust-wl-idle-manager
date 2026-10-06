@@ -2,15 +2,12 @@ use std::mem;
 
 use crate::config::{Action, Argv, Timeout};
 
-/// Something that happened, from Wayland, logind or the authentication helper.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {
     /// ext-idle-notify's `idled` and `resumed`, for the timeout at this index.
     Idled(usize),
     Resumed(usize),
-    /// Whether a logind `idle` inhibitor is held (from `BlockInhibited`).
     Inhibited(bool),
-    /// logind's `Active`: false while another session is in the foreground.
     SessionActive(bool),
     LockRequested,
     UnlockRequested,
@@ -18,13 +15,11 @@ pub enum Input {
     /// else logind's `LockedHint`, which the compositor sets once the locker has locked.
     Locked(bool),
     LidClosed(bool),
-    /// logind's `PrepareForSleep`: true before sleep, false after waking.
     PrepareForSleep(bool),
     LockWaitTimedOut,
     Authenticated(bool),
 }
 
-/// What the I/O shell should do.
 #[derive(Debug, PartialEq)]
 pub enum Command {
     /// Lock with the built-in lock screen, unless a lock is under way, or start the locker.
@@ -37,11 +32,8 @@ pub enum Command {
     Spawn(Argv),
     /// Start the timer that ends in `Input::LockWaitTimedOut` (about 4 s, chosen by the shell).
     WaitForLock,
-    /// Let sleep go ahead, and stop waiting for the lock.
     ReleaseSleepInhibitor,
-    /// Take a new sleep delay inhibitor, replacing any still held.
     TakeSleepInhibitor,
-    /// Re-create the idle notifications at these indices, so their timers start again.
     Rearm(Vec<usize>),
 }
 
@@ -151,7 +143,6 @@ impl Policy {
         }
     }
 
-    /// Clear `ran[i]`; if the action had run, return the timeout's on-resume spawn, if any.
     fn resume(&mut self, i: usize) -> Option<Command> {
         if !mem::take(&mut self.ran[i]) {
             return None;

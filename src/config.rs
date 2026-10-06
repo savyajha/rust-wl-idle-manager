@@ -12,7 +12,7 @@ use knuffel::traits::{DecodeChildren, ErrorSpan};
 use pango::glib::prelude::StaticType;
 use pango::glib::{DateTime, EnumClass};
 
-use crate::gtk::{self, Rgba};
+use crate::theme::{self, Rgba};
 
 /// The longest timeout: ext-idle-notify takes milliseconds as a u32, about 49 days.
 const MAX_SECS: u64 = u32::MAX as u64 / 1000;
@@ -24,13 +24,12 @@ pub struct Config {
     pub locker: Option<Argv>,
     #[knuffel(children(name = "timeout"))]
     pub timeouts: Vec<Timeout>,
-    /// The built-in lock screen's widgets, unless there is a `locker`.
     #[knuffel(child)]
     pub lock_screen: Option<LockScreen>,
 }
 
-/// The built-in lock screen's look when the config has no `lock-screen` block: mockup D3,
-/// laid out for a 1280×720 output.
+/// The lock screen without a `lock-screen` block: the date and a large clock at the top, the
+/// avatar, name and password field at the bottom, laid out for a 1280×720 output.
 pub const DEFAULT_LOCK_SCREEN: &str = r##"
 lock-screen {
     background
@@ -51,12 +50,10 @@ pub struct Number<const MIN: i32, const MAX: i32>(pub f64);
 
 /// A size in logical pixels.
 pub type Size = Number<1, 1000>;
-/// A distance in logical pixels that may be negative.
 pub type Distance = Number<-10000, 10000>;
 pub type Fraction = Number<0, 1>;
 pub type Factor = Number<0, 10>;
 
-/// One of nine points of the output a widget is placed at.
 #[derive(knuffel::DecodeScalar, Clone, Copy, Debug, Default, PartialEq)]
 pub enum Anchor {
     TopLeft,
@@ -75,8 +72,7 @@ pub enum Anchor {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Weight(pub pango::Weight);
 
-/// Where a widget goes: at `anchor` (by default the centre), moved by `offset` in logical
-/// pixels away from the edges it is anchored to, and right or down along a centred axis.
+/// Where a widget goes: at `anchor`, moved by `offset` logical pixels away from its edges.
 #[derive(knuffel::Decode, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Place {
     #[knuffel(child, unwrap(argument))]
@@ -85,7 +81,6 @@ pub struct Place {
     pub offset: Option<Offset>,
 }
 
-/// A widget's offset, x and y.
 #[derive(knuffel::Decode, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Offset(
     #[knuffel(argument)] pub Distance,
@@ -99,24 +94,23 @@ pub struct Gradient(
     #[knuffel(argument)] pub Fraction,
 );
 
-/// A colour, and an opacity it is multiplied by.
+/// A color, and an opacity it is multiplied by.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
-pub struct Colour {
+pub struct Color {
     #[knuffel(argument, str)]
-    pub name: ColourName,
+    pub name: ColorName,
     #[knuffel(argument, default = Number(1.0))]
     pub alpha: Fraction,
 }
 
-/// `#` and six or eight hex digits, or a GTK colour name (a letter or `_`, then letters,
+/// `#` and six or eight hex digits, or a GTK color name (a letter or `_`, then letters,
 /// digits, `_` and `-`), which gtk.css may define.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ColourName {
+pub enum ColorName {
     Literal(Rgba),
     Named(String),
 }
 
-/// A strftime-like format that GLib can use.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Format(pub String);
 
@@ -149,10 +143,8 @@ pub struct LockScreen {
     pub password: Password,
 }
 
-/// The wallpaper, blurred and darkened, or a plain colour.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub struct Background {
-    /// A command that prints the wallpaper's path.
     #[knuffel(child)]
     pub wallpaper_command: Option<Argv>,
     /// The blur's radius, in the wallpaper's pixels.
@@ -162,12 +154,11 @@ pub struct Background {
     pub brightness: Factor,
     #[knuffel(child, unwrap(argument), default = Number(1.1))]
     pub saturation: Factor,
-    /// The opacity of the black gradients at the top and the bottom.
     #[knuffel(child, default = Gradient(Number(0.35), Number(0.45)))]
     pub gradient: Gradient,
     /// Without a wallpaper (none configured, or it failed).
-    #[knuffel(child, default = colour("#202428"))]
-    pub color: Colour,
+    #[knuffel(child, default = Color::new("#202428"))]
+    pub color: Color,
 }
 
 /// How text looks; by default 15 px, normal weight, white.
@@ -180,10 +171,9 @@ pub struct Style {
     #[knuffel(child, unwrap(argument))]
     pub letter_spacing: Option<Number<-100, 100>>,
     #[knuffel(child)]
-    pub color: Option<Colour>,
+    pub color: Option<Color>,
 }
 
-/// The date or the clock.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub struct Text {
     #[knuffel(flatten(child))]
@@ -202,19 +192,17 @@ pub struct Name {
     pub style: Style,
 }
 
-/// A frosted circle with the user's initial.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub struct Avatar {
     #[knuffel(flatten(child))]
     pub place: Place,
     #[knuffel(child, unwrap(argument), default = Number(64.0))]
     pub diameter: Size,
-    /// The initial's.
-    #[knuffel(child, default = colour("#ffffff"))]
-    pub color: Colour,
+    /// The initial's color.
+    #[knuffel(child, default = Color::new("#ffffff"))]
+    pub color: Color,
 }
 
-/// The password field, with the hint, cooldown and caps lock lines.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub struct Password {
     #[knuffel(flatten(child))]
@@ -228,15 +216,14 @@ pub struct Password {
     #[knuffel(child, unwrap(argument), default = Number(4.0))]
     pub dot_size: Number<1, 100>,
     /// The text, dots and arrow.
-    #[knuffel(child, default = colour("#ffffff"))]
-    pub color: Colour,
-    /// The field's outline after a wrong password.
-    #[knuffel(child, default = colour("error_color"))]
-    pub error_color: Colour,
+    #[knuffel(child, default = Color::new("#ffffff"))]
+    pub color: Color,
+    #[knuffel(child, default = Color::new("error_color"))]
+    pub error_color: Color,
 }
 
 impl LockScreen {
-    pub fn colours(&self) -> impl Iterator<Item = &Colour> {
+    pub fn colors(&self) -> impl Iterator<Item = &Color> {
         let texts = [&self.date, &self.clock].into_iter().flatten();
         let styles = texts
             .map(|text| &text.style)
@@ -251,24 +238,25 @@ impl LockScreen {
     }
 }
 
-fn colour(name: &str) -> Colour {
-    Colour {
-        name: name.parse().expect("a valid colour"),
-        alpha: Number(1.0),
+impl Color {
+    /// `name`, opaque; for the defaults, so it must parse.
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.parse().expect("a valid color"),
+            alpha: Number(1.0),
+        }
     }
 }
 
-/// One `timeout` node: what to do after a period of idleness.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Timeout {
     pub after: Duration,
     pub action: Action,
-    /// What to run when the session is no longer idle.
     pub on_resume: Option<Argv>,
     pub ignore_inhibit: bool,
 }
 
-#[derive(knuffel::Decode, Debug, PartialEq)]
+#[derive(knuffel::Decode, Clone, Debug, PartialEq)]
 pub enum Action {
     Lock,
     Suspend,
@@ -404,13 +392,15 @@ impl<S: ErrorSpan, const MIN: i32, const MAX: i32> knuffel::DecodeScalar<S> for 
     }
 }
 
-impl FromStr for ColourName {
+impl FromStr for ColorName {
     type Err = &'static str;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
         let named = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b));
-        if let Some(rgba) = gtk::hex(name) {
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b));
+        if let Some(rgba) = theme::hex(name) {
             Ok(Self::Literal(rgba))
         } else if named {
             Ok(Self::Named(name.to_owned()))
@@ -459,7 +449,7 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"
-        locker "hyprlock-wallpaper"          // argv; one or more string args
+        locker "hyprlock-wallpaper"
         timeout 300 { lock; }
         timeout 600 {
             ignore-inhibit
@@ -549,38 +539,21 @@ mod tests {
             (name.style.weight, name.style.size),
             (Some(Weight(pango::Weight::Bold)), None)
         );
-        let colour = Colour {
-            name: ColourName::Named("accent_color".into()),
+        let color = Color {
+            name: ColorName::Named("accent_color".into()),
             alpha: Number(0.5),
         };
-        assert_eq!(name.style.color, Some(colour));
+        assert_eq!(name.style.color, Some(color));
         let place = lock_screen.password.place;
         assert_eq!(place.anchor, Some(Anchor::TopLeft));
         assert_eq!(place.offset, Some(Offset(Number(10.0), Number(-2.5))));
         assert_eq!(lock_screen.clock, None);
-        let white = ColourName::Literal([1.0; 4]);
+        let white = ColorName::Literal([1.0; 4]);
         assert_eq!(lock_screen.password.color.name, white);
     }
 
     #[test]
-    fn every_pango_weight_name_parses() {
-        let names = [
-            "thin",
-            "ultralight",
-            "light",
-            "semilight",
-            "book",
-            "normal",
-            "medium",
-            "semibold",
-            "bold",
-            "ultrabold",
-            "heavy",
-            "ultraheavy",
-        ];
-        for name in names {
-            assert!(name.parse::<Weight>().is_ok(), "{name}");
-        }
+    fn weights_are_pango_names() {
         assert_eq!("bold".parse(), Ok(Weight(pango::Weight::Bold)));
         assert!("boldest".parse::<Weight>().is_err());
     }

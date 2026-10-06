@@ -15,13 +15,12 @@ use zune_jpeg::zune_core::options::DecoderOptions;
 use crate::cloexec_above_stderr;
 use crate::config::Argv;
 
-/// How much smaller than the wallpaper the blurred copy is; blurred, it loses nothing.
+/// How much smaller than the wallpaper the blurred copy is; the blur hides the loss.
 const WALLPAPER_SHRINK: i32 = 4;
 
 /// How many box blurs in a row approximate a Gaussian one.
 const PASSES: usize = 3;
 
-/// How long the wallpaper command may take.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most pixels a wallpaper may have; a larger one is refused before it is decoded.
@@ -35,8 +34,7 @@ pub struct Blurred {
     pub pixels: Vec<u8>,
 }
 
-/// Run `command`, then decode the PNG or JPEG whose path it prints first, shrink it, blur
-/// it by the radius `blur`, and tone it, on a blocking thread.
+/// Run `command`, then decode, shrink, blur and tone the image whose path it prints.
 pub async fn load(
     command: Argv,
     blur: f64,

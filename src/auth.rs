@@ -22,14 +22,12 @@ const SERVICE: &str = "rust-wl-idle-manager";
 /// How long the helper may take before it is killed and the attempt counts as failed.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One password check: the helper process, killed at `deadline` if it has not answered.
 pub struct Attempt {
     child: Child,
     deadline: Instant,
 }
 
-/// Start the helper, `rust-wl-idle-manager --auth`, and write `password` to its stdin,
-/// which is then closed. Nothing else carries the password.
+/// Start the helper (`--auth`) and write `password` to its stdin, which is then closed.
 pub async fn start(password: &[u8]) -> io::Result<Attempt> {
     // This binary, even if its file has been replaced since.
     let mut child = cloexec_above_stderr(&mut Command::new("/proc/self/exe"))
@@ -68,13 +66,11 @@ pub async fn finished(slot: &mut Option<Attempt>) -> bool {
             false
         }
     };
-    // Dropping the attempt kills a helper still running.
     *slot = None;
     ok
 }
 
-/// The `--auth` helper: read a password from stdin, check it with PAM for the user
-/// running this process, wipe it, and exit with 0 if it was right, 1 otherwise.
+/// The `--auth` helper: check the password on stdin with PAM; exit with 0 if it is right.
 pub fn helper() -> ExitCode {
     let mut buffer = [0; CAPACITY];
     let ok = match read_all(&mut buffer) {
@@ -93,7 +89,6 @@ pub fn helper() -> ExitCode {
     }
 }
 
-/// Read stdin into `buffer`, unbuffered, until it ends or `buffer` is full.
 fn read_all(buffer: &mut [u8]) -> io::Result<usize> {
     let mut stdin = File::from(io::stdin().as_fd().try_clone_to_owned()?);
     let mut len = 0;
@@ -134,7 +129,6 @@ fn check(password: &[u8]) -> bool {
     true
 }
 
-/// The name of the user running this process, from the password database.
 fn user_name() -> Option<OsString> {
     // SAFETY: getpwuid returns null or a pointer to an entry that stays valid until the
     // next getpwuid call; it is copied out at once, and this thread is the only one.

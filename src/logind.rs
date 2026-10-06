@@ -25,7 +25,6 @@ pub trait LogindManager {
     /// Suspend the system; with `interactive` false, polkit never asks for a password.
     fn suspend(&self, interactive: bool) -> zbus::Result<()>;
 
-    /// Suspend, then hibernate after `HibernateDelaySec` or on low battery.
     fn suspend_then_hibernate(&self, interactive: bool) -> zbus::Result<()>;
 
     fn hibernate(&self, interactive: bool) -> zbus::Result<()>;
@@ -113,7 +112,6 @@ impl LogindManagerProxy<'_> {
     }
 }
 
-/// Whether logind's `BlockInhibited` list holds `idle`.
 pub fn idle_inhibited(block_inhibited: &str) -> bool {
     block_inhibited.split(':').any(|what| what == "idle")
 }

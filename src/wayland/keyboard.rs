@@ -8,15 +8,16 @@ use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use xkbcommon::xkb;
 
 use super::State;
+use super::lock::Screen;
 use crate::entry::{Key, Repeat};
 
-impl State {
+impl Screen {
     /// Act on the key with evdev `code`, pressed; only while locked, so it is meant for us.
     fn press(&mut self, code: u32) {
-        let Some(xkb) = self.lock.as_ref().and(self.xkb_state.as_ref()) else {
+        let Some(xkb) = self.xkb_state.as_ref().filter(|_| self.is_locked()) else {
             return;
         };
-        // xkbcommon numbers keys from 8; the character comes straight as UTF-32.
+        // xkbcommon numbers keys from 8.
         let keycode = xkb::Keycode::new(code + 8);
         let alt_or_logo = [xkb::MOD_NAME_ALT, xkb::MOD_NAME_LOGO]
             .iter()
@@ -44,18 +45,21 @@ impl Dispatch<WlSeat, ()> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        let wl_seat::Event::Capabilities {
-            capabilities: WEnum::Value(capabilities),
-        } = wl_event
+        let (
+            wl_seat::Event::Capabilities {
+                capabilities: WEnum::Value(capabilities),
+            },
+            Some(screen),
+        ) = (wl_event, &mut state.lock_screen)
         else {
             return;
         };
         let has_keyboard = capabilities.contains(Capability::Keyboard);
-        if has_keyboard && state.painter.is_some() && state.keyboard.is_none() {
-            state.keyboard = Some(seat.get_keyboard(qh, ()));
-        } else if !has_keyboard && let Some(keyboard) = state.keyboard.take() {
+        if has_keyboard && screen.keyboard.is_none() {
+            screen.keyboard = Some(seat.get_keyboard(qh, ()));
+        } else if !has_keyboard && let Some(keyboard) = screen.keyboard.take() {
             keyboard.release();
-            state.entry.stop_repeat();
+            screen.entry.stop_repeat();
         }
     }
 }
@@ -69,6 +73,7 @@ impl Dispatch<WlKeyboard, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let screen = state.screen();
         match wl_event {
             wl_keyboard::Event::Keymap {
                 format: WEnum::Value(KeymapFormat::XkbV1),
@@ -79,7 +84,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                 // which xkbcommon maps read-only (private, as wl_keyboard v7 requires).
                 let keymap = unsafe {
                     xkb::Keymap::new_from_fd(
-                        &state.xkb,
+                        &screen.xkb,
                         fd,
                         size as usize,
                         xkb::KEYMAP_FORMAT_TEXT_V1,
@@ -89,22 +94,22 @@ impl Dispatch<WlKeyboard, ()> for State {
                 match keymap {
                     Ok(Some(keymap)) => {
                         // A new state starts with no modifiers; the next `modifiers` sets them.
-                        state.xkb_state = Some(xkb::State::new(&keymap));
-                        state.entry.caps_lock = false;
+                        screen.xkb_state = Some(xkb::State::new(&keymap));
+                        screen.entry.caps_lock = false;
                     }
                     Ok(None) => error!("the compositor sent a keymap xkbcommon cannot compile"),
                     Err(e) => error!("reading the keymap: {e}"),
                 }
             }
             // The release may go elsewhere.
-            wl_keyboard::Event::Leave { .. } => state.entry.stop_repeat(),
+            wl_keyboard::Event::Leave { .. } => screen.entry.stop_repeat(),
             wl_keyboard::Event::Key {
                 key,
                 state: WEnum::Value(key_state),
                 ..
             } => match key_state {
-                KeyState::Pressed => state.press(key),
-                KeyState::Released => state.entry.release(key),
+                KeyState::Pressed => screen.press(key),
+                KeyState::Released => screen.entry.release(key),
                 // Only sent for wl_seat version 10; we bind up to 9 and repeat keys ourselves.
                 _ => {}
             },
@@ -115,15 +120,15 @@ impl Dispatch<WlKeyboard, ()> for State {
                 group,
                 ..
             } => {
-                if let Some(xkb) = &mut state.xkb_state {
+                if let Some(xkb) = &mut screen.xkb_state {
                     xkb.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-                    state.entry.caps_lock =
+                    screen.entry.caps_lock =
                         xkb.mod_name_is_active(xkb::MOD_NAME_CAPS, xkb::STATE_MODS_EFFECTIVE);
                 }
             }
             // A rate of 0 means no repeat; clamped so a bad compositor can't panic or spin us.
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
-                state.entry.set_repeat((rate > 0).then(|| Repeat {
+                screen.entry.set_repeat((rate > 0).then(|| Repeat {
                     delay: Duration::from_millis(delay.max(0) as u64),
                     interval: Duration::from_secs(1) / rate.min(1000) as u32,
                 }))

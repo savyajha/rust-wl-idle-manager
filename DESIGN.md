@@ -284,10 +284,11 @@ the clock; and the countdown, once a second during a cooldown (a cooldown
 never starts with a lock). A fade-in and a shake after a wrong password are
 not done (yet).
 
-A part that fails to render is logged as an error and left out; a frame
-always has at least its background, or the plain colour, so a lock never shows
-nothing. Rendering fails only when the environment does (say, a broken
-fontconfig): the config is checked when it is loaded, so that a config that
+If preparing an output's lock screen or drawing a frame fails, the error is
+logged and the frame is the background's plain colour, so a lock never shows
+nothing. If rendering the clock, the date or the countdown fails later, the
+error is logged and the old text stays. Rendering fails only when the
+environment does (say, a broken fontconfig): the config is checked when it is loaded, so that a config that
 loads can always be drawn: every number has a range (sizes up to 1000 logical
 pixels, the field up to 4000 wide), colours, formats and commands are checked,
 and a text longer than 8192 pixels is cut off.
@@ -345,6 +346,9 @@ Pango, fontconfig, cairo and GLib add about 3 MB of private memory (more with
 many fonts installed), and their libraries' pages, which are shared with
 every GTK application on the system. Decoding a wallpaper briefly takes tens
 of megabytes, which are handed back to the system afterwards (`malloc_trim`).
+With a `locker`, none of this is allocated: no outputs are tracked, no font
+map is created, and there is no buffer pool, session lock, password buffer
+or keymap.
 
 ### Checking the password
 

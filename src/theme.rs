@@ -5,20 +5,20 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use crate::config::{Colour, ColourName, LockScreen};
+use crate::config::{Color, ColorName, LockScreen};
 
 /// Red, green, blue and alpha, each from 0 to 1, not premultiplied.
 pub type Rgba = [f64; 4];
 
-/// The error colour the default lock screen names, for when gtk.css lacks it.
+/// The error color the default lock screen names, for when gtk.css lacks it.
 const ERROR_COLOR: &str = "#ffb4ab";
 
-/// GTK's named colours, as matugen writes them to `gtk-4.0/gtk.css`.
+/// GTK's named colors, as matugen writes them to `gtk-4.0/gtk.css`.
 pub struct Palette(HashMap<String, Rgba>);
 
 impl Palette {
-    /// The colours gtk.css defines, over the built-in one; a missing file is logged. So is
-    /// each colour `config` names that neither defines.
+    /// The colors gtk.css defines, over the built-in one; a missing file is logged. So is
+    /// each color `config` names that neither defines.
     pub fn load(config: &LockScreen) -> Self {
         let css = file("gtk.css").and_then(|path| {
             fs::read_to_string(&path)
@@ -26,8 +26,8 @@ impl Palette {
                 .ok()
         });
         let palette = Self::parse(&css.unwrap_or_default());
-        for colour in config.colours() {
-            if let ColourName::Named(name) = &colour.name
+        for color in config.colors() {
+            if let ColorName::Named(name) = &color.name
                 && !palette.0.contains_key(name)
             {
                 warn!("unknown colour {name:?}; using white");
@@ -36,7 +36,7 @@ impl Palette {
         palette
     }
 
-    /// The built-in colour, and those `css` defines in `@define-color <name> #hex;` lines.
+    /// The built-in color, and those `css` defines in `@define-color <name> #hex;` lines.
     pub fn parse(css: &str) -> Self {
         let defined = css.lines().filter_map(|line| {
             let mut words = line.strip_prefix("@define-color")?.split_whitespace();
@@ -50,18 +50,17 @@ impl Palette {
         Self([built_in].into_iter().chain(defined).collect())
     }
 
-    /// `colour`, with its opacity applied; an unknown name gives white.
-    pub fn get(&self, colour: &Colour) -> Rgba {
-        let [r, g, b, a] = match &colour.name {
-            ColourName::Literal(rgba) => *rgba,
-            ColourName::Named(name) => self.0.get(name).copied().unwrap_or([1.0; 4]),
+    /// `color`, with its opacity applied; an unknown name gives white.
+    pub fn get(&self, color: &Color) -> Rgba {
+        let [r, g, b, a] = match &color.name {
+            ColorName::Literal(rgba) => *rgba,
+            ColorName::Named(name) => self.0.get(name).copied().unwrap_or([1.0; 4]),
         };
-        [r, g, b, a * colour.alpha.0]
+        [r, g, b, a * color.alpha.0]
     }
 }
 
-/// `name` in GTK 4's config directory, `$XDG_CONFIG_HOME/gtk-4.0` (by default
-/// `~/.config/gtk-4.0`); `None`, logged, if neither variable is set.
+/// `name` in `$XDG_CONFIG_HOME/gtk-4.0`, by default `~/.config/gtk-4.0`.
 fn file(name: &str) -> Option<PathBuf> {
     let config = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -80,7 +79,6 @@ pub fn font() -> String {
         .to_owned()
 }
 
-/// The `gtk-font-name` in settings.ini's `text`.
 fn font_in(text: &str) -> Option<&str> {
     text.lines()
         .find_map(|line| {
@@ -92,7 +90,6 @@ fn font_in(text: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-/// `#rrggbb` or `#rrggbbaa`.
 pub fn hex(text: &str) -> Option<Rgba> {
     let digits = text.strip_prefix('#')?;
     if !matches!(digits.len(), 6 | 8) || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -108,8 +105,8 @@ mod tests {
     use super::*;
     use crate::config::Number;
 
-    fn colour(name: &str, alpha: f64) -> Colour {
-        Colour {
+    fn color(name: &str, alpha: f64) -> Color {
+        Color {
             name: name.parse().unwrap(),
             alpha: Number(alpha),
         }
@@ -123,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn hex_colours_parse() {
+    fn hex_colors_parse() {
         assert_eq!(hex("#ff0080"), Some([1.0, 0.0, 128.0 / 255.0, 1.0]));
         assert_eq!(hex("#00000000"), Some([0.0; 4]));
         for bad in [
@@ -142,12 +139,12 @@ mod tests {
         );
         assert_eq!(palette.0.len(), 2);
         assert_eq!(
-            palette.get(&colour("accent_color", 1.0)),
+            palette.get(&color("accent_color", 1.0)),
             hex("#add28e").unwrap()
         );
-        // The file's error colour replaces the built-in one; the opacity multiplies.
+        // The file's error color replaces the built-in one; the opacity multiplies.
         assert_eq!(
-            palette.get(&colour("error_color", 0.5)),
+            palette.get(&color("error_color", 0.5)),
             [1.0, 0.0, 0.0, 128.0 / 510.0]
         );
     }
@@ -155,11 +152,11 @@ mod tests {
     #[test]
     fn literals_built_ins_and_unknown_names_resolve() {
         let palette = Palette::parse("");
-        assert_eq!(palette.get(&colour("#ffffff", 0.82)), [1.0, 1.0, 1.0, 0.82]);
+        assert_eq!(palette.get(&color("#ffffff", 0.82)), [1.0, 1.0, 1.0, 0.82]);
         assert_eq!(
-            palette.get(&colour("error_color", 1.0)),
+            palette.get(&color("error_color", 1.0)),
             hex("#ffb4ab").unwrap()
         );
-        assert_eq!(palette.get(&colour("nope", 1.0)), [1.0; 4]);
+        assert_eq!(palette.get(&color("nope", 1.0)), [1.0; 4]);
     }
 }
