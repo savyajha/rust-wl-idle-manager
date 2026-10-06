@@ -24,7 +24,7 @@ use futures_lite::StreamExt;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::Connection;
 
@@ -412,7 +412,15 @@ fn main() -> ExitCode {
     let mode = parse_args(env::args_os().skip(1));
     init_logging();
     match mode {
-        Some(Mode::Daemon(config_path)) => daemon(&config_path),
+        Some(Mode::Daemon(config_path)) => {
+            // A fixed mmap threshold: freeing a wallpaper's decode buffer would otherwise
+            // raise glibc's, and later ~1 MB buffers would stay in the heap once freed.
+            // SAFETY: mallopt takes only integers; no thread has been started yet.
+            if unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024) } == 0 {
+                warn!("mallopt(M_MMAP_THRESHOLD) failed");
+            }
+            daemon(&config_path)
+        }
         Some(Mode::Auth) => auth::helper(),
         None => {
             eprintln!("usage: rust-wl-idle-manager --config <path>");

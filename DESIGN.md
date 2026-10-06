@@ -346,6 +346,9 @@ Pango, fontconfig, cairo and GLib add about 3 MB of private memory (more with
 many fonts installed), and their libraries' pages, which are shared with
 every GTK application on the system. Decoding a wallpaper briefly takes tens
 of megabytes, which are handed back to the system afterwards (`malloc_trim`).
+The daemon fixes glibc's mmap threshold at 128 kB at start-up (`mallopt`):
+freeing the decode buffer would otherwise raise it to its size, and later
+megabyte-sized buffers would stay resident in the heap after being freed.
 With a `locker`, none of this is allocated: no outputs are tracked, no font
 map is created, and there is no buffer pool, session lock, password buffer
 or keymap.
