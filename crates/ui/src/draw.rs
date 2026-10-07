@@ -1,4 +1,5 @@
 use std::f64::consts::PI;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use cairo::{
@@ -7,7 +8,7 @@ use cairo::{
 };
 use pango::FontDescription;
 use pango::Weight;
-use pango::glib::{self, DateTime};
+use pango::glib::DateTime;
 use pango::prelude::FontMapExt;
 use tracing::error;
 
@@ -53,6 +54,8 @@ const MAX_TEXT: i32 = 8192;
 /// Prepares each output's `Scene` ahead of time, so that drawing a frame only composites.
 pub struct Painter {
     config: LockScreen,
+    /// Where GTK's gtk.css and settings.ini are read from.
+    theme: Option<PathBuf>,
     fonts: pango::Context,
     font: FontDescription,
     palette: Palette,
@@ -139,16 +142,20 @@ struct Field {
 }
 
 impl Painter {
-    pub fn new(config: LockScreen) -> Self {
-        // GLib's name for a user without one in the passwd database.
-        let name = glib::real_name().into_string().ok();
-        let name = name.filter(|name| name != "Unknown");
-        let name = name.unwrap_or_else(|| glib::user_name().to_string_lossy().into_owned());
-        let palette = Palette::load(&config);
-        Self::from_theme(config, palette, &theme::font(), name)
+    /// The user's `name` drawn in GTK's colours and font, from the `theme` directory.
+    pub fn new(config: LockScreen, theme: Option<PathBuf>, name: String) -> Self {
+        let palette = Palette::load(theme.as_deref(), &config);
+        let font = theme::font(theme.as_deref());
+        Self::from_theme(config, theme, palette, &font, name)
     }
 
-    fn from_theme(config: LockScreen, palette: Palette, font: &str, name: String) -> Self {
+    fn from_theme(
+        config: LockScreen,
+        theme: Option<PathBuf>,
+        palette: Palette,
+        font: &str,
+        name: String,
+    ) -> Self {
         let fonts = pangocairo::FontMap::default().create_context();
         let mut options = cairo::FontOptions::new().expect("cairo font options");
         options.set_antialias(Antialias::Gray);
@@ -157,6 +164,7 @@ impl Painter {
         pangocairo::functions::context_set_font_options(&fonts, Some(&options));
         Self {
             config,
+            theme,
             fonts,
             font: FontDescription::from_string(font),
             palette,
@@ -175,7 +183,7 @@ impl Painter {
                 .inspect_err(|e| error!("using the wallpaper: {e}"))
                 .ok();
         }
-        self.palette = Palette::load(&self.config);
+        self.palette = Palette::load(self.theme.as_deref(), &self.config);
     }
 
     /// A scene of nothing but the background's color, for when `scene` fails.
@@ -741,7 +749,6 @@ pub fn minute() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, DEFAULT_LOCK_SCREEN};
 
     #[test]
     fn widgets_are_placed_inwards_from_their_anchor() {
@@ -780,9 +787,9 @@ mod tests {
     /// The default lock screen, prepared for a 1280×720 output at `scale`, with the
     /// built-in colors and the font the package's tests provide.
     fn scene(scale: u32) -> (Painter, Scene) {
-        let config: Config = knuffel::parse("default", DEFAULT_LOCK_SCREEN).unwrap();
-        let config = config.lock_screen.unwrap();
-        let painter = Painter::from_theme(config, Palette::parse(""), "Adwaita Sans", "Ann".into());
+        let config = LockScreen::default_layout();
+        let palette = Palette::parse("");
+        let painter = Painter::from_theme(config, None, palette, "Adwaita Sans", "Ann".into());
         let scene = painter
             .scene(Layout::new((1280, 720), scale, None))
             .unwrap();

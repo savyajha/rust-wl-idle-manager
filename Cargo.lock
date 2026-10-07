@@ -775,14 +775,12 @@ name = "rust-wl-idle-manager"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cairo-rs",
  "futures-lite",
  "knuffel",
  "libc",
- "miette",
  "nonstick",
  "pango",
- "pangocairo",
+ "rust-wl-ui",
  "smithay-client-toolkit",
  "tokio",
  "tracing",
@@ -790,8 +788,24 @@ dependencies = [
  "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
- "xkbcommon",
  "zbus",
+]
+
+[[package]]
+name = "rust-wl-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cairo-rs",
+ "knuffel",
+ "libc",
+ "miette",
+ "pango",
+ "pangocairo",
+ "tokio",
+ "tracing",
+ "wayland-client",
+ "xkbcommon",
  "zune-jpeg",
 ]
 

@@ -47,11 +47,11 @@
             idleManager = self.packages.${system}.rust-wl-idle-manager;
           };
 
-          fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --check";
+          fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --all --check";
           clippy = cargoCheck "clippy" [
             pkgs.rustc
             pkgs.clippy
-          ] "cargo clippy --all-targets -- -D warnings";
+          ] "cargo clippy --workspace --all-targets -- -D warnings";
         };
 
         devShells.default = pkgs.mkShell {

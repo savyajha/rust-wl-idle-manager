@@ -1,0 +1,22 @@
+[package]
+name = "rust-wl-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ui"
+
+[dependencies]
+anyhow.workspace = true
+cairo-rs = { version = "0.22", default-features = false, features = ["png"] }
+knuffel.workspace = true
+libc.workspace = true
+miette = "5"
+pango.workspace = true
+pangocairo = "0.22"
+tokio.workspace = true
+tracing.workspace = true
+wayland-client.workspace = true
+xkbcommon = { version = "0.8", default-features = false, features = ["wayland"] }
+zune-jpeg = "0.5"

@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
+use std::env;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use pango::glib;
 use smithay_client_toolkit::output::OutputInfo;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -27,14 +30,14 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1:
 };
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
-use xkbcommon::xkb;
 
 use super::State;
-use crate::config::LockScreen;
-use crate::draw::{self, Layout, Painter, Scene};
-use crate::entry::{Entry, Look, Status};
 use crate::policy::Input;
-use crate::wallpaper::Blurred;
+use ui::config::LockScreen;
+use ui::draw::{self, Layout, Painter, Scene};
+use ui::entry::{Entry, Look, Status};
+use ui::keyboard::Keyboard;
+use ui::wallpaper::Blurred;
 
 /// The most buffers an output's frames use: one the compositor shows, one to draw the next in.
 const BUFFERS: usize = 2;
@@ -52,9 +55,7 @@ pub struct Screen {
     lock: Option<Lock>,
     pub(super) entry: Entry,
     pub(super) submitted: bool,
-    pub(super) xkb: xkb::Context,
-    /// The keymap and modifiers, once the compositor has sent the keymap.
-    pub(super) xkb_state: Option<xkb::State>,
+    pub(super) xkb: Keyboard,
     /// The first keyboard to appear, while the seat has one.
     pub(super) keyboard: Option<WlKeyboard>,
     /// The minute the clock was last rendered for.
@@ -144,7 +145,7 @@ impl Screen {
         }
         let shm = Shm::bind(globals, qh).context("binding wl_shm")?;
         Ok(Self {
-            painter: Painter::new(config),
+            painter: Painter::new(config, gtk_dir(), real_name()),
             outputs: Vec::new(),
             compositor: globals
                 .bind(qh, 1..=4, ())
@@ -160,8 +161,7 @@ impl Screen {
             lock: None,
             entry: Entry::new(),
             submitted: false,
-            xkb: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
-            xkb_state: None,
+            xkb: Keyboard::default(),
             keyboard: None,
             minute: draw::minute(),
             drawn: None,
@@ -524,6 +524,25 @@ impl Screen {
             lock.shown = None;
         }
     }
+}
+
+/// The user's full name, or without one in the passwd database, their user name.
+fn real_name() -> String {
+    // GLib's name for a user without one in the passwd database.
+    let name = glib::real_name().into_string().ok();
+    let name = name.filter(|name| name != "Unknown");
+    name.unwrap_or_else(|| glib::user_name().to_string_lossy().into_owned())
+}
+
+/// `$XDG_CONFIG_HOME/gtk-4.0`, by default `~/.config/gtk-4.0`.
+fn gtk_dir() -> Option<PathBuf> {
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    if config.is_none() {
+        warn!("neither XDG_CONFIG_HOME nor HOME is set; not reading gtk-4.0");
+    }
+    Some(config?.join("gtk-4.0"))
 }
 
 /// The buffer for a frame showing `look`: a released one that shows it already, else any

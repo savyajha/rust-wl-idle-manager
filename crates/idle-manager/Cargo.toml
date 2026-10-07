@@ -1,0 +1,22 @@
+[package]
+name = "rust-wl-idle-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures-lite = { version = "2", default-features = false }
+knuffel.workspace = true
+libc.workspace = true
+nonstick = "0.1"
+pango.workspace = true
+rust-wl-ui.workspace = true
+smithay-client-toolkit = { version = "0.21", default-features = false }
+tokio.workspace = true
+tracing.workspace = true
+tracing-journald = "0.3"
+tracing-subscriber = "0.3"
+wayland-client.workspace = true
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }

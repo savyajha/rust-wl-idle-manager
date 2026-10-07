@@ -28,6 +28,8 @@ pub struct Password {
 }
 
 impl Password {
+    // Not `Default`: it mlocks a page.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let page = Box::new(Page([0; CAPACITY]));
         // SAFETY: the range is the buffer's own memory, which lives as long as `page`.

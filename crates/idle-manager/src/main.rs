@@ -1,13 +1,8 @@
 mod auth;
 mod config;
-mod draw;
-mod entry;
 mod logind;
-mod password;
 mod policy;
 mod systemd;
-mod theme;
-mod wallpaper;
 mod wayland;
 
 use std::env;
@@ -28,12 +23,13 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use zbus::Connection;
 
-use config::{Argv, Background, Config};
-use entry::Entry;
+use config::Config;
 use logind::{LogindManagerProxy, idle_inhibited};
 use policy::{Command, Input, Policy};
 use systemd::SystemdManagerProxy;
-use wallpaper::Blurred;
+use ui::config::{Argv, Background};
+use ui::entry::Entry;
+use ui::wallpaper::{self, Blurred};
 use wayland::{Next, Wayland};
 
 const LOCKER_UNIT: &str = "rust-wl-locker.service";
@@ -71,19 +67,6 @@ fn init_logging() {
         .with(journald)
         .with(stderr)
         .init();
-}
-
-/// Mark every fd above stderr close-on-exec in `command`'s child: an fd received over D-Bus
-/// (the sleep inhibitor's) lacks it until zbus drops its message (see DESIGN.md).
-pub fn cloexec_above_stderr(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
-    // SAFETY: close_range is a system call, safe between fork and exec. It keeps the pipe std
-    // reports a failed exec on; a failure (before Linux 5.11, or seccomp) is ignored.
-    unsafe {
-        command.pre_exec(|| {
-            libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as i32);
-            Ok(())
-        })
-    }
 }
 
 fn log_input(input: Input, session: &str, delays: &[Duration]) {

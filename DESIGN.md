@@ -7,6 +7,14 @@ holds sleep back until the session is locked. It locks with its own lock
 screen, or, if the config names a `locker`, by starting that program. This
 document records why it works the way it does.
 
+The code is a Cargo workspace of two crates. `crates/ui` (`rust-wl-ui`) is what
+the lock screen draws and types with: the `lock-screen` layout and its
+validation, GTK's colours and font, the wallpaper, the drawing, the password
+entry and its `Password` buffer, and the keyboard's keymap and keys.
+`crates/idle-manager` is the daemon: the policy, logind, systemd, the
+authentication helper, the rest of the config, and the Wayland connection with
+the session lock.
+
 ## Idle detection
 
 Idleness comes from the Wayland `ext-idle-notify-v1` protocol. Each configured
@@ -238,9 +246,10 @@ The layout comes from the config's `lock-screen` block: a widget each for the
 background, date, clock, avatar, name and password field, each placed at one
 of nine anchors of the output and moved by an offset in logical pixels, away
 from the edges it is anchored to. Without the block, the default
-(`DEFAULT_LOCK_SCREEN` in config.rs) is the look of the design it was made
-from. A widget's box is its text's logical box (as Pango lays it out), the
-avatar's circle, or the password field with the caps lock line under it.
+(`DEFAULT_LOCK_SCREEN` in `crates/ui/src/config.rs`) is the look of the design
+it was made from. A widget's box is its text's logical box (as Pango lays it
+out), the avatar's circle, or the password field with the caps lock line under
+it.
 
 Everything a frame needs is prepared ahead of time, per output, in a `Scene`:
 the background at a quarter of the output's physical size (the blurred

@@ -1,6 +1,7 @@
 use std::mem;
 
-use crate::config::{Action, Argv, Timeout};
+use crate::config::{Action, Timeout};
+use ui::config::Argv;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {

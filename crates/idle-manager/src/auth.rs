@@ -13,8 +13,8 @@ use tokio::process::{Child, Command};
 use tokio::time::{self, Instant};
 use tracing::{error, info, warn};
 
-use crate::cloexec_above_stderr;
-use crate::password::{self, CAPACITY};
+use ui::cloexec_above_stderr;
+use ui::password::{self, CAPACITY};
 
 /// The PAM service; NixOS needs `security.pam.services.rust-wl-idle-manager = { };`.
 const SERVICE: &str = "rust-wl-idle-manager";

@@ -101,6 +101,8 @@ pub struct Entry {
 }
 
 impl Entry {
+    // Not `Default`: its password mlocks a page.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             password: Password::new(),

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 use tracing::{info, warn};
 
@@ -17,10 +16,10 @@ const ERROR_COLOR: &str = "#ffb4ab";
 pub struct Palette(HashMap<String, Rgba>);
 
 impl Palette {
-    /// The colors gtk.css defines, over the built-in one; a missing file is logged. So is
-    /// each color `config` names that neither defines.
-    pub fn load(config: &LockScreen) -> Self {
-        let css = file("gtk.css").and_then(|path| {
+    /// The colors `dir`'s gtk.css defines, over the built-in one; a missing file is logged.
+    /// So is each color `config` names that neither defines.
+    pub fn load(dir: Option<&Path>, config: &LockScreen) -> Self {
+        let css = dir.map(|dir| dir.join("gtk.css")).and_then(|path| {
             fs::read_to_string(&path)
                 .inspect_err(|e| info!("no GTK colours from {}: {e}", path.display()))
                 .ok()
@@ -60,20 +59,9 @@ impl Palette {
     }
 }
 
-/// `name` in `$XDG_CONFIG_HOME/gtk-4.0`, by default `~/.config/gtk-4.0`.
-fn file(name: &str) -> Option<PathBuf> {
-    let config = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    if config.is_none() {
-        warn!("neither XDG_CONFIG_HOME nor HOME is set; not reading gtk-4.0/{name}");
-    }
-    Some(config?.join("gtk-4.0").join(name))
-}
-
-/// GTK's default font, `gtk-font-name` in its settings.ini, or "Sans".
-pub fn font() -> String {
-    let settings = file("settings.ini").and_then(|path| fs::read_to_string(path).ok());
+/// GTK's default font, `gtk-font-name` in `dir`'s settings.ini, or "Sans".
+pub fn font(dir: Option<&Path>) -> String {
+    let settings = dir.and_then(|dir| fs::read_to_string(dir.join("settings.ini")).ok());
     font_in(&settings.unwrap_or_default())
         .unwrap_or("Sans")
         .to_owned()

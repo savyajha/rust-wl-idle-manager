@@ -27,11 +27,12 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
-use crate::config::{LockScreen, Timeout};
-use crate::entry::Entry;
+use crate::config::Timeout;
 use crate::policy::Input;
-use crate::wallpaper::Blurred;
 use lock::Screen;
+use ui::config::LockScreen;
+use ui::entry::Entry;
+use ui::wallpaper::Blurred;
 
 /// The daemon's connection to the compositor: idle notifications and the lock screen.
 pub struct Wayland {
