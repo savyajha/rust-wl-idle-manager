@@ -7,13 +7,15 @@ holds sleep back until the session is locked. It locks with its own lock
 screen, or, if the config names a `locker`, by starting that program. This
 document records why it works the way it does.
 
-The code is a Cargo workspace of two crates. `crates/ui` (`rust-wl-ui`) is what
+The code is a Cargo workspace of three crates. `crates/ui` (`rust-wl-ui`) is what
 the lock screen draws and types with: the `lock-screen` layout and its
 validation, GTK's colours and font, the wallpaper, the drawing, the password
 entry and its `Password` buffer, and the keyboard's keymap and keys.
 `crates/idle-manager` is the daemon: the policy, logind, systemd, the
 authentication helper, the rest of the config, and the Wayland connection with
-the session lock.
+the session lock. `crates/greeter-compositor` (`rust-wl-greeter-compositor`) is
+a separate program, a Wayland compositor for a greetd greeter; it shares no
+code with the other two and is described at the end.
 
 ## Idle detection
 
@@ -523,3 +525,116 @@ rust-wl-idle-manager exits with 0 on SIGTERM and 1 on any error. Each error is
 logged once; on compositor loss, wayland-backend also prints its own line to
 stderr, which reaches the journal. Command-line usage errors exit with 2.
 The `--auth` helper exits with 0 for the right password and 1 otherwise.
+
+## The greeter compositor
+
+`rust-wl-greeter-compositor` is the Wayland compositor a graphical greetd
+greeter runs on. greetd starts it as the greeter, as the `greeter` user:
+
+```sh
+rust-wl-greeter-compositor [--drm-device PATH] [--scale CONNECTOR=SCALE]... [--log-timing] -- GREETER [ARGS...]
+```
+
+It takes the seat through libseat (logind or seatd), opens one GPU, creates
+its Wayland socket, starts `GREETER` with `WAYLAND_DISPLAY` set, and exits when
+the greeter exits, with its exit status. On SIGTERM (greetd starting the
+session) or SIGINT it sends the greeter SIGTERM, waits up to 500 ms for it
+(then SIGKILL), and exits with 0. It exits without tearing down libinput and
+libseat: the kernel closes its devices, and logind (or seatd) releases them
+when its connection closes, which saves a round trip per input device before
+it exits. There is no config file; everything is on the command line;
+`--scale` takes 0.5 to 4.
+
+### Drawing
+
+Smithay's Pixman renderer draws into DRM dumb buffers, two per output, which
+are page-flipped on vblank. Nothing links GBM, EGL, GL or Mesa, so the first
+frame does not wait for a GPU driver stack to load. A frame is drawn only
+when something changed: a commit, the cursor, or a VT switch back, and then
+only the damage, using the buffer's age. Frame callbacks go out on the flip's
+vblank; without damage there is no flip, and they go out one refresh interval
+later instead, so a client that draws on every callback does not spin. A flip
+that fails is logged once and tried again every refresh interval, with frame
+callbacks still sent, and the drawn frame is flipped again even without new
+damage. A vblank event more than a refresh interval older than the output's
+pending flip is ignored as stale (from before a VT switch, or of a removed
+output on the same CRTC); a flip that gets no accepted event within four
+refresh intervals is taken as done, so a wrongly ignored event cannot stop the
+output.
+
+The GPU is the one given with `--drm-device`, or else the seat's boot GPU
+(udev's `boot_vga`). No other DRM device is opened. Every connected connector
+of it gets an output at its preferred mode and a free CRTC, built-in panels
+(eDP, LVDS, DSI) first; the first output is the primary one. At start-up the
+primary output is set up before the greeter starts and the others only after
+the greeter's first frame (or 1 s), so their blocking modesets do not delay
+it. Outputs are laid out left to right. The scale of each comes from `--scale` (default 1) and is sent as the
+fractional and integer preferred scale. libinput is opened after the
+greeter's first frame is on screen, or 1 s after start at the latest. udev is
+watched from before the first scan of the connectors (which opens nothing), so
+no hotplug is missed: a change event of that GPU, and a VT switch back, rescan
+its connectors, adding and removing outputs; an output whose preferred mode
+changed is removed and added again. Those rescans make the kernel probe the
+connectors (read their modes): after a hotplug it does not do so by itself
+while the device has a master. The start-up scan uses the state from boot,
+which is faster.
+
+The cursor is a built-in arrow, drawn at the output's scale rounded, hidden
+until the pointer first moves. It goes on the output's cursor plane where
+there is one; otherwise, and if a flip with the cursor plane ever fails, it
+is drawn into the frame (and the plane is switched off), pixel for pixel at
+any scale. Legacy KMS has no usable cursor plane here, and
+virtual GPUs hide theirs from clients that cannot set a cursor hotspot, as
+Smithay cannot. Client cursor surfaces are ignored.
+
+### Protocols
+
+`wl_compositor` (with `wl_subcompositor`, which Smithay adds), `wl_shm`,
+`wl_seat`, `wl_output`, `xdg_wm_base`, `wp_fractional_scale_v1`,
+`wp_viewporter` and `wp_presentation`. No layer-shell, session lock,
+decorations or data device.
+
+Every toplevel is fullscreen on the output it asks for with `set_fullscreen`,
+else the primary one, and is configured on its first commit. When an output
+goes, its toplevels leave it and move to the primary output (to the new one,
+when the last output went), beneath that output's own toplevel, which gets
+the keyboard whichever was created first; a popup grab on one of them is dismissed. Popups are placed by their positioner,
+constrained to the toplevel's output, and drawn above their parent. A popup
+grab is granted to a popup on a toplevel or on the topmost grabbing popup;
+the topmost grabbing popup has the keyboard. Escape dismisses it, and a
+click outside the grabbing popups dismisses all of them; neither reaches the
+client.
+
+### Input
+
+The keyboard uses one keymap, from xkbcommon's defaults, which honour the
+`XKB_DEFAULT_*` variables; repeat is 600 ms and 25 per second. The keymap
+never changes. Ctrl+Alt+F1 to F12 switch VT; under logind this needs polkit,
+through which logind allows an active session to switch
+(`org.freedesktop.login1.chvt`). Keys go to the topmost grabbing
+popup, else the toplevel last clicked, else the primary output's toplevel.
+Pointer motion, buttons and scrolling go to the surface under the pointer,
+popups first; absolute devices map onto the whole layout. The pointer stays
+on the outputs: motion off them, and an absolute position in a gap of the
+layout, go to the nearest point of an output, and after outputs change it is
+moved back onto one. Touch is not
+handled. Power, sleep and lid keys are left to logind.
+
+On a VT switch away the compositor stops drawing and suspends libinput; on
+the way back it rescans the connectors and redraws every output in full.
+
+### Logging and tests
+
+It logs to stderr, which greetd sends to the journal. With `--log-timing`,
+the time from start to opening the GPU, starting the greeter, the greeter's
+first frame and input, and from a signal to the exit call, are logged at info.
+
+`tests/greeter-compositor.nix` runs it under greetd in a VM with two virtio-gpu
+outputs and a test client (`examples/test-client.rs`): first frames at two
+scales, keys and clicks, popups and their dismissal, the cursor, VT switches
+(by `chvt` and by Ctrl+Alt+F2) and the full redraw after them, an output
+unplugged and plugged again (forced through the connector's sysfs `status`,
+which also probes it, so the compositor's own probe is not covered),
+greetd's restart after the client exits, the exit time after SIGTERM, and that
+the binary links no EGL, GBM, Mesa or LLVM. The cursor plane is not covered:
+virtio-gpu hides it.

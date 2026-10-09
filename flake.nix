@@ -10,19 +10,21 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        inherit (self.packages.${system}) rust-wl-idle-manager rust-wl-greeter-compositor;
+        greeterTestClient = pkgs.callPackage ./greeter-compositor.nix { testClient = true; };
         # Runs `command` on the source offline, with the package's vendored dependencies.
         cargoCheck =
           name: tools: command:
           pkgs.stdenv.mkDerivation {
             name = "rust-wl-idle-manager-${name}";
-            inherit (self.packages.${system}.rust-wl-idle-manager) src cargoDeps;
+            inherit (rust-wl-idle-manager) src cargoDeps;
             nativeBuildInputs = [
               pkgs.rustPlatform.cargoSetupHook
               pkgs.cargo
               pkgs.pkg-config
             ]
             ++ tools;
-            inherit (self.packages.${system}.rust-wl-idle-manager) buildInputs;
+            buildInputs = rust-wl-idle-manager.buildInputs ++ rust-wl-greeter-compositor.buildInputs;
             buildPhase = command;
             installPhase = "touch $out";
             dontFixup = true;
@@ -31,6 +33,7 @@
       {
         packages = rec {
           rust-wl-idle-manager = pkgs.callPackage ./package.nix { };
+          rust-wl-greeter-compositor = pkgs.callPackage ./greeter-compositor.nix { };
           default = rust-wl-idle-manager;
         };
 
@@ -46,6 +49,12 @@
             inherit pkgs;
             idleManager = self.packages.${system}.rust-wl-idle-manager;
           };
+          # The greeter compositor under greetd, on two virtual outputs.
+          greeter-compositor = import ./tests/greeter-compositor.nix {
+            inherit pkgs;
+            compositor = rust-wl-greeter-compositor;
+            testClient = greeterTestClient;
+          };
 
           fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --all --check";
           clippy = cargoCheck "clippy" [
@@ -55,7 +64,10 @@
         };
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${system}.rust-wl-idle-manager ];
+          inputsFrom = [
+            rust-wl-idle-manager
+            rust-wl-greeter-compositor
+          ];
           packages = with pkgs; [
             rust-analyzer
             clippy

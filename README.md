@@ -281,7 +281,9 @@ including the sleep handshake, and one with the built-in lock screen, which
 checks the screen's pixels while locked, after unlocking, after an output is
 added, after the daemon is killed while locked, at scale 1.5, and with a PNG
 and then a JPEG wallpaper taken up on SIGHUP, and types right and wrong
-passwords with `wtype`. They need KVM.
+passwords with `wtype`. A third runs the greeter compositor
+(`rust-wl-greeter-compositor`, see [DESIGN.md](DESIGN.md)) under greetd. They
+need KVM.
 
 ## License
 

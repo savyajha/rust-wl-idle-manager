@@ -17,6 +17,14 @@ rustPlatform.buildRustPackage {
   src = ./.;
 
   cargoLock.lockFile = ./Cargo.lock;
+  # The daemon and its library only; the greeter compositor is greeter-compositor.nix.
+  cargoBuildFlags = [ "--package" "rust-wl-idle-manager" ];
+  cargoTestFlags = [
+    "--package"
+    "rust-wl-idle-manager"
+    "--package"
+    "rust-wl-ui"
+  ];
 
   nativeBuildInputs = [ pkg-config ];
   # xkbcommon decodes the keyboard; PAM is called only by the `--auth` helper; Pango and

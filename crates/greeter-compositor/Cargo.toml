@@ -1,0 +1,32 @@
+[package]
+name = "rust-wl-greeter-compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Smithay's own calloop, with signal sources.
+calloop = { version = "0.14", features = ["signals"] }
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber = "0.3"
+
+# No backend_gbm, backend_egl or renderer_gl: nothing here links Mesa, GBM or EGL.
+[dependencies.smithay]
+version = "0.7"
+default-features = false
+features = [
+  "backend_drm",
+  "backend_libinput",
+  "backend_session_libseat",
+  "backend_udev",
+  "desktop",
+  "renderer_pixman",
+  "wayland_frontend",
+]
+
+# The test client (examples/test-client.rs).
+[dev-dependencies]
+wayland-client.workspace = true
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
