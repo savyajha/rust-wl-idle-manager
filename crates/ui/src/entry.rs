@@ -206,6 +206,22 @@ impl Entry {
         true
     }
 
+    /// The answer was taken without a verdict (another prompt follows, or the attempt was
+    /// given up): wipe it and stop checking, keeping the failures in a row. Nothing unless
+    /// a check is under way.
+    pub fn answered(&mut self) {
+        if self.checking {
+            let failures = self.failures;
+            self.reset();
+            self.failures = failures;
+        }
+    }
+
+    /// What is typed, for showing the answer to a visible prompt; never for a password.
+    pub fn typed(&self) -> &[u8] {
+        self.password.bytes()
+    }
+
     pub fn wipe(&mut self) {
         self.password.wipe();
         self.forget_at = None;
@@ -571,6 +587,24 @@ mod tests {
         assert_eq!(entry.look(now).chars, 3);
         entry.checked(false, now);
         assert_eq!(entry.look(now).chars, 0);
+    }
+
+    #[test]
+    fn an_answer_without_a_verdict_keeps_the_failures() {
+        let (mut entry, now) = entry();
+        for _ in 0..4 {
+            attempt(&mut entry, false, now);
+        }
+        // Typing is not a check: nothing happens.
+        type_text(&mut entry, "code", now);
+        entry.answered();
+        assert_eq!(entry.typed(), b"code");
+        entry.press(Key::Enter, 4, now);
+        entry.answered();
+        assert_eq!(typed(&entry), b"");
+        assert_eq!(entry.look(now).status, Status::Idle);
+        attempt(&mut entry, false, now);
+        assert!(matches!(entry.look(now).status, Status::Cooldown(_)));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use anyhow::Context;
 use tokio::time::Instant;
 use tracing::error;
 use wayland_client::WEnum;
@@ -13,6 +14,8 @@ pub struct Keyboard {
     xkb: xkb::Context,
     /// The keymap and modifiers, once the compositor has sent the keymap.
     xkb_state: Option<xkb::State>,
+    /// A keymap of our own, used in place of the compositor's.
+    own: Option<xkb::Keymap>,
 }
 
 impl Default for Keyboard {
@@ -20,11 +23,38 @@ impl Default for Keyboard {
         Self {
             xkb: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
+            own: None,
         }
     }
 }
 
 impl Keyboard {
+    /// A keyboard that types with the xkb `layout` (with the default rules, model and
+    /// variant) whatever keymap the compositor sends. The modifiers still come from the
+    /// compositor: the eight real ones are the same in every keymap xkbcommon compiles.
+    pub fn with_layout(layout: &str) -> anyhow::Result<Self> {
+        let mut keyboard = Self::default();
+        let keymap = xkb::Keymap::new_from_names(
+            &keyboard.xkb,
+            "",
+            "",
+            layout,
+            "",
+            None,
+            xkb::COMPILE_NO_FLAGS,
+        );
+        keyboard.own = Some(
+            keymap.with_context(|| format!("xkbcommon cannot compile the layout {layout:?}"))?,
+        );
+        Ok(keyboard)
+    }
+
+    /// The keysym of the key with evdev `code`, with the modifiers in effect.
+    pub fn keysym(&self, code: u32) -> Option<xkb::Keysym> {
+        let xkb = self.xkb_state.as_ref()?;
+        Some(xkb.key_get_one_sym(xkb::Keycode::new(code + 8)))
+    }
+
     /// Act on the key with evdev `code`, pressed; returns whether it submitted the password.
     fn press(&self, entry: &mut Entry, code: u32) -> bool {
         let Some(xkb) = &self.xkb_state else {
@@ -48,6 +78,11 @@ impl Keyboard {
     /// Act on a `wl_keyboard` event for `entry`; returns whether it submitted the password.
     pub fn handle(&mut self, wl_event: wl_keyboard::Event, entry: &mut Entry) -> bool {
         match wl_event {
+            // The compositor's keymap is not compiled; its fd is closed when dropped.
+            wl_keyboard::Event::Keymap { .. } if let Some(own) = &self.own => {
+                self.xkb_state = Some(xkb::State::new(own));
+                entry.caps_lock = false;
+            }
             wl_keyboard::Event::Keymap {
                 format: WEnum::Value(KeymapFormat::XkbV1),
                 fd,

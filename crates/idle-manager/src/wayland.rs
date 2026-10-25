@@ -2,22 +2,17 @@ mod keyboard;
 mod lock;
 
 use std::collections::VecDeque;
-use std::io::ErrorKind;
 use std::mem;
-use std::os::fd::{AsFd, OwnedFd};
 
 use anyhow::{Context, bail};
 use smithay_client_toolkit::output::OutputState;
 use smithay_client_toolkit::registry::RegistryState;
-use tokio::io::unix::AsyncFd;
-use tokio::time::{self, Instant};
+use tokio::time::Instant;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, backend::WaylandError, delegate_noop,
-};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, delegate_noop};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
     Event, ExtIdleNotificationV1,
 };
@@ -32,17 +27,17 @@ use crate::policy::Input;
 use lock::Screen;
 use ui::config::LockScreen;
 use ui::entry::Entry;
+use ui::queue::Queue;
 use ui::wallpaper::Blurred;
 
 /// The daemon's connection to the compositor: idle notifications and the lock screen.
 pub struct Wayland {
-    queue: EventQueue<State>,
+    queue: Queue<State>,
     state: State,
     seat: WlSeat,
     notifier: ExtIdleNotifierV1,
     timeouts: Vec<Timeout>,
     notifications: Vec<ExtIdleNotificationV1>,
-    fd: AsyncFd<OwnedFd>,
 }
 
 pub enum Next {
@@ -84,10 +79,8 @@ impl Wayland {
                 .map(|config| Screen::new(&globals, &qh, config))
                 .transpose()?,
         };
-        let fd = conn.as_fd().try_clone_to_owned()?;
         let mut wayland = Self {
-            fd: AsyncFd::new(fd)?,
-            queue,
+            queue: Queue::new(&conn, queue)?,
             state,
             seat,
             notifier,
@@ -140,7 +133,7 @@ impl Wayland {
             bail!("there is no built-in lock screen to lock with");
         };
         screen.lock(&self.queue.handle())?;
-        self.flush()
+        self.queue.flush()
     }
 
     /// Unlock the built-in lock screen, or if the compositor has not locked yet, once it has.
@@ -160,14 +153,12 @@ impl Wayland {
     /// the compositor is gone. Cancel-safe: what has been dispatched stays queued.
     pub async fn next(&mut self) -> anyhow::Result<Next> {
         loop {
-            self.queue
-                .dispatch_pending(&mut self.state)
-                .context("dispatching Wayland events")?;
+            self.queue.dispatch(&mut self.state)?;
             if let Some(screen) = &mut self.state.lock_screen {
                 screen.redraw();
             }
             // Before returning, so that lock surfaces drawn while dispatching go out at once.
-            self.flush()?;
+            self.queue.flush()?;
             if let Some(screen) = &mut self.state.lock_screen {
                 screen.log_latencies();
                 // After the flush: rendering a new minute takes milliseconds, which must
@@ -182,34 +173,11 @@ impl Wayland {
             if let Some(input) = self.state.inputs.pop_front() {
                 return Ok(Next::Input(input));
             }
-            // Only the system backend returns None (events queued); dispatch_pending takes them.
-            let Some(guard) = self.queue.prepare_read() else {
-                continue;
-            };
             let wake = self.state.lock_screen.as_ref().map(Screen::next_wake);
-            let mut ready = tokio::select! {
-                ready = self.fd.readable() => ready.context("waiting for the Wayland compositor")?,
-                () = time::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
-                    if let Some(screen) = &mut self.state.lock_screen {
-                        screen.entry.tick(Instant::now());
-                    }
-                    continue;
-                }
-            };
-            match guard.read() {
-                Ok(_) => {}
-                Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
-                    ready.clear_ready();
-                }
-                Err(e) => return Err(e).context("reading from the Wayland compositor"),
+            let events = self.queue.wait(wake).await?;
+            if !events && let Some(screen) = &mut self.state.lock_screen {
+                screen.entry.tick(Instant::now());
             }
-        }
-    }
-
-    fn flush(&self) -> anyhow::Result<()> {
-        match self.queue.flush() {
-            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(()),
-            result => result.context("writing to the Wayland compositor"),
         }
     }
 }

@@ -88,6 +88,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import re, time
+    ${builtins.readFile ./screen.py}
 
     LOG = "${log}"
     CLIENT = "'^/nix/store/[^ ]*/bin/rust-wl-greeter-test-client'"
@@ -121,38 +122,6 @@ pkgs.testers.runNixOSTest {
     def settle():
         """Long enough for anything still on its way (QEMU holds a key 100 ms) to arrive."""
         time.sleep(0.5)
-
-    def input_events(*events):
-        assert machine.qmp_client is not None
-        machine.qmp_client.send("input-send-event", {"events": list(events)})  # type: ignore
-
-    def move(x, y):
-        """The pointer to (x, y) of the layout, through the absolute tablet."""
-        def scaled(v, size):
-            return round(v * 0x7fff / size)
-        input_events(
-            {"type": "abs", "data": {"axis": "x", "value": scaled(x, LAYOUT[0])}},
-            {"type": "abs", "data": {"axis": "y", "value": scaled(y, LAYOUT[1])}},
-        )
-
-    def click(x, y):
-        move(x, y)
-        for down in [True, False]:
-            input_events({"type": "btn", "data": {"down": down, "button": "left"}})
-
-    def screen_pixel(x, y, head=0):
-        """A pixel of an output (head 0: Virtual-1), from QEMU's screendump."""
-        path = machine.out_dir / "screen.ppm"
-        machine.send_monitor_command(f"screendump {path} gpu {head}")
-        data = path.read_bytes()
-        header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+\d+\s", data)
-        assert header is not None
-        i = header.end() + (y * int(header.group(1)) + x) * 3
-        return list(data[i:i + 3])
-
-    def wait_for_screen(check, what, x=512, y=384, head=0):
-        with machine.nested(f"waiting for {what} on the screen"):
-            retry(lambda _: check(screen_pixel(x, y, head)), 20)
 
     machine.start()
     machine.wait_for_unit("greetd.service")

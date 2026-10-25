@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::{Deref, DerefMut};
 
 use tracing::warn;
 use zeroize::Zeroize;
@@ -6,14 +7,53 @@ use zeroize::Zeroize;
 /// The most bytes of UTF-8 a password can have; typing past it is ignored.
 pub const CAPACITY: usize = 1024;
 
-/// Page-aligned, so that it fills exactly one page that `mlock` can pin.
+/// Page-aligned, so that `N` bytes (a multiple of the page size) fill whole pages that
+/// `mlock` can pin.
 #[repr(align(4096))]
-struct Page([u8; CAPACITY]);
+struct Pages<const N: usize>([u8; N]);
 
-/// A password as UTF-8, in one buffer that is allocated once, never moved or grown, kept
-/// out of swap, and wiped wherever the password shrinks. Not `Debug`.
+/// `N` bytes in pages of their own: allocated once, never moved or grown, kept out of swap,
+/// and wiped when dropped. For secrets; not `Debug`.
+pub struct Locked<const N: usize>(Box<Pages<N>>);
+
+impl<const N: usize> Locked<N> {
+    // Not `Default`: it mlocks pages.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        let pages = Box::new(Pages([0; N]));
+        // SAFETY: the range is the buffer's own memory, which lives as long as `pages`.
+        if unsafe { libc::mlock(pages.0.as_ptr().cast(), N) } != 0 {
+            let e = io::Error::last_os_error();
+            warn!("could not lock a secret's buffer in memory: {e}");
+        }
+        Self(pages)
+    }
+}
+
+impl<const N: usize> Deref for Locked<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &[u8; N] {
+        &self.0.0
+    }
+}
+
+impl<const N: usize> DerefMut for Locked<N> {
+    fn deref_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0.0
+    }
+}
+
+impl<const N: usize> Drop for Locked<N> {
+    fn drop(&mut self) {
+        self.0.0.zeroize();
+    }
+}
+
+/// A password as UTF-8, in one `Locked` page, wiped wherever the password shrinks.
+/// Not `Debug`.
 pub struct Password {
-    page: Box<Page>,
+    page: Locked<CAPACITY>,
     len: usize,
 }
 
@@ -21,17 +61,14 @@ impl Password {
     // Not `Default`: it mlocks a page.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let page = Box::new(Page([0; CAPACITY]));
-        // SAFETY: the range is the buffer's own memory, which lives as long as `page`.
-        if unsafe { libc::mlock(page.0.as_ptr().cast(), CAPACITY) } != 0 {
-            let e = io::Error::last_os_error();
-            warn!("could not lock the password buffer in memory: {e}");
+        Self {
+            page: Locked::new(),
+            len: 0,
         }
-        Self { page, len: 0 }
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.page.0[..self.len]
+        &self.page[..self.len]
     }
 
     pub fn chars(&self) -> usize {
@@ -41,28 +78,28 @@ impl Password {
     pub fn push(&mut self, c: char) {
         let end = self.len + c.len_utf8();
         if end <= CAPACITY {
-            c.encode_utf8(&mut self.page.0[self.len..end]);
+            c.encode_utf8(&mut self.page[self.len..end]);
             self.len = end;
         }
     }
 
     pub fn pop(&mut self) {
         if let Some(start) = self.last_start() {
-            self.page.0[start..self.len].zeroize();
+            self.page[start..self.len].zeroize();
             self.len = start;
         }
     }
 
     pub fn last(&self) -> Option<char> {
         let start = self.last_start()?;
-        str::from_utf8(&self.page.0[start..self.len])
+        str::from_utf8(&self.page[start..self.len])
             .ok()?
             .chars()
             .next()
     }
 
     pub fn wipe(&mut self) {
-        self.page.0.zeroize();
+        self.page.zeroize();
         self.len = 0;
     }
 
@@ -87,7 +124,7 @@ mod tests {
     use super::*;
 
     fn wiped(password: &Password) -> bool {
-        password.page.0.iter().all(|&b| b == 0)
+        password.page.iter().all(|&b| b == 0)
     }
 
     #[test]

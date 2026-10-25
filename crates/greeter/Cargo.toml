@@ -1,0 +1,24 @@
+[package]
+name = "rust-wl-greeter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cairo-rs = { version = "0.22", default-features = false }
+greetd_ipc = { version = "0.10.3", features = ["tokio-codec"] }
+knuffel.workspace = true
+libc.workspace = true
+# getpwnam_r, for the user's full name.
+nix = { version = "0.31", default-features = false, features = ["user"] }
+pango.workspace = true
+rust-wl-ui.workspace = true
+smithay-client-toolkit = { version = "0.21", default-features = false }
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+tracing-subscriber = "0.3"
+wayland-client.workspace = true
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+xkbcommon = { version = "0.8", default-features = false }
+zeroize.workspace = true

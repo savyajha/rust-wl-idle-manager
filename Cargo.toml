@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ui", "crates/idle-manager", "crates/greeter-compositor"]
+members = ["crates/ui", "crates/idle-manager", "crates/greeter-compositor", "crates/greeter"]
 resolver = "3"
 
 [workspace.package]

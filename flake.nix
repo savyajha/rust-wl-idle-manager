@@ -10,7 +10,11 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        inherit (self.packages.${system}) rust-wl-idle-manager rust-wl-greeter-compositor;
+        inherit (self.packages.${system})
+          rust-wl-idle-manager
+          rust-wl-greeter-compositor
+          rust-wl-greeter
+          ;
         greeterTestClient = pkgs.callPackage ./greeter-compositor.nix { testClient = true; };
         # Runs `command` on the source offline, with the package's vendored dependencies.
         cargoCheck =
@@ -24,7 +28,10 @@
               pkgs.pkg-config
             ]
             ++ tools;
-            buildInputs = rust-wl-idle-manager.buildInputs ++ rust-wl-greeter-compositor.buildInputs;
+            buildInputs =
+              rust-wl-idle-manager.buildInputs
+              ++ rust-wl-greeter-compositor.buildInputs
+              ++ rust-wl-greeter.buildInputs;
             buildPhase = command;
             installPhase = "touch $out";
             dontFixup = true;
@@ -34,6 +41,7 @@
         packages = rec {
           rust-wl-idle-manager = pkgs.callPackage ./package.nix { };
           rust-wl-greeter-compositor = pkgs.callPackage ./greeter-compositor.nix { };
+          rust-wl-greeter = pkgs.callPackage ./greeter.nix { };
           default = rust-wl-idle-manager;
         };
 
@@ -55,6 +63,8 @@
             compositor = rust-wl-greeter-compositor;
             testClient = greeterTestClient;
           };
+          # The greeter under greetd, through its NixOS module: logins, prompts, sessions.
+          greeter = import ./tests/greeter.nix { inherit pkgs; };
 
           fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --all --check";
           clippy = cargoCheck "clippy" [
@@ -67,6 +77,7 @@
           inputsFrom = [
             rust-wl-idle-manager
             rust-wl-greeter-compositor
+            rust-wl-greeter
           ];
           packages = with pkgs; [
             rust-analyzer
@@ -75,5 +86,9 @@
           ];
         };
       }
-    );
+    )
+    // {
+      # greetd's greeter: the compositor running the greeter (see greeter-module.nix).
+      nixosModules.greeter = ./greeter-module.nix;
+    };
 }

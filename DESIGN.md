@@ -7,15 +7,18 @@ holds sleep back until the session is locked. It locks with its own lock
 screen, or, if the config names a `locker`, by starting that program. This
 document records why it works the way it does.
 
-The code is a Cargo workspace of three crates. `crates/ui` (`rust-wl-ui`) is what
+The code is a Cargo workspace of four crates. `crates/ui` (`rust-wl-ui`) is what
 the lock screen draws and types with: the `lock-screen` layout and its
 validation, GTK's colours and font, the wallpaper, the drawing, the password
-entry and its `Password` buffer, and the keyboard's keymap and keys.
-`crates/idle-manager` is the daemon: the policy, logind, systemd, the
+entry and its `Password` buffer, the keyboard's keymap and keys, and the
+Wayland event queue on tokio and the two buffers per surface that frames are
+drawn in. `crates/idle-manager` is the daemon: the policy, logind, systemd, the
 authentication helper, the rest of the config, and the Wayland connection with
-the session lock. `crates/greeter-compositor` (`rust-wl-greeter-compositor`) is
-a separate program, a Wayland compositor for a greetd greeter; it shares no
-code with the other two and is described at the end.
+the session lock. `crates/greeter` (`rust-wl-greeter`) is a greetd greeter that
+looks like the lock screen and draws and types with `crates/ui` too.
+`crates/greeter-compositor` (`rust-wl-greeter-compositor`) is the Wayland
+compositor it runs on; it shares no code with the others. Both are described
+at the end.
 
 ## Idle detection
 
@@ -639,3 +642,134 @@ which also probes it, so the compositor's own probe is not covered),
 greetd's restart after the client exits, the exit time after SIGTERM, and that
 the binary links no EGL, GBM, Mesa or LLVM. The cursor plane is not covered:
 virtio-gpu hides it.
+
+## The greeter
+
+`rust-wl-greeter` logs one configured user in through greetd. greetd runs it on
+the greeter compositor, as the `greeter` user:
+
+```sh
+rust-wl-greeter-compositor [options] -- rust-wl-greeter --config PATH
+```
+
+The NixOS module `greeter-module.nix` (the flake's `nixosModules.greeter`) sets
+greetd's command to that, with the config written from its options and checked
+(`rust-wl-greeter --check PATH`, which loads it and compiles its keyboard
+layout) when the system is built. greetd connects a greeter's stdin, stdout and
+stderr to the VT, so the module runs both programs under `systemd-cat -t
+rust-wl-greeter`, which sends what they log to the journal.
+
+The config is KDL: `user` (who logs in), `sessions` (a directory of `.desktop`
+files), optionally `keyboard-layout` (an xkb layout the greeter compiles itself,
+instead of using the compositor's keymap; the compositor's modifiers are still
+used, as the eight real modifiers are the same in every keymap), and optionally
+`look`, which takes the lock screen's `lock-screen` widgets. Without a `look`,
+the lock screen's default is used with the avatar, name and field 100 pixels
+higher. There is no theme yet: GTK's built-in colours and "Sans".
+
+### The screen
+
+Each output gets a fullscreen `xdg_toplevel`. The login screen is on the output
+the compositor announced first (the lowest registry name), its primary one; the
+others show the background alone. The login screen is the lock screen's scene
+(the same `Painter`, at each output's preferred fractional scale, through a
+viewport) with the greeter's widgets drawn over it: a Log In button right of the
+field, a "‹ Users" chip left of it, a line under it for messages, and, with more
+than one session, a chip under that with the chosen session's name. The empty
+field shows greetd's prompt without its colon ("Password"); for a visible
+prompt, the field shows the answer as typed instead of a dot per character.
+What the login screen shows is a `View` (the entry's look, the prompt, the
+answer to a visible prompt, the message and the session); a surface is drawn
+again only when its view, size or scale changes, or the clock's minute, into
+one of at most two buffers, as the lock screen's are.
+
+A click on the session chip opens the session popup: an `xdg_popup` under the
+chip, with a grab, listing the sessions. Up and Down move its highlight, Enter
+or a click on a row chooses; Escape or a click outside it (handled by the
+compositor) dismisses it. A click on the Log In button submits like Enter; a
+click on "‹ Users", or Escape, gives up the login and starts it again (with one
+user, there is no chooser to go back to yet).
+
+### Logging in
+
+greetd's IPC is strictly one response per request. The conversation is a state
+machine, `Flow`, which does no I/O: fed greetd's responses and the user's
+answers, it says what to send and what to show. It sends `create_session` for
+the user; a `secret` or `visible` prompt waits for the user's answer; an `info`
+or `error` message (from PAM) is shown on the message line and answered with an
+empty response; `success` is answered with `start_session`, and its `success`
+ends the greeter, which exits at once (greetd starts the session only once the
+greeter has exited, and terminates it after 5 s). An `auth_error` in answer to
+the user's answer shows "Wrong password" and the field's failure outline (the
+lock screen's five-failure cooldown applies), and the session is cancelled and
+created again at once. Any other failure shows "Could not log in; try again",
+is not counted, and cancels the session too. One that follows no answer of the
+user's (greetd reports every PAM failure as `auth_error`, a locked account or
+`pam_nologin` included, before any prompt; or creating or starting the session
+failed) would come back at once, so then the session is created again only
+after 2 s.
+greetd's description of an error is never shown or logged: it may contain what
+was typed. Escape at a prompt cancels and starts again at once. An answer
+submitted before greetd's prompt has come (typed ahead at start-up, or during a
+pause) answers that prompt when it comes, if it is of the kind the field showed
+(a secret one at first, then the last prompt's); a prompt of the other kind
+discards what was typed, so that what was typed as a secret is never sent or
+shown as a visible answer. A failure discards an answer submitted ahead.
+Responses are read by a task of their own, so that the main loop can wait for
+the compositor and greetd at once.
+
+### Sessions
+
+Each `.desktop` file of the sessions directory is read as the Desktop Entry
+Specification has it: the `[Desktop Entry]` group's `Name`, `Exec` and
+`DesktopNames`, with its string escapes; a file with `Hidden` or `NoDisplay`
+set to `true` is skipped, and one without `Name` or a valid `Exec` is logged
+and skipped. `Exec` is split into arguments on spaces outside double quotes
+(within which a backslash escapes the next character), and its field codes
+(`%f`, `%U` and so on) are dropped. Sessions are sorted by name. greetd joins
+`start_session`'s command with spaces and runs it with `sh -c`, so each argument
+is sent in single quotes. The session's environment is `XDG_SESSION_TYPE=wayland`,
+`XDG_SESSION_DESKTOP` (the file's name without `.desktop`) and, if the file has
+`DesktopNames`, `XDG_CURRENT_DESKTOP` (those names, joined by colons).
+
+The session chosen is the user's last one, else the first by name. Once
+greetd has accepted `start_session`, it is written to
+`/var/lib/rust-wl-greeter/state` (a directory the NixOS module creates, owned
+by `greeter`), as KDL `session "user" "file.desktop"` lines, into a new file of
+mode 0600 (any left from before is removed first, and it is opened with
+`O_NOFOLLOW` and `O_EXCL`), which is then renamed over the old one, and the
+directory synced. A state file that cannot be read or parsed is logged and
+ignored. `--check` also loads the sessions, so a directory without any fails
+the system's build.
+
+### The password
+
+The typed answer is kept in the lock screen's `Entry` and `Password` (one
+locked page, wiped as the lock screen wipes it). greetd_ipc serialises a
+response from a `String` into a `Vec`, two copies that would stay unwiped in
+the heap, so the answer to a secret prompt is sent another way: its frame (the
+body's length in native byte order, then
+`{"type":"post_auth_message_response","response":"…"}`) is built in a second
+buffer of two locked pages, allocated once, straight from the password's bytes
+(`"` and `\` escaped with a backslash, control characters as `\u00XX`, the
+rest as they are), written to the socket from there, and the whole buffer is
+wiped; then the password is (by the guard `Entry::submission` hands it out in).
+A visible prompt's answer goes through greetd_ipc. The greeter makes itself
+non-dumpable at start-up. greetd runs PAM, as root, and its copies of the
+password are outside the greeter's reach.
+
+### Logging and tests
+
+It logs to stderr: the sessions and the one chosen, the user greeted, each
+output's first frame, each prompt's kind (never its answer), messages and
+failures by kind, cancels, the session popup, and the session started.
+
+`tests/greeter.nix` runs it through the NixOS module under greetd, in a VM with
+the compositor test's two outputs, with a PAM stack that asks a user with a
+TOTP secret for a visible verification code (pam_google_authenticator with
+`echo_verification_code` and `nullok`) before the password: a wrong password
+then the right one, Escape and the "‹ Users" chip, the Log In button, the
+session popup by keyboard and by click, the state file and the session
+remembered after greetd restarts, both prompts, the "de" keymap the greeter
+compiles, and that no password or code reaches the journal. Each session writes
+a marker of its arguments and environment.

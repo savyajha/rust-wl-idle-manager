@@ -12,7 +12,7 @@ use smithay_client_toolkit::session_lock::{
     SessionLock, SessionLockHandler, SessionLockState, SessionLockSurface,
     SessionLockSurfaceConfigure,
 };
-use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
+use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use tokio::time::Instant;
@@ -36,11 +36,9 @@ use crate::policy::Input;
 use ui::config::LockScreen;
 use ui::draw::{self, Layout, Painter, Scene};
 use ui::entry::{Entry, Look, Status};
+use ui::frames::{Frame, Frames};
 use ui::keyboard::Keyboard;
 use ui::wallpaper::Blurred;
-
-/// The most buffers an output's frames use: one the compositor shows, one to draw the next in.
-const BUFFERS: usize = 2;
 
 /// The built-in lock screen: its outputs, buffers, lock and keyboard.
 pub struct Screen {
@@ -87,20 +85,7 @@ struct Output {
 /// holds the first frame a lock shows, drawn ahead, so that a lock only attaches it.
 struct Prepared {
     scene: Scene,
-    buffers: Vec<Framebuffer>,
-}
-
-struct Framebuffer {
-    buffer: Buffer,
-    /// `None` once what it shows is out of date.
-    shows: Option<Look>,
-}
-
-#[derive(Debug, PartialEq)]
-enum Frame {
-    Reused(usize),
-    /// Drawn now; an index past the buffers is a new one.
-    Painted(usize),
+    frames: Frames<Look>,
 }
 
 struct Surface {
@@ -297,7 +282,7 @@ impl Screen {
             Ok(pool) => {
                 for output in &mut self.outputs {
                     if let Some(prepared) = &mut output.prepared {
-                        prepared.buffers.clear();
+                        prepared.frames.clear();
                     }
                 }
                 self.pool = pool;
@@ -333,9 +318,7 @@ impl Screen {
         let mut changed = false;
         for prepared in self.outputs.iter_mut().filter_map(|o| o.prepared.as_mut()) {
             if self.painter.refresh(&mut prepared.scene) {
-                for framebuffer in &mut prepared.buffers {
-                    framebuffer.shows = None;
-                }
+                prepared.frames.forget();
                 changed = true;
             }
         }
@@ -423,7 +406,7 @@ impl Screen {
         );
         output.prepared = Some(Prepared {
             scene,
-            buffers: Vec::new(),
+            frames: Frames::default(),
         });
         true
     }
@@ -441,28 +424,12 @@ impl Screen {
     /// A buffer of output `i` that shows `look`, drawn now unless one shows it already.
     fn frame_showing(&mut self, i: usize, look: Look) -> Option<Frame> {
         let prepared = self.outputs[i].prepared.as_mut()?;
-        let pool = &mut self.pool;
-        let shows: Vec<_> = prepared.buffers.iter().map(|b| b.shows).collect();
-        let released = |at: usize| prepared.buffers[at].buffer.canvas(pool).is_some();
-        let frame = choose_buffer(&shows, released, look)?;
-        let Frame::Painted(at) = frame else {
-            return Some(frame);
-        };
-        if at == prepared.buffers.len() {
-            let (width, height) = prepared.scene.layout.pixels;
-            let created = pool.create_buffer(width, height, width * 4, Format::Xrgb8888);
-            let (buffer, _) = created
-                .inspect_err(|e| error!("allocating a buffer for the lock screen: {e}"))
-                .ok()?;
-            prepared.buffers.push(Framebuffer {
-                buffer,
-                shows: None,
-            });
+        let pixels = prepared.scene.layout.pixels;
+        let frames = &mut prepared.frames;
+        let frame = frames.frame(&mut self.pool, pixels, Format::Xrgb8888, &look)?;
+        if let Frame::Painted(at) = frame {
+            prepared.scene.draw(frames.canvas(at, &mut self.pool), look);
         }
-        let framebuffer = &mut prepared.buffers[at];
-        let canvas = framebuffer.buffer.canvas(pool).expect("a released buffer");
-        prepared.scene.draw(canvas, look);
-        framebuffer.shows = Some(look);
         Some(frame)
     }
 
@@ -491,7 +458,7 @@ impl Screen {
         let (Frame::Reused(at) | Frame::Painted(at)) = frame;
         let layout = prepared.scene.layout;
         let wl_surface = surface.lock_surface.wl_surface();
-        if let Err(e) = prepared.buffers[at].buffer.attach_to(wl_surface) {
+        if let Err(e) = prepared.frames.attach(at, wl_surface, layout.pixels) {
             error!("drawing the lock screen: {e}");
             return;
         }
@@ -500,7 +467,6 @@ impl Screen {
             Some((_, viewport)) => viewport.set_destination(layout.logical.0, layout.logical.1),
             None => wl_surface.set_buffer_scale(layout.scale as i32 / 120),
         }
-        wl_surface.damage_buffer(0, 0, layout.pixels.0, layout.pixels.1);
         wl_surface.commit();
         if first {
             let how = match frame {
@@ -543,23 +509,6 @@ fn gtk_dir() -> Option<PathBuf> {
         warn!("neither XDG_CONFIG_HOME nor HOME is set; not reading gtk-4.0");
     }
     Some(config?.join("gtk-4.0"))
-}
-
-/// The buffer for a frame showing `look`: a released one that shows it already, else any
-/// released one, else a new one up to `BUFFERS`; `None` while the compositor holds them all.
-fn choose_buffer(
-    shows: &[Option<Look>],
-    mut released: impl FnMut(usize) -> bool,
-    look: Look,
-) -> Option<Frame> {
-    if let Some(at) = (0..shows.len()).find(|&at| shows[at] == Some(look) && released(at)) {
-        return Some(Frame::Reused(at));
-    }
-    match (0..shows.len()).find(|&at| released(at)) {
-        Some(at) => Some(Frame::Painted(at)),
-        None if shows.len() < BUFFERS => Some(Frame::Painted(shows.len())),
-        None => None,
-    }
 }
 
 impl SessionLockHandler for State {
@@ -685,45 +634,3 @@ impl ProvidesRegistryState for State {
 
 delegate_registry!(State);
 delegate_dispatch2!(State);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TYPING: Look = Look {
-        status: Status::Typing,
-        chars: 1,
-        caps_lock: false,
-    };
-    const MORE: Look = Look { chars: 2, ..TYPING };
-
-    #[test]
-    fn a_frame_reuses_a_released_buffer_that_shows_it() {
-        let shows = [Some(MORE), Some(TYPING)];
-        assert_eq!(
-            choose_buffer(&shows, |_| true, TYPING),
-            Some(Frame::Reused(1))
-        );
-        // One the compositor holds is painted over in the other.
-        assert_eq!(
-            choose_buffer(&shows, |at| at == 0, TYPING),
-            Some(Frame::Painted(0))
-        );
-    }
-
-    #[test]
-    fn a_second_buffer_is_added_then_frames_wait_for_a_release() {
-        assert_eq!(
-            choose_buffer(&[], |_| true, TYPING),
-            Some(Frame::Painted(0))
-        );
-        let shows = [Some(TYPING)];
-        assert_eq!(
-            choose_buffer(&shows, |_| false, MORE),
-            Some(Frame::Painted(1))
-        );
-        let shows = [Some(TYPING), Some(MORE)];
-        assert_eq!(choose_buffer(&shows, |_| false, MORE), None);
-        assert_eq!(choose_buffer(&shows, |_| false, TYPING), None);
-    }
-}

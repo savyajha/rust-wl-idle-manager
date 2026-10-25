@@ -1,11 +1,13 @@
 //! What the lock screen draws and types with: its layout, colours, wallpaper, drawing,
-//! password entry and keyboard.
+//! password entry and keyboard, and the Wayland queue and buffers it draws through.
 
 pub mod config;
 pub mod draw;
 pub mod entry;
+pub mod frames;
 pub mod keyboard;
 pub mod password;
+pub mod queue;
 pub mod theme;
 pub mod wallpaper;
 
