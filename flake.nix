@@ -65,6 +65,8 @@
           };
           # The greeter under greetd, through its NixOS module: logins, prompts, sessions.
           greeter = import ./tests/greeter.nix { inherit pkgs; };
+          # The greeter's indicator row: the keyboard-layout picker and the battery.
+          greeter-indicators = import ./tests/greeter-indicators.nix { inherit pkgs; };
 
           fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --all --check";
           clippy = cargoCheck "clippy" [

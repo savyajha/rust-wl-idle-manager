@@ -1,17 +1,20 @@
 //! The login screen: what it shows, the greeter's widgets (drawn over the lock screen's, or
-//! instead of its user, the avatar row), the focus ring, where they are for the pointer, and
-//! the session popup's list.
+//! instead of its user, the avatar row), the indicator row, the focus ring, where they are
+//! for the pointer, and the popups' lists.
 
 use cairo::{Context, Operator};
 use pango::Weight;
 use tokio::time::Instant;
+use tracing::error;
 use ui::draw::{self, Avatar, Font, Label, Layout, Painter, Rect, Scene};
 use ui::entry::{Entry, Look};
 use ui::keyboard::Keyboard;
 use ui::theme::Rgba;
 
+use crate::battery::Battery;
 use crate::chooser::{Chooser, Screen};
 use crate::focus::Widget;
+use crate::layouts::Layout as KeyboardLayout;
 use crate::sessions::Session;
 
 // In logical pixels. The Log In button and the "‹ Users" chip sit beside the field, the
@@ -41,6 +44,17 @@ const RING_WIDTH: f64 = 2.0;
 const RING_GAP: f64 = 2.0;
 const RING: Rgba = [1.0, 1.0, 1.0, 0.7];
 
+// The indicator row at the top right: 24 high, 8 from the top and 12 from the right edge,
+// its items 8 apart (the layout, then the battery, rightmost). With a popup the layout is a
+// chip like the session chip, else its text alone. DESIGN.md has this as the spec for the
+// desktop bar's right end.
+const INDICATOR_TOP: f64 = 8.0;
+const INDICATOR_RIGHT: f64 = 12.0;
+const INDICATOR_HEIGHT: f64 = 24.0;
+const INDICATOR_GAP: f64 = 8.0;
+/// The battery: a body 21 by 12, outlined 1 wide, with a nub 2 by 6.
+const BATTERY_WIDTH: f64 = 23.0;
+
 /// The field's hint for "Other…"'s user name.
 const USER_NAME: &str = "User name";
 
@@ -58,6 +72,11 @@ pub struct Login {
     /// The session to start, in `sessions`.
     pub chosen: usize,
     pub chooser: Chooser,
+    /// The layouts to choose from; none to type with the compositor's keymap.
+    pub layouts: Vec<KeyboardLayout>,
+    /// The one typed with, in `layouts`.
+    pub layout: usize,
+    pub battery: Option<Battery>,
 }
 
 /// greetd's prompt.
@@ -83,9 +102,32 @@ pub struct View {
     /// Whether the "‹ Users" chip is shown.
     users: bool,
     ring: Option<Widget>,
+    indicators: Indicators,
+}
+
+/// What the indicator row shows.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Indicators {
+    /// The layout's short name, if layouts are configured.
+    layout: Option<String>,
+    /// Whether the layout opens a popup: there is more than one.
+    picker: bool,
+    battery: Option<Battery>,
 }
 
 impl Login {
+    /// Type with layout `i` from now on; on a failure (`--check` compiled them all) the
+    /// old one stays.
+    pub fn set_layout(&mut self, i: usize) {
+        match self
+            .keyboard
+            .set_layout(&self.layouts[i].name, &mut self.entry)
+        {
+            Ok(()) => self.layout = i,
+            Err(e) => error!("{e:#}"),
+        }
+    }
+
     pub fn view(&self, now: Instant) -> View {
         let screen = &self.chooser.screen;
         let (secret, prompt) = match screen {
@@ -104,6 +146,14 @@ impl Login {
             row: (*screen == Screen::Row).then(|| self.chooser.names()),
             users: self.chooser.has_row(),
             ring: self.chooser.focus.ring(),
+            indicators: Indicators {
+                layout: self
+                    .layouts
+                    .get(self.layout)
+                    .map(|layout| layout.short.clone()),
+                picker: self.layouts.len() > 1,
+                battery: self.battery,
+            },
         }
     }
 }
@@ -144,6 +194,13 @@ pub struct Extras {
     /// While it is shown, instead of a user.
     row: Option<Row>,
     ring: Option<Widget>,
+    /// The frame's width.
+    width: f64,
+    indicators: Indicators,
+    /// The layout's chip, or with no popup its text alone.
+    layout_chip: Option<Button>,
+    /// Where the battery is.
+    battery: Option<Rect>,
 }
 
 impl Extras {
@@ -187,6 +244,10 @@ impl Extras {
             message: None,
             row: None,
             ring: None,
+            width: f64::from(scene.layout.pixels.0),
+            indicators: Indicators::default(),
+            layout_chip: None,
+            battery: None,
         }))
     }
 
@@ -229,8 +290,42 @@ impl Extras {
                 self.row = Some(self.render_row(painter, names)?);
             }
         }
+        if self.indicators != view.indicators {
+            self.render_indicators(painter, &view.indicators)?;
+        }
         self.users_shown = view.users;
         self.ring = view.ring;
+        Ok(())
+    }
+
+    /// Place the indicators, right to left from the top right corner.
+    fn render_indicators(
+        &mut self,
+        painter: &Painter,
+        indicators: &Indicators,
+    ) -> Result<(), cairo::Error> {
+        let f = self.factor;
+        let mut right = self.width - INDICATOR_RIGHT * f;
+        // The next item, `w` wide, left of the last.
+        let mut place = |w: f64| {
+            let y = INDICATOR_TOP * f;
+            let rect = whole(Rect {
+                x: right - w,
+                y,
+                w,
+                h: INDICATOR_HEIGHT * f,
+            });
+            right = rect.x - INDICATOR_GAP * f;
+            rect
+        };
+        self.battery = indicators.battery.map(|_| place(BATTERY_WIDTH * f));
+        self.layout_chip = None;
+        if let Some(text) = &indicators.layout {
+            let font = Font::new(draw::HINT_SIZE, Weight::Medium, WHITE);
+            let w = painter.label(text, &font, f, |_| (0.0, 0.0))?.size().0 + 2.0 * PADDING * f;
+            self.layout_chip = Some(button(painter, text, place(w), draw::FIELD, f)?);
+        }
+        self.indicators = indicators.clone();
         Ok(())
     }
 
@@ -288,6 +383,16 @@ impl Extras {
                 message.label.paint(cr, draw::HINT_ALPHA)?;
             }
         }
+        if let Some(chip) = &self.layout_chip {
+            if self.indicators.picker {
+                draw::rounded(cr, chip.rect, chip.rect.h / 2.0);
+                draw::frost(cr, chip.alpha, OUTLINE, f)?;
+            }
+            chip.label.paint(cr, 1.0)?;
+        }
+        if let (Some(rect), Some(battery)) = (self.battery, self.indicators.battery) {
+            paint_battery(cr, rect, battery, f)?;
+        }
         // Round every widget's shape, a field's or a chip's or an avatar's.
         if let Some(rect) = self.ring.and_then(|widget| self.place(widget)) {
             let out = (RING_GAP + RING_WIDTH / 2.0) * f;
@@ -306,8 +411,12 @@ impl Extras {
     }
 
     /// Where `widget` is, in physical pixels, if it is shown.
-    fn place(&self, widget: Widget) -> Option<Rect> {
+    pub fn place(&self, widget: Widget) -> Option<Rect> {
         match (widget, &self.row) {
+            (Widget::Layout, _) => {
+                let chip = self.layout_chip.as_ref().filter(|_| self.indicators.picker);
+                chip.map(|chip| chip.rect)
+            }
             (Widget::Avatar(i), Some(row)) => row.avatars.get(i).map(Avatar::square),
             (_, Some(_)) | (Widget::Avatar(_), None) => None,
             (Widget::Pill, None) => Some(self.pill),
@@ -323,15 +432,56 @@ impl Extras {
             (rect.x..rect.x + rect.w).contains(&x) && (rect.y..rect.y + rect.h).contains(&y)
         };
         let avatars = self.row.as_ref().map_or(0, |row| row.avatars.len());
-        let buttons = [Widget::LogIn, Widget::Users, Widget::Session];
+        let buttons = [
+            Widget::LogIn,
+            Widget::Users,
+            Widget::Session,
+            Widget::Layout,
+        ];
         let mut widgets = (0..avatars).map(Widget::Avatar).chain(buttons);
         widgets.find(|&widget| self.place(widget).is_some_and(inside))
     }
+}
 
-    /// The session chip, in physical pixels.
-    pub fn session_chip(&self) -> Option<Rect> {
-        self.session.as_ref().map(|session| session.rect)
+/// Draw `battery` in `rect`, a `BATTERY_WIDTH` wide box, at `f` physical pixels per logical
+/// one: an outline with a nub, filled as far as its level, and a bolt on mains.
+fn paint_battery(cr: &Context, rect: Rect, battery: Battery, f: f64) -> Result<(), cairo::Error> {
+    // Whole pixels at scale 1 (fills on them, strokes centred half a pixel in).
+    let (x, top) = (rect.x, rect.center().1.round() - 6.0 * f);
+    draw::set_color(cr, WHITE);
+    let outline = Rect {
+        x: x + 0.5 * f,
+        y: top + 0.5 * f,
+        w: 20.0 * f,
+        h: 11.0 * f,
+    };
+    draw::rounded(cr, outline, 2.0 * f);
+    cr.set_line_width(f);
+    cr.stroke()?;
+    cr.rectangle(x + 21.0 * f, top + 3.0 * f, 2.0 * f, 6.0 * f);
+    let level = (17.0 * f * f64::from(battery.percent) / 100.0).round();
+    cr.rectangle(x + 2.0 * f, top + 2.0 * f, level, 8.0 * f);
+    cr.fill()?;
+    if battery.charging {
+        // A bolt across the body, outlined dark to show over the level and past it.
+        let (center, middle) = (x + 10.5 * f, top + 6.0 * f);
+        let points = [
+            (1.5, -6.0),
+            (-3.0, 1.0),
+            (-0.3, 1.0),
+            (-1.5, 6.0),
+            (3.0, -1.0),
+            (0.3, -1.0),
+        ];
+        for (dx, dy) in points {
+            cr.line_to(center + dx * f, middle + dy * f);
+        }
+        cr.close_path();
+        cr.fill_preserve()?;
+        draw::set_color(cr, POPUP_FILL);
+        cr.stroke()?;
     }
+    Ok(())
 }
 
 /// `text` centred in a frosted `rect` filled with white at `alpha`.
@@ -365,29 +515,29 @@ fn whole(rect: Rect) -> Rect {
     }
 }
 
-/// The session popup's rows, rendered at its parent's scale.
-pub struct SessionList {
+/// A popup's rows, rendered at its parent's scale.
+pub struct PopupList {
     /// The popup's size, in logical pixels.
     pub size: (i32, i32),
     factor: f64,
     rows: Vec<Label>,
 }
 
-impl SessionList {
-    pub fn new(painter: &Painter, sessions: &[Session], factor: f64) -> Result<Self, cairo::Error> {
+impl PopupList {
+    pub fn new(painter: &Painter, names: &[&str], factor: f64) -> Result<Self, cairo::Error> {
         let font = Font::new(draw::HINT_SIZE, Weight::Normal, WHITE);
         let mut rows = Vec::new();
         let mut width = POPUP_MIN_WIDTH;
-        for (i, session) in sessions.iter().enumerate() {
+        for (i, name) in names.iter().enumerate() {
             let top = (POPUP_PADDING + ROW_HEIGHT * i as f64) * factor;
-            let label = painter.label(&session.name, &font, factor, |(_, h)| {
+            let label = painter.label(name, &font, factor, |(_, h)| {
                 let x = (POPUP_PADDING + PADDING) * factor;
                 (x.round(), (top + (ROW_HEIGHT * factor - h) / 2.0).round())
             })?;
             width = width.max(label.size().0 / factor + 2.0 * (POPUP_PADDING + PADDING));
             rows.push(label);
         }
-        let height = ROW_HEIGHT * sessions.len() as f64 + 2.0 * POPUP_PADDING;
+        let height = ROW_HEIGHT * names.len() as f64 + 2.0 * POPUP_PADDING;
         Ok(Self {
             size: (width.ceil() as i32, height.ceil() as i32),
             factor,
@@ -434,6 +584,10 @@ impl SessionList {
         })
     }
 
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
     /// The row at logical `y`.
     pub fn row_at(&self, y: f64) -> Option<usize> {
         row_at(y, self.rows.len())
@@ -475,7 +629,10 @@ mod tests {
             message: None,
             sessions: sessions.iter().map(|name| session(name)).collect(),
             chosen: sessions.len().saturating_sub(1),
-            chooser: Chooser::new(users.collect(), None, sessions.len() > 1),
+            chooser: Chooser::new(users.collect(), None, sessions.len() > 1, false),
+            layouts: Vec::new(),
+            layout: 0,
+            battery: None,
         }
     }
 
@@ -520,5 +677,34 @@ mod tests {
         assert_eq!(row_at(31.9, 2), Some(0));
         assert_eq!(row_at(32.0, 2), Some(1));
         assert_eq!(row_at(60.0, 2), None);
+    }
+
+    #[test]
+    fn the_indicators_show_the_layout_and_the_battery() {
+        let now = Instant::now();
+        let mut login = login(&["Alice"], &["A"], true, "");
+        assert_eq!(login.view(now).indicators, Indicators::default());
+        let names = ["de".to_owned(), "us(dvorak)".to_owned()];
+        login.layouts = crate::layouts::new(&names);
+        login.layout = 1;
+        let battery = Battery {
+            percent: 5,
+            charging: false,
+        };
+        login.battery = Some(battery);
+        let indicators = login.view(now).indicators;
+        assert_eq!(indicators.layout.as_deref(), Some("US"));
+        assert_eq!(
+            (indicators.picker, indicators.battery),
+            (true, Some(battery))
+        );
+        // One layout: its name, but no popup.
+        login.layouts.pop();
+        login.layout = 0;
+        let indicators = login.view(now).indicators;
+        assert_eq!(
+            (indicators.layout.as_deref(), indicators.picker),
+            (Some("DE"), false)
+        );
     }
 }

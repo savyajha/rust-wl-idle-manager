@@ -1,6 +1,7 @@
-//! What the greeter remembers from one login to the next: the last user and each user's
-//! last session, in a small KDL file of a `last-user "user"` line and `session "user"
-//! "file.desktop"` lines. The last user can be taken from tuigreet's, once.
+//! What the greeter remembers from one login to the next: the last user, and each user's
+//! last session and keyboard layout, in a small KDL file of a `last-user "user"` line,
+//! `session "user" "file.desktop"` and `layout "user" "de"` lines. The last user can be
+//! taken from tuigreet's, once.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
@@ -22,15 +23,17 @@ pub struct State {
     last_user: Option<String>,
     #[knuffel(children(name = "session"))]
     sessions: Vec<Remembered>,
+    #[knuffel(children(name = "layout"))]
+    layouts: Vec<Remembered>,
 }
 
+/// A user's last session (its file name) or layout.
 #[derive(knuffel::Decode, Debug, PartialEq)]
 struct Remembered {
     #[knuffel(argument)]
     user: String,
-    /// The session's file name.
     #[knuffel(argument)]
-    file: String,
+    value: String,
 }
 
 impl State {
@@ -103,16 +106,20 @@ impl State {
 
     /// The file name of `user`'s last session.
     pub fn session(&self, user: &str) -> Option<&str> {
-        let remembered = self.sessions.iter().find(|r| r.user == user)?;
-        Some(&remembered.file)
+        find(&self.sessions, user)
     }
 
     pub fn set_session(&mut self, user: &str, file: &str) {
-        self.sessions.retain(|r| r.user != user);
-        self.sessions.push(Remembered {
-            user: user.to_owned(),
-            file: file.to_owned(),
-        });
+        set(&mut self.sessions, user, file);
+    }
+
+    /// The layout `user` last logged in with.
+    pub fn layout(&self, user: &str) -> Option<&str> {
+        find(&self.layouts, user)
+    }
+
+    pub fn set_layout(&mut self, user: &str, layout: &str) {
+        set(&mut self.layouts, user, layout);
     }
 
     /// Write the state to `path` (mode 0600), replacing it at once: written to a new file
@@ -122,8 +129,10 @@ impl State {
         if let Some(user) = &self.last_user {
             text += &format!("last-user {}\n", quote(user));
         }
-        for Remembered { user, file } in &self.sessions {
-            text += &format!("session {} {}\n", quote(user), quote(file));
+        for (kind, remembered) in [("session", &self.sessions), ("layout", &self.layouts)] {
+            for Remembered { user, value } in remembered {
+                text += &format!("{kind} {} {}\n", quote(user), quote(value));
+            }
         }
         let temporary = path.with_extension("new");
         match fs::remove_file(&temporary) {
@@ -149,6 +158,19 @@ impl State {
             .and_then(|dir| dir.sync_all())
             .with_context(|| format!("syncing {}", dir.display()))
     }
+}
+
+fn find<'a>(remembered: &'a [Remembered], user: &str) -> Option<&'a str> {
+    let found = remembered.iter().find(|r| r.user == user)?;
+    Some(&found.value)
+}
+
+fn set(remembered: &mut Vec<Remembered>, user: &str, value: &str) {
+    remembered.retain(|r| r.user != user);
+    remembered.push(Remembered {
+        user: user.to_owned(),
+        value: value.to_owned(),
+    });
 }
 
 /// `text` as a KDL string.
@@ -182,6 +204,9 @@ mod tests {
         state.set_session("alice", "niri.desktop");
         state.set_session("bob", "odd \"name\" \\ é\n.desktop");
         state.set_session("alice", "sway.desktop");
+        state.set_layout("alice", "us");
+        state.set_layout("bob", "de(nodeadkeys)");
+        state.set_layout("alice", "us(dvorak)");
         state.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         let first =
@@ -192,6 +217,14 @@ mod tests {
         assert_eq!(loaded.session("alice"), Some("sway.desktop"));
         assert_eq!(loaded.session("carol"), None);
         assert_eq!(loaded.last_user(), Some("alice"));
+        assert!(
+            text.ends_with("layout \"bob\" \"de(nodeadkeys)\"\nlayout \"alice\" \"us(dvorak)\"\n")
+        );
+        assert_eq!(loaded.layout("alice"), Some("us(dvorak)"));
+        assert_eq!(
+            (loaded.layout("carol"), loaded.session("bob").is_some()),
+            (None, true)
+        );
         let mode = fs::metadata(&path).unwrap().permissions();
         assert_eq!(
             std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,

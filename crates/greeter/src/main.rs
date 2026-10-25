@@ -5,11 +5,13 @@
 //! through greetd's prompts (flow.rs); it exits once greetd has the chosen session to start.
 //! `--check <path>` validates a config.
 
+mod battery;
 mod chooser;
 mod config;
 mod flow;
 mod focus;
 mod greetd;
+mod layouts;
 mod login;
 mod sessions;
 mod state;
@@ -26,6 +28,7 @@ use std::time::Duration;
 use anyhow::Context;
 use greetd_ipc as ipc;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
@@ -99,19 +102,30 @@ fn main() -> ExitCode {
     }
 }
 
-/// Load the config at `path` as `greet` would, with its sessions and keyboard layout.
+/// Load the config at `path` as `greet` would, with its sessions and keyboard layouts.
 fn check(path: &Path) -> anyhow::Result<()> {
     let config = Config::load(path)?;
     sessions::load(&config.sessions)?;
-    if let Some(layout) = &config.keyboard_layout {
+    for layout in &config.keyboard_layouts {
         Keyboard::with_layout(layout)?;
     }
     info!("{} is valid", path.display());
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn greet(path: &Path) -> anyhow::Result<()> {
+fn greet(path: &Path) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio")?;
+    let greeted = runtime.block_on(greet_on(path));
+    // Not waiting for a task blocked on a hung system bus: greetd starts the session only
+    // once the greeter has exited.
+    runtime.shutdown_background();
+    greeted
+}
+
+async fn greet_on(path: &Path) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
     let config = Config::load(path)?;
     let sessions = sessions::load(&config.sessions)?;
@@ -126,12 +140,14 @@ async fn greet(path: &Path) -> anyhow::Result<()> {
         };
         info!("last user {last} ({how})");
     }
-    let session_chip = sessions.len() > 1;
-    let chooser = Chooser::new(users, state.last_user(), session_chip);
-    let keyboard = match &config.keyboard_layout {
-        Some(layout) => Keyboard::with_layout(layout)?,
+    let layouts = layouts::new(&config.keyboard_layouts);
+    let keyboard = match layouts.first() {
+        Some(first) => Keyboard::with_layout(&first.name)?,
         None => Keyboard::default(),
     };
+    let session_chip = sessions.len() > 1;
+    let layout_chip = layouts.len() > 1;
+    let chooser = Chooser::new(users, state.last_user(), session_chip, layout_chip);
     let login = Login {
         entry: Entry::new(),
         keyboard,
@@ -143,12 +159,19 @@ async fn greet(path: &Path) -> anyhow::Result<()> {
         sessions,
         chosen: 0,
         chooser,
+        layouts,
+        layout: 0,
+        battery: None,
     };
     // No theme yet: GTK's built-in colours and font. The name is set with the user.
     let painter = Painter::new(config.look, None, String::new());
+    let wayland = Wayland::connect(login, painter)?;
+    // Alongside the rest: a slow bus or a missing UPower holds up nothing.
+    let (battery_sender, mut batteries) = mpsc::channel(1);
+    tokio::spawn(battery::watch(battery_sender));
     let mut greeter = Greeter {
         user: String::new(),
-        wayland: Wayland::connect(login, painter)?,
+        wayland,
         greetd: Greetd::connect().await?,
         flow: Flow::new(),
         state,
@@ -169,6 +192,10 @@ async fn greet(path: &Path) -> anyhow::Result<()> {
             biased;
             event = greeter.wayland.next() => greeter.event(event?),
             response = greeter.greetd.receive() => greeter.flow.handle(response?),
+            Some(battery) = batteries.recv() => {
+                greeter.wayland.login().battery = battery;
+                Step::default()
+            }
             () = time::sleep_until(retry_at), if greeter.retry_at.is_some() => {
                 greeter.retry_at = None;
                 greeter.flow.retry()
@@ -251,6 +278,12 @@ impl Greeter {
     fn begin(&mut self, user: User) -> Step {
         let login = self.wayland.login();
         login.chosen = sessions::preselect(&login.sessions, self.state.session(&user.name));
+        let layout =
+            layouts::preselect(&login.layouts, self.state.layout(&user.name), login.layout);
+        if layout != login.layout {
+            login.set_layout(layout);
+            info!("layout {} (remembered)", login.layouts[login.layout].name);
+        }
         login.prompt = Prompt {
             secret: true,
             text: String::new(),
@@ -302,6 +335,9 @@ impl Greeter {
                 let session = &login.sessions[started.session];
                 self.state.set_last_user(&started.user);
                 self.state.set_session(&started.user, &session.file);
+                if let Some(layout) = login.layouts.get(login.layout) {
+                    self.state.set_layout(&started.user, &layout.name);
+                }
                 if let Err(e) = self.state.save(Path::new(STATE)) {
                     warn!("not remembering the session: {e:#}");
                 }

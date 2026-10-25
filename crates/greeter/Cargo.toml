@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 cairo-rs = { version = "0.22", default-features = false }
+futures-lite = { version = "2", default-features = false }
 greetd_ipc = { version = "0.10.3", features = ["tokio-codec"] }
 knuffel.workspace = true
 libc.workspace = true
@@ -19,4 +20,6 @@ tracing-subscriber = "0.3"
 wayland-client.workspace = true
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 xkbcommon = { version = "0.8", default-features = false }
+# The battery, from UPower.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 zeroize.workspace = true

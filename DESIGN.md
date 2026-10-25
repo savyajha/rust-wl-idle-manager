@@ -660,10 +660,9 @@ stderr to the VT, so the module runs both programs under `systemd-cat -t
 rust-wl-greeter`, which sends what they log to the journal.
 
 The config is KDL: `sessions` (a directory of `.desktop` files), optionally
-`keyboard-layout` (an xkb layout the greeter compiles itself,
-instead of using the compositor's keymap; the compositor's modifiers are still
-used, as the eight real modifiers are the same in every keymap), and optionally
-`look`, which takes the lock screen's `lock-screen` widgets. Without a `look`,
+`keyboard-layouts` (xkb layouts to choose from, which the greeter compiles
+itself instead of using the compositor's keymap; see Keyboard layouts), and
+optionally `look`, which takes the lock screen's `lock-screen` widgets. Without a `look`,
 the lock screen's default is used with the avatar, name and field 100 pixels
 higher. There is no theme yet: GTK's built-in colours and "Sans".
 
@@ -729,8 +728,75 @@ Escape is the compositor's for the popup, which it dismisses, and otherwise
 cancels. A ring two pixels wide, white at 0.7 (brighter than the widgets'
 outlines), two pixels out, shows the focus once a key has moved it, until a
 click (which focuses what it hits, without the ring). The logic is `focus.rs`
-and `chooser.rs`, which do no I/O. In the session popup, Space chooses as Enter
+and `chooser.rs`, which do no I/O. In a popup, Space chooses as Enter
 does.
+
+### Keyboard layouts
+
+`keyboard-layouts "us" "de(nodeadkeys)"` lists the layouts to choose from, each
+`layout` or `layout(variant)` (names of letters, digits, `_` and `-`), compiled
+with xkb's default rules and model. Without it the greeter types with the
+compositor's keymap. With them it starts on the first; `--check` compiles each.
+Each has a short name for the indicator: xkbcommon has none (they are in
+xkeyboard-config's `evdev.xml`, which is not read), so it is the layout without
+its variant in capitals, numbered from 2 where it repeats (`us`, `us(dvorak)`:
+US, US2). With one layout the indicator is that name alone; with more it is a
+chip like the session chip, which opens a popup of the layouts (as configured)
+and joins the keyboard focus, last.
+
+With a layout of its own the greeter follows the modifiers from the keys it is
+sent, by its own keymap, and not the compositor's modifier masks: those say
+which of the compositor's keymap's modifiers are held, and its keys differ (the
+right Alt is Alt in "us", AltGr in "de", so AltGr+Q would be Alt+Q, a shortcut
+the field ignores, instead of "@"). So a Caps Lock or Num Lock locked before the
+greeter started is not known; one locked in the greeter is kept when the layout
+changes, and so are the keys held then (pressed again in the new keymap). Held
+keys are forgotten when the keyboard leaves the surface. Every key pressed
+counts for the modifiers, also one that goes to a popup or the focus.
+
+Choosing a user switches to the layout they last logged in with, if it is still
+configured; otherwise the layout stays as it was, so one chosen before the user
+(on the row, or for "Other…"'s name) carries on. A layout changes only what keys
+type from then on: what is typed, or submitted ahead, stays as it was typed
+(and is wiped when the user goes back, as anything typed is). Characters typed
+in the same burst as the Enter that chose the user are not typed at all (the
+row has no field, and the user name's field is checking its answer); only the
+keys held then carry over, as above. The layout in use
+when the session starts is remembered for the user, as `layout "user" "de"`. It
+is not carried into the session, whose compositor has its own.
+
+### Indicators
+
+The indicator row is at the top right of the login screen's output, on every
+screen (the row, a login, the user name). It is the specification the desktop
+bar's right end follows, so that the lock screen, the greeter and the desktop
+look like one system:
+
+- 24 pixels high (logical), 8 from the top of the screen, ending 12 from its
+  right edge; its items 8 apart, right to left: the battery (rightmost), then
+  the keyboard layout.
+- Text: the theme's font at 13 pixels, medium weight, white.
+- A clickable item is a chip: rounded at half its height, 12 pixels between its
+  text and its ends, frosted as the session chip (white at 0.2, with the field's
+  outline); one that is not is its text alone.
+- The battery, 23 pixels wide, centred on the row's middle: a body 21 by 12
+  outlined 1 pixel wide inside its edge (rounded 2), and a nub 2 by 6 on its
+  right, centred; inside the body, 2 pixels from its edge (1 from the outline),
+  a bar 8 high as long as the charge (17 pixels at 100 %, rounded to whole
+  pixels). All white; on mains power (charging, fully charged, or about to
+  charge), a white bolt across it, outlined in the popups' dark colour so that it
+  shows over the bar and past it. At scale 1 every edge is on a whole pixel. It
+  is not clickable or focusable.
+
+The battery is UPower's `DisplayDevice` (all batteries as one): `IsPresent`,
+`Percentage` and `State`, read over the system bus with zbus by a task of its
+own, started with the login screen, so the first frame never waits for the
+bus. It is read (one `GetAll`) again on each `PropertiesChanged`, and each time
+UPower's name changes owner (it stopped, or started), after listening for both
+so that no change is missed. With no battery, or while UPower is not running
+(and the bus cannot start it), none is shown; without a system bus, none ever.
+The greeter's runtime does not wait for that task when it exits, so a hung bus
+never holds up the session.
 
 ### The screen
 
@@ -832,7 +898,8 @@ It logs to stderr: the users listed and the last user (and whether it came
 from tuigreet), the sessions and the one chosen, the user greeted, going back to
 the row and "Other…", each
 output's first frame, each prompt's kind (never its answer), messages and
-failures by kind, cancels, the session popup, and the session started.
+failures by kind, cancels, the popups, the layouts and the layout chosen, the
+battery's level, and the session started.
 
 `tests/greeter.nix` runs it through the NixOS module under greetd, in a VM with
 the compositor test's two outputs, with a PAM stack that asks a user with a
@@ -845,4 +912,13 @@ compiles, and that no password or code reaches the journal; the focus ring and
 keys; then, with users added, the avatar row, the last user and each user's
 session after a restart, going back to the row, "Other…" for an unlisted user,
 and seeding from tuigreet's last user. Each session writes
-a marker of its arguments and environment.
+a marker of its arguments and environment. It has one layout, whose label opens
+nothing, and no UPower.
+
+`tests/greeter-indicators.nix` has three layouts, "de", "us" and "us(dvorak)",
+on one output: the popup by keyboard and by click, what each layout types into
+"Other…"'s visible field (and AltGr under "de"), the layout remembered for a
+user, and the battery from a fake UPower, checked by the indicator row's pixels:
+none without UPower; then, in one running greeter, shown when the fake starts,
+redrawn when it charges, hidden when it stops (the bus cannot start another),
+shown when it starts again, and hidden when no battery is present.

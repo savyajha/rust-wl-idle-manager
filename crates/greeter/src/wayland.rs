@@ -1,6 +1,6 @@
 //! The connection to the greeter's compositor: a fullscreen toplevel on each output, with the
 //! login screen on the primary one (the first the compositor announced) and the background
-//! alone on the others; the session popup; the keyboard and the pointer.
+//! alone on the others; the session and layout popups; the keyboard and the pointer.
 
 use std::collections::VecDeque;
 use std::mem;
@@ -40,7 +40,7 @@ use wayland_protocols::xdg::shell::client::xdg_positioner::{
 use xkbcommon::xkb::Keysym;
 
 use crate::focus::{self, Action, Widget};
-use crate::login::{self, Extras, Login, SessionList, View};
+use crate::login::{self, Extras, Login, PopupList, View};
 use ui::draw::{self, Layout, Painter, Scene};
 use ui::entry::{Key, Status};
 use ui::frames::{Frame, Frames};
@@ -80,7 +80,7 @@ struct State {
     serial: u32,
     painter: Painter,
     toplevels: Vec<Toplevel>,
-    popup: Option<SessionPopup>,
+    popup: Option<ListPopup>,
     login: Login,
     /// The minute the clocks were last rendered for.
     minute: i64,
@@ -116,16 +116,28 @@ struct Prepared {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Shown {
-    Login(View),
+    Login(Box<View>),
     Background,
 }
 
-struct SessionPopup {
+/// The session or layout popup.
+struct ListPopup {
+    /// The chip it opened from: `Widget::Session` or `Widget::Layout`.
+    picker: Widget,
     /// Showing the row highlighted.
     surface: Surface<usize>,
     popup: Popup,
-    list: SessionList,
+    list: PopupList,
     selected: usize,
+}
+
+/// What `picker`'s popup is called in the log.
+fn name(picker: Widget) -> &'static str {
+    if picker == Widget::Session {
+        "session"
+    } else {
+        "layout"
+    }
 }
 
 /// A surface the greeter draws on: its viewport, logical size and scale, its buffers, and
@@ -310,7 +322,7 @@ impl State {
         let login = self.login_toplevel();
         for i in 0..self.toplevels.len() {
             let shows = if Some(i) == login {
-                Shown::Login(view.clone())
+                Shown::Login(Box::new(view.clone()))
             } else {
                 Shown::Background
             };
@@ -390,7 +402,8 @@ impl State {
 
     fn draw_popup(&mut self) {
         let State { popup, pool, .. } = self;
-        let Some(SessionPopup {
+        let Some(ListPopup {
+            picker,
             surface,
             popup,
             list,
@@ -403,17 +416,17 @@ impl State {
         let layout = Layout::new(size, surface.scale, None);
         let paint = |canvas: &mut [u8]| {
             if let Err(e) = list.draw(canvas, layout, *selected) {
-                error!("drawing the session popup: {e}");
+                error!("drawing the {} popup: {e}", name(*picker));
             }
         };
         let wl = popup.wl_surface();
         if surface.draw(wl, pool, layout, Format::Argb8888, *selected, paint) {
-            info!("session popup shown");
+            info!("{} popup shown", name(*picker));
         }
     }
 
-    /// Open the session popup under the session chip, if there is one.
-    fn open_popup(&mut self, qh: &QueueHandle<Self>) -> anyhow::Result<()> {
+    /// Open `picker`'s popup (the session chip's or the layout's) under it, if it is shown.
+    fn open_popup(&mut self, picker: Widget, qh: &QueueHandle<Self>) -> anyhow::Result<()> {
         let Some(i) = self.login_toplevel().filter(|_| self.popup.is_none()) else {
             return Ok(());
         };
@@ -421,12 +434,26 @@ impl State {
         let Some(prepared) = &toplevel.prepared else {
             return Ok(());
         };
-        let Some(chip) = prepared.extras.as_ref().and_then(Extras::session_chip) else {
+        let Some(chip) = prepared
+            .extras
+            .as_ref()
+            .and_then(|extras| extras.place(picker))
+        else {
             return Ok(());
         };
         let layout = prepared.scene.layout;
         let f = layout.factor();
-        let list = SessionList::new(&self.painter, &self.login.sessions, f)?;
+        let login = &self.login;
+        let (names, selected): (Vec<_>, _) = if picker == Widget::Session {
+            let names = login.sessions.iter().map(|s| &*s.name);
+            (names.collect(), login.chosen)
+        } else {
+            (
+                login.layouts.iter().map(|l| &*l.name).collect(),
+                login.layout,
+            )
+        };
+        let list = PopupList::new(&self.painter, &names, f)?;
         let positioner = XdgPositioner::new(&self.xdg_shell)?;
         positioner.set_size(list.size.0, list.size.1);
         let logical = |v: f64| (v / f).round() as i32;
@@ -444,19 +471,29 @@ impl State {
         let popup = Popup::from_surface(parent, &positioner, qh, surface, &self.xdg_shell)?;
         popup.xdg_popup().grab(&self.seat, self.serial);
         popup.wl_surface().commit();
-        self.popup = Some(SessionPopup {
+        self.popup = Some(ListPopup {
+            picker,
             surface: Surface::new(viewport, layout.scale),
             popup,
             list,
-            selected: self.login.chosen,
+            selected,
         });
         Ok(())
     }
 
-    fn choose(&mut self, session: usize) {
-        self.popup = None;
-        self.login.chosen = session;
-        info!("session {} chosen", self.login.sessions[session].name);
+    /// Row `i` of the popup was chosen; it closes.
+    fn choose(&mut self, i: usize) {
+        let Some(popup) = self.popup.take() else {
+            return;
+        };
+        let login = &mut self.login;
+        if popup.picker == Widget::Session {
+            login.chosen = i;
+            info!("session {} chosen", login.sessions[i].name);
+        } else {
+            login.set_layout(i);
+            info!("layout {} chosen", login.layouts[login.layout].name);
+        }
     }
 
     fn click(&mut self, qh: &QueueHandle<Self>) {
@@ -493,9 +530,9 @@ impl State {
             Widget::Avatar(i) => self.events.push_back(Event::Choose(i)),
             Widget::Pill => {}
             Widget::Users => self.events.push_back(Event::Cancel),
-            Widget::Session => {
-                if let Err(e) = self.open_popup(qh) {
-                    error!("opening the session popup: {e:#}");
+            Widget::Session | Widget::Layout => {
+                if let Err(e) = self.open_popup(widget, qh) {
+                    error!("opening the {} popup: {e:#}", name(widget));
                 }
             }
             // As Enter in the field; the "key" is the button, which does not repeat.
@@ -507,11 +544,44 @@ impl State {
         }
     }
 
-    /// Act on a key pressed while the session popup is open: arrows move, Enter or Space
-    /// chooses.
+    /// Act on the key with evdev `code`, pressed, unless it is for the field: in a popup,
+    /// Escape, or as the focus has it. Returns whether it is for the field.
+    fn route(&mut self, code: u32, qh: &QueueHandle<Self>) -> bool {
+        let keyboard = &self.login.keyboard;
+        let keysym = keyboard.keysym(code);
+        if self.popup.is_some() {
+            self.popup_key(keysym);
+            return false;
+        }
+        let focus_key = match keysym {
+            Some(Keysym::Escape) => {
+                self.events.push_back(Event::Cancel);
+                return false;
+            }
+            Some(Keysym::Tab) => focus::Key::Tab,
+            Some(Keysym::ISO_Left_Tab) => focus::Key::BackTab,
+            Some(Keysym::Left) => focus::Key::Left,
+            Some(Keysym::Right) => focus::Key::Right,
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => focus::Key::Activate,
+            _ if keyboard.key(code).is_some() => focus::Key::Text,
+            // Modifiers and keys that do nothing, which the field's keyboard follows.
+            _ => return true,
+        };
+        let chooser = &mut self.login.chooser;
+        let shown = chooser.shown();
+        match chooser.focus.key(focus_key, &shown) {
+            Action::Type => true,
+            action => {
+                self.act(action, qh);
+                false
+            }
+        }
+    }
+
+    /// Act on a key pressed while a popup is open: arrows move, Enter or Space chooses.
     fn popup_key(&mut self, keysym: Option<Keysym>) {
         let Some(popup) = &mut self.popup else { return };
-        let last = self.login.sessions.len() - 1;
+        let last = popup.list.rows() - 1;
         match keysym {
             Some(Keysym::Up) => popup.selected = popup.selected.saturating_sub(1),
             Some(Keysym::Down) => popup.selected = (popup.selected + 1).min(last),
@@ -634,9 +704,8 @@ impl PopupHandler for State {
 
     /// Escape or a click outside it.
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
-        if self.popup.as_ref().is_some_and(|ours| &ours.popup == popup) {
-            self.popup = None;
-            info!("session popup dismissed");
+        if let Some(ours) = self.popup.take_if(|ours| &ours.popup == popup) {
+            info!("{} popup dismissed", name(ours.picker));
         }
     }
 }
@@ -712,31 +781,10 @@ impl Dispatch<WlKeyboard, ()> for State {
         } = wl_event
         {
             state.serial = serial;
-            let keyboard = &state.login.keyboard;
-            let keysym = keyboard.keysym(key);
-            if state.popup.is_some() {
-                return state.popup_key(keysym);
-            }
-            let focus_key = match keysym {
-                Some(Keysym::Escape) => return state.events.push_back(Event::Cancel),
-                Some(Keysym::Tab) => Some(focus::Key::Tab),
-                Some(Keysym::ISO_Left_Tab) => Some(focus::Key::BackTab),
-                Some(Keysym::Left) => Some(focus::Key::Left),
-                Some(Keysym::Right) => Some(focus::Key::Right),
-                Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => {
-                    Some(focus::Key::Activate)
-                }
-                _ if keyboard.key(key).is_some() => Some(focus::Key::Text),
-                // Modifiers and keys that do nothing.
-                _ => None,
-            };
-            if let Some(focus_key) = focus_key {
-                let chooser = &mut state.login.chooser;
-                let shown = chooser.shown();
-                match chooser.focus.key(focus_key, &shown) {
-                    Action::Type => {}
-                    action => return state.act(action, qh),
-                }
+            if !state.route(key, qh) {
+                // Its modifier still counts: a Caps Lock pressed in a popup.
+                let login = &mut state.login;
+                return login.keyboard.pressed_elsewhere(key, &mut login.entry);
             }
         }
         let login = &mut state.login;

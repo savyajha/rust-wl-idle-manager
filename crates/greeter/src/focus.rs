@@ -16,6 +16,8 @@ pub enum Widget {
     /// The session chip.
     Session,
     LogIn,
+    /// The keyboard layout's indicator, when it opens a popup.
+    Layout,
 }
 
 /// A key, as the focus has it.

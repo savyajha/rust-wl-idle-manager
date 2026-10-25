@@ -23,7 +23,8 @@
 #
 # Behaviours asserted:
 #   1. with one user, the greeter greets them by the full name at once, with no avatar row
-#      but the "‹ Users" chip; Hidden and NoDisplay sessions are not offered; the first
+#      but the "‹ Users" chip; the one layout's short name; no battery without UPower
+#      (which the bus cannot start); Hidden and NoDisplay sessions are not offered; the first
 #      session by name is chosen; the login screen is on the primary output and the other
 #      shows the background alone
 #   2. a wrong password: a generic error line under the field, and greetd's description is
@@ -33,7 +34,8 @@
 #      session runs
 #   3. Escape at the prompt goes back to the row of the one user and "Other…" (what was
 #      typed is gone); Enter picks her again; the Log In button submits
-#   4. keyboard focus: no ring until a key moves the focus; Tab moves it to the "‹ Users"
+#   4. keyboard focus: the one layout's label opens no popup on a click; no ring until a
+#      key moves the focus; Tab moves it to the "‹ Users"
 #      chip, then the session chip; typing there goes to the field (and the focus with it);
 #      Tab cycles to Log In and around, Shift+Tab back, and Enter on Log In submits
 #   5. the session popup, opened from the session chip: Escape dismisses it and changes
@@ -166,7 +168,8 @@ pkgs.testers.runNixOSTest {
       programs.rust-wl-greeter = {
         enable = true;
         sessions = "${sessions}/share/wayland-sessions";
-        keyboardLayout = "de";
+        # One layout: a plain label, with no popup.
+        keyboardLayouts = [ "de" ];
         scales.Virtual-1 = 1.5;
         # On Virtual-1, in logical pixels: the field (176x30) is centred at the top, 220
         # from it, between the background's gradients.
@@ -226,6 +229,8 @@ pkgs.testers.runNixOSTest {
     SESSION_CHIP = (341.5, 250 + 58 + 12)
     def popup_row(i):
         return (341.5, 250 + 58 + 24 + 8 + 28 * i + 14)
+    # The layout's label, top right: 8 from the top, 24 high, ending 12 from the right.
+    LAYOUT_LABEL = (683 - 12 - 10, 8 + 12)
     # The "‹ Users" chip's rectangle.
     USERS_CHIP = (253.5 - 12 - 80, 223, 80, 24)
     # Strips of the focus rings (2 wide, 2 to 4 outside a widget) of the field and Log In,
@@ -256,7 +261,8 @@ pkgs.testers.runNixOSTest {
     def wait_for_line(text, count=1, timeout=60):
         """Wait until `text` is in the greeter's log `count` times; print the log if it never is."""
         try:
-            machine.wait_until_succeeds(f"test $({LOG} | grep -cF -- '{text}') -ge {count}", timeout=timeout)
+            command = f"test $({LOG} | grep -cF -- '{text}') -ge {count}"
+            machine.wait_until_succeeds(command, timeout=timeout)
         except Exception:
             print(read_log())
             raise
@@ -315,6 +321,12 @@ pkgs.testers.runNixOSTest {
         """Session `name` must start as `user` and write `want`, with the greeter having
         exited by itself (not by greetd's SIGTERM) since the log was `before`; then it is
         ended, and the next greeter waited for until it logs `ready`."""
+        # At once: a wrong password fails here, not after the marker's long wait.
+        def started(_):
+            after = read_log()[len(before):]
+            assert "wrong password" not in after, after
+            return "starting session" in after
+        retry(started, 30)
         marker = session_marker(name)
         assert marker == f"{user}\n{want}", marker
         machine.fail(f"pgrep -f {PROGRAMS}")
@@ -349,6 +361,10 @@ pkgs.testers.runNixOSTest {
         # her prompt, with no avatar row beside her avatar, but "‹ Users" for one.
         assert re.search(r"users: Alice Liddell$", text, re.M), text
         assert "greeting alice (Alice Liddell)" in text, text
+        assert "layouts: de (DE); DE chosen (first)" in text, text
+        # No UPower in this VM: no battery.
+        wait_for_line("no battery from UPower: ")
+        wait_for_line("battery: none")
         assert "sessions: Alpha, Beta; Alpha chosen (first)" in text, text
         wait_for_screen(lambda p: p == PLAIN, "the plain background", 5, 384)
         # The avatar, name and hint are drawn on Virtual-1; Virtual-2 has the background alone.
@@ -392,6 +408,10 @@ pkgs.testers.runNixOSTest {
         logged_in("alpha", ALPHA, before)
 
     with subtest("keys move the focus ring; typing goes to the field; Enter on Log In submits"):
+        # One layout: its label at the top right opens nothing (keys typed next would go
+        # to a popup), and Tab never reaches it (below, Tab goes round from Log In to the
+        # field).
+        click(*LAYOUT_LABEL)
         # A new greeter, its focus on the field: no ring until a key moves it.
         assert marked(FIELD_RING) == 0 and marked(LOG_IN_RING) == 0
         assert marked(SESSION_RING) == 0
@@ -416,6 +436,7 @@ pkgs.testers.runNixOSTest {
         retry(lambda _: marked(LOG_IN_RING) > 0 and marked(FIELD_RING) == 0, 10)
         # Moving the focus typed nothing; Enter, on Log In, submits.
         assert dots() == len(PASSWORD), dots()
+        assert "popup shown" not in read_log()
         before = read_log()
         machine.send_key("ret")
         logged_in("alpha", ALPHA, before)
@@ -607,7 +628,8 @@ pkgs.testers.runNixOSTest {
         prompts = count("prompt: secret")
         type_text("dave\n")
         # Not listed: not logged by the name typed (it might be a password).
-        wait_for_line("greeting a user who is not listed", count("greeting a user who is not listed") + 1)
+        unlisted = "greeting a user who is not listed"
+        wait_for_line(unlisted, count(unlisted) + 1)
         wait_for_line("prompt: secret", prompts + 1)
         log_in("alpha", ALPHA, password=DAVE_PASSWORD, user="dave", ready="input ready")
         assert 'last-user "dave"' in machine.succeed(f"cat {STATE}")
@@ -696,7 +718,10 @@ pkgs.testers.runNixOSTest {
         out = machine.fail(f"{command[0]} --check /root/bad.kdl 2>&1")
         assert "at line 1" in out, out
         # A config whose sessions directory has none fails too.
-        machine.succeed("mkdir /root/no-sessions && echo 'sessions \"/root/no-sessions\"' > /root/empty.kdl")
+        machine.succeed(
+            "mkdir /root/no-sessions",
+            "echo 'sessions \"/root/no-sessions\"' > /root/empty.kdl",
+        )
         out = machine.fail(f"{command[0]} --check /root/empty.kdl 2>&1")
         assert "no sessions in /root/no-sessions" in out, out
 

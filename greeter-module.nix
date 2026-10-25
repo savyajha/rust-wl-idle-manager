@@ -15,7 +15,7 @@ let
       {
         text = ''
           sessions ${quote cfg.sessions}
-          ${lib.optionalString (cfg.keyboardLayout != null) "keyboard-layout ${quote cfg.keyboardLayout}"}
+          ${lib.optionalString (cfg.keyboardLayouts != [ ]) "keyboard-layouts ${lib.concatMapStringsSep " " quote cfg.keyboardLayouts}"}
           ${cfg.extraConfig}
         '';
         passAsFile = [ "text" ];
@@ -47,11 +47,17 @@ in
       defaultText = lib.literalExpression ''"''${config.services.displayManager.sessionData.desktops}/share/wayland-sessions"'';
       description = "The directory of the sessions' `.desktop` files.";
     };
-    keyboardLayout = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "de";
-      description = "The xkb layout the greeter types with; by default the compositor's.";
+    keyboardLayouts = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "us"
+        "de(nodeadkeys)"
+      ];
+      description = ''
+        The xkb layouts to choose from at the login screen, as `layout` or
+        `layout(variant)`; the first at first. By default, the compositor's keymap.
+      '';
     };
     scales = lib.mkOption {
       type = lib.types.attrsOf lib.types.float;

@@ -30,12 +30,19 @@ pub struct Chooser {
     typed: bool,
     /// Whether the session chip shows during a login: there is more than one session.
     session_chip: bool,
+    /// Whether the layout indicator opens a popup: there is more than one layout.
+    layout_chip: bool,
 }
 
 impl Chooser {
     /// The first screen for `users`, the row's focus on the last user's avatar (named
     /// `last`): "Other…" if they are not listed, the first if there is none.
-    pub fn new(users: Vec<User>, last: Option<&str>, session_chip: bool) -> Self {
+    pub fn new(
+        users: Vec<User>,
+        last: Option<&str>,
+        session_chip: bool,
+        layout_chip: bool,
+    ) -> Self {
         let listed = users.iter().position(|user| Some(&*user.name) == last);
         let other = last.map(|_| users.len());
         let (screen, focused) = match &users[..] {
@@ -49,6 +56,7 @@ impl Chooser {
             focus: Focus::new(focused),
             typed: false,
             session_chip,
+            layout_chip,
         }
     }
 
@@ -67,19 +75,25 @@ impl Chooser {
         names.chain([OTHER.to_owned()]).collect()
     }
 
-    /// The widgets shown, in reading order.
+    /// The widgets shown, in reading order; the layout indicator last (W2's order), so
+    /// that Tab from the field goes through the login's widgets first.
     pub fn shown(&self) -> Vec<Widget> {
+        let mut shown = Vec::new();
         if self.screen == Screen::Row {
-            return (0..=self.users.len()).map(Widget::Avatar).collect();
+            shown.extend((0..=self.users.len()).map(Widget::Avatar));
+        } else {
+            shown.push(Widget::Pill);
+            if self.has_row() {
+                shown.push(Widget::Users);
+            }
+            if self.session_chip && matches!(self.screen, Screen::Login(_)) {
+                shown.push(Widget::Session);
+            }
+            shown.push(Widget::LogIn);
         }
-        let mut shown = vec![Widget::Pill];
-        if self.has_row() {
-            shown.push(Widget::Users);
+        if self.layout_chip {
+            shown.push(Widget::Layout);
         }
-        if self.session_chip && matches!(self.screen, Screen::Login(_)) {
-            shown.push(Widget::Session);
-        }
-        shown.push(Widget::LogIn);
         shown
     }
 
@@ -167,7 +181,7 @@ mod tests {
     #[test]
     fn one_user_starts_on_their_login_with_a_row_behind_it() {
         let alice = user("alice", "Alice");
-        let mut chooser = Chooser::new(vec![alice.clone()], None, true);
+        let mut chooser = Chooser::new(vec![alice.clone()], None, true, false);
         assert_eq!(chooser.screen, Screen::Login(alice.clone()));
         assert_eq!(chooser.shown(), [Pill, Users, Session, LogIn]);
         // Off the row, nothing is chosen.
@@ -184,7 +198,7 @@ mod tests {
 
     #[test]
     fn with_no_one_listed_a_mistyped_name_can_be_typed_again() {
-        let mut chooser = Chooser::new(Vec::new(), Some("root"), true);
+        let mut chooser = Chooser::new(Vec::new(), Some("root"), true, false);
         assert_eq!(chooser.screen, Screen::UserName);
         assert_eq!(chooser.shown(), [Pill, LogIn]);
         // No row to go back to from the user name.
@@ -203,22 +217,22 @@ mod tests {
 
     #[test]
     fn the_row_starts_on_the_last_user() {
-        let mut chooser = Chooser::new(two(), Some("bob"), true);
+        let mut chooser = Chooser::new(two(), Some("bob"), true, false);
         assert_eq!(chooser.screen, Screen::Row);
         assert_eq!(chooser.shown(), [Avatar(0), Avatar(1), Avatar(2)]);
         assert_eq!(chooser.names(), ["Alice Liddell", "Bob Builder", OTHER]);
         assert_eq!(enter(&mut chooser), Action::Activate(Avatar(1)));
         // One who is not listed (typed for "Other…" last time): on "Other…".
-        let mut chooser = Chooser::new(two(), Some("root"), true);
+        let mut chooser = Chooser::new(two(), Some("root"), true, false);
         assert_eq!(enter(&mut chooser), Action::Activate(Avatar(2)));
         // None: on the first.
-        let mut chooser = Chooser::new(two(), None, true);
+        let mut chooser = Chooser::new(two(), None, true, false);
         assert_eq!(enter(&mut chooser), Action::Activate(Avatar(0)));
     }
 
     #[test]
     fn choosing_shows_the_login_and_back_returns_to_the_avatar_left() {
-        let mut chooser = Chooser::new(two(), None, true);
+        let mut chooser = Chooser::new(two(), None, true, false);
         assert_eq!(chooser.choose(1), Some(user("bob", "Bob Builder")));
         assert_eq!(chooser.shown(), [Pill, Users, Session, LogIn]);
         assert_eq!(chooser.focus.focused, Pill);
@@ -228,14 +242,14 @@ mod tests {
         // On the row, there is nothing to go back from.
         assert!(!chooser.back());
         // One session: no session chip.
-        let mut chooser = Chooser::new(two(), None, false);
+        let mut chooser = Chooser::new(two(), None, false, false);
         chooser.choose(0);
         assert_eq!(chooser.shown(), [Pill, Users, LogIn]);
     }
 
     #[test]
     fn other_asks_for_a_user_name_and_back_goes_one_step() {
-        let mut chooser = Chooser::new(two(), None, true);
+        let mut chooser = Chooser::new(two(), None, true, false);
         assert_eq!(chooser.choose(2), None);
         assert_eq!(chooser.screen, Screen::UserName);
         // No session chip until the user is known.
@@ -259,5 +273,24 @@ mod tests {
         chooser.choose(0);
         assert!(chooser.back());
         assert_eq!(chooser.screen, Screen::Row);
+    }
+
+    #[test]
+    fn the_layout_indicator_is_last_where_it_opens_a_popup() {
+        let mut chooser = Chooser::new(two(), None, false, /* layout_chip */ true);
+        assert_eq!(chooser.shown(), [Avatar(0), Avatar(1), Avatar(2), Layout]);
+        chooser.choose(0);
+        assert_eq!(chooser.shown(), [Pill, Users, LogIn, Layout]);
+        let shown = chooser.shown();
+        for _ in 0..3 {
+            chooser.focus.key(Key::Tab, &shown);
+        }
+        assert_eq!(
+            chooser.focus.key(Key::Activate, &shown),
+            Action::Activate(Layout)
+        );
+        // Typed there, it goes to the field.
+        assert_eq!(chooser.focus.key(Key::Text, &shown), Action::Type);
+        assert_eq!(chooser.focus.focused, Pill);
     }
 }

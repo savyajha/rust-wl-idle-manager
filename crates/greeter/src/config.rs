@@ -25,9 +25,10 @@ pub struct Config {
     /// The directory of the sessions' `.desktop` files.
     #[knuffel(child, unwrap(argument))]
     pub sessions: PathBuf,
-    /// The xkb layout to type with, instead of the compositor's keymap.
-    #[knuffel(child, unwrap(argument))]
-    pub keyboard_layout: Option<String>,
+    /// The xkb layouts to choose from (`layout` or `layout(variant)`), instead of the
+    /// compositor's keymap; the first at first.
+    #[knuffel(child, unwrap(arguments), default)]
+    pub keyboard_layouts: Vec<String>,
     /// The lock screen's widgets, as its `lock-screen` block has them.
     #[knuffel(child, default = default_look())]
     pub look: LockScreen,
@@ -69,12 +70,12 @@ mod tests {
     fn a_config_takes_its_sessions_layout_and_look() {
         let text = r#"
             sessions "/run/sessions"
-            keyboard-layout "de"
+            keyboard-layouts "de" "us(dvorak)"
             look { password { anchor "top"; }; }
         "#;
         let config = Config::parse("test.kdl", text).unwrap();
         assert_eq!(config.sessions, PathBuf::from("/run/sessions"));
-        assert_eq!(config.keyboard_layout.as_deref(), Some("de"));
+        assert_eq!(config.keyboard_layouts, ["de", "us(dvorak)"]);
         assert_eq!(config.look.avatar, None);
     }
 
@@ -83,14 +84,14 @@ mod tests {
         let config = Config::parse("test.kdl", "sessions \"/s\"").unwrap();
         let look = config.look;
         assert!(look.avatar.is_some() && look.clock.is_some());
-        assert_eq!(config.keyboard_layout, None);
+        assert!(config.keyboard_layouts.is_empty());
     }
 
     #[test]
     fn bad_configs_are_rejected_where_they_are() {
         for (text, want) in [
             (
-                "keyboard-layout \"de\"",
+                "keyboard-layouts \"de\"",
                 "child node `sessions` is required",
             ),
             ("sessions 1", "expected string scalar, found integer"),
