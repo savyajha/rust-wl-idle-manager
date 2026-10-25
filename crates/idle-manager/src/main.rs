@@ -110,7 +110,7 @@ impl Runner {
                 info!("starting the locker");
                 let started = self
                     .systemd
-                    .start_service(LOCKER_UNIT, "rust-wl-idle-manager: locker", &locker.0)
+                    .start_service(LOCKER_UNIT, "rust-wl-idle-manager: locker", locker)
                     .await
                     .context("starting the locker")?;
                 if !started {
@@ -138,8 +138,8 @@ impl Runner {
                 info!("unlocking the lock screen");
                 wayland.unlock();
             }
-            Command::Spawn(Argv(argv)) => {
-                let line = argv.join(" ");
+            Command::Spawn(argv) => {
+                let line = argv.to_vec().join(" ");
                 info!("spawning {line}");
                 let unit = format!(
                     "rust-wl-idle-spawn-{}-{}.service",

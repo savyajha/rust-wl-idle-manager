@@ -66,7 +66,7 @@ impl Dumb {
         std::mem::forget(mapping);
         let image = (format == Fourcc::Xrgb8888).then(|| {
             let code = pixman::FormatCode::X8R8G8B8;
-            // Safety: the mapping is pitch * h bytes; the image is dropped before it.
+            // SAFETY: the mapping is pitch * h bytes; the image is dropped before it.
             unsafe { pixman::Image::from_raw_mut(code, w as _, h as _, ptr.cast(), pitch, false) }
         });
         Ok(Dumb {
@@ -82,12 +82,22 @@ impl Dumb {
             pitch,
         })
     }
+
+    /// The mapping, `pitch` bytes a row, to write into: only for a buffer with no image (the
+    /// cursor's), which nothing else points into.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        assert!(self.image.is_none(), "drawn through its image");
+        // SAFETY: `ptr` is the read-write mapping of `len` bytes made in `new`, unmapped only
+        // in Drop. Without an image nothing else points into it, and the borrow of `self`
+        // makes the slice the only access while it lives.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
 }
 
 impl Drop for Dumb {
     fn drop(&mut self) {
         self.image = None;
-        // Safety: the mapping made in `new`, used by nothing else any more.
+        // SAFETY: the mapping made in `new`, used by nothing else any more.
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
         let _ = self.fd.destroy_framebuffer(self.fb);
         if let Some(buffer) = self.buffer.take() {
@@ -377,12 +387,7 @@ impl State {
         }
         // Not those still before their initial commit: that commit configures them.
         for i in 0..self.toplevels.len() {
-            if self.toplevels[i]
-                .window
-                .toplevel()
-                .unwrap()
-                .is_initial_configure_sent()
-            {
+            if self.toplevels[i].surface().is_initial_configure_sent() {
                 self.place(i);
             }
         }
@@ -438,7 +443,8 @@ impl State {
         head.frames += 1;
         let age = buffer.drawn_at.map_or(0, |at| (head.frames - at) as usize);
         let damaged = {
-            let mut target = match self.renderer.bind(buffer.image.as_mut().unwrap()) {
+            let image = buffer.image.as_mut().expect("frame buffers are XRGB");
+            let mut target = match self.renderer.bind(image) {
                 Ok(target) => target,
                 Err(e) => return warn!("binding a buffer: {e}"),
             };
@@ -710,7 +716,7 @@ fn stale(time: Duration, submitted: Duration, refresh: Duration) -> bool {
 fn now() -> Duration {
     rustix::time::clock_gettime(rustix::time::ClockId::Monotonic)
         .try_into()
-        .unwrap()
+        .expect("the monotonic clock is not negative")
 }
 
 fn preferred_mode(conn: &connector::Info) -> Mode {
@@ -781,16 +787,16 @@ fn cursor_plane(gpu: &Gpu, surface: &DrmSurface, scale: f64) -> Option<CursorPla
         .iter()
         .find_map(|p| Some((p.handle, surface.claim_plane(p.handle)?)))?;
     let size = gpu.cursor_size;
-    let dumb = Dumb::new(&gpu.fd, size, Fourcc::Argb8888)
+    let mut dumb = Dumb::new(&gpu.fd, size, Fourcc::Argb8888)
         .inspect_err(|e| warn!("cursor buffer: {e:#}"))
         .ok()?;
     let (w, h) = (size.0 as usize, size.1 as usize);
     let pixels = cursor::arrow((scale.round() as usize).max(1), w, h);
-    // Safety: the mapping is pitch * h bytes, and pitch >= w * 4.
-    let mapping = unsafe { std::slice::from_raw_parts_mut(dumb.ptr, dumb.len) };
+    let pitch = dumb.pitch;
+    let mapping = dumb.bytes_mut();
     for (y, row) in pixels.chunks(w).enumerate() {
         for (x, pixel) in row.iter().enumerate() {
-            let at = y * dumb.pitch + x * 4;
+            let at = y * pitch + x * 4;
             mapping[at..at + 4].copy_from_slice(&pixel.to_ne_bytes());
         }
     }
@@ -835,7 +841,7 @@ mod tests {
                 .render_output(&mut renderer, &mut target, 0, &[element], white)
                 .unwrap();
             drop(target);
-            // Safety: the image's own w * h pixels.
+            // SAFETY: the image's own w * h pixels.
             let pixels = unsafe { std::slice::from_raw_parts(image.data(), w * h) };
             let count = |colour| pixels.iter().filter(|&&p| p & 0xff_ffff == colour).count();
             assert_eq!(count(0), outline, "black at {x},{y}");

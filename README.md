@@ -51,7 +51,7 @@ own lock screen, through `ext-session-lock-v1`, which the
 compositor must support. The built-in lock screen covers every output with
 the blurred wallpaper, the date and a large clock at the top, and your
 initial, name and a password field at the bottom: type your password and
-press Enter (Backspace deletes a character, Escape clears it). The field shows
+press Enter (Backspace deletes a character, Escape or Ctrl+Backspace clears it). The field shows
 a dot per character, dims while the password is checked, and is outlined in
 the error colour when it was wrong; "Caps Lock is on" shows under it. After
 five wrong passwords in a row, it says "Try again in N s" and takes no input

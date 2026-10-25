@@ -198,10 +198,10 @@ compiled by xkbcommon (mapped read-only from the compositor's fd), and its
 modifiers update the xkbcommon state. Keys act only while a lock exists: the
 lock surfaces are the daemon's only surfaces, so it never sees keys meant for
 anything else. Enter submits the password, Backspace deletes one character
-and Escape clears it, each recognised by its keysym. Any other key types the
-character xkbcommon gives for it as UTF-32 (`key_get_utf32`), so any layout
-works, unless it is a control character (as with Ctrl held) or Alt or Logo is
-held. There is no compose table, so a dead key types nothing. While a
+and Escape or Ctrl+Backspace clears it, each recognised by its keysym. Any
+other key types the character xkbcommon gives for it as UTF-32
+(`key_get_utf32`), so any layout works, unless it is a control character or
+Ctrl, Alt or Logo is held. There is no compose table, so a dead key types nothing. While a
 password is being checked, keys do nothing, and an empty password is never
 submitted.
 
@@ -417,11 +417,12 @@ keystrokes. It is handled like this:
   buffer is used anyway.
 - It is wiped, with volatile writes the compiler cannot remove, as soon as
   the helper has its copy (the password is handed out in a guard that wipes
-  it when dropped, on every path), after every answer, on Escape, on unlock,
-  when a lock starts, after 30 s without typing, and before sleep, since the
-  machine may go on to hibernate. The sleep wipe is attached to releasing the
-  sleep inhibitor: every `PrepareForSleep(true)` path ends in that release
-  (the policy's tests prove it), and sleep cannot start before it.
+  it when dropped, on every path), after every answer, on Escape or
+  Ctrl+Backspace, on unlock, when a lock starts, after 30 s without typing,
+  and before sleep, since the machine may go on to hibernate. The sleep wipe
+  is attached to releasing the sleep inhibitor: every `PrepareForSleep(true)`
+  path ends in that release (the policy's tests prove it), and sleep cannot
+  start before it.
 - A typed character goes from xkbcommon (`key_get_utf32`) straight into the
   buffer, never through a `String`.
 - At startup the daemon and the helper make themselves non-dumpable

@@ -15,6 +15,7 @@ pango = "0.22"
 tokio = { version = "1", features = ["rt", "macros", "signal", "net", "time", "process", "io-util"] }
 tracing = "0.1"
 wayland-client = "0.31"
+zeroize = "1"
 rust-wl-ui = { path = "crates/ui" }
 
 # Whole-program optimisation, tuned for size: the daemon is idle, so speed does not matter.

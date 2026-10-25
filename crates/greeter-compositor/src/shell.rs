@@ -35,6 +35,12 @@ use smithay::{
 
 use crate::{ClientState, State, Toplevel};
 
+impl Toplevel {
+    pub fn surface(&self) -> &ToplevelSurface {
+        self.window.toplevel().expect("no X11 windows")
+    }
+}
+
 impl State {
     /// Configures toplevel `i` fullscreen on its output (the primary if it has none) and maps it
     /// there. Without any output it is configured with no size and stays unmapped.
@@ -50,7 +56,7 @@ impl State {
             .output
             .as_ref()
             .and_then(|o| self.space.output_geometry(o));
-        let surface = toplevel.window.toplevel().unwrap();
+        let surface = toplevel.surface();
         surface.with_pending_state(|s| {
             s.size = geometry.map(|g| g.size);
             s.states.set(xdg_toplevel::State::Fullscreen);
@@ -91,7 +97,7 @@ impl State {
     fn toplevel_index(&self, root: &WlSurface) -> Option<usize> {
         self.toplevels
             .iter()
-            .position(|t| t.window.toplevel().unwrap().wl_surface() == root)
+            .position(|t| t.surface().wl_surface() == root)
     }
 
     /// Gives the keyboard to the topmost grabbing popup, else the clicked toplevel, else the
@@ -119,9 +125,9 @@ impl State {
         }
         let target = match self.grab.last() {
             Some(popup) => Some(popup.wl_surface().clone()),
-            None => toplevel.map(|t| t.window.toplevel().unwrap().wl_surface().clone()),
+            None => toplevel.map(|t| t.surface().wl_surface().clone()),
         };
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let keyboard = self.keyboard();
         if keyboard.current_focus() != target {
             keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
         }
@@ -178,7 +184,10 @@ impl CompositorHandler for State {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor
+        &client
+            .get_data::<ClientState>()
+            .expect("every client is inserted with one")
+            .compositor
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -187,7 +196,7 @@ impl CompositorHandler for State {
 
         if let Some(i) = self.toplevel_index(&crate::input::root(surface.clone())) {
             self.toplevels[i].window.on_commit();
-            let toplevel = self.toplevels[i].window.toplevel().unwrap();
+            let toplevel = self.toplevels[i].surface();
             if !toplevel.is_initial_configure_sent() {
                 self.place(i);
             }

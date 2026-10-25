@@ -21,20 +21,22 @@ const COOLDOWN: Duration = Duration::from_secs(30);
 pub enum Key {
     Enter,
     Backspace,
-    Escape,
+    /// Escape or Ctrl+Backspace: wipe the password.
+    Clear,
     Char(char),
 }
 
 impl Key {
     /// The key a press means, from its `keysym` and the character it types (`utf32`, 0 for
-    /// none), or `None`. With Alt or Logo held, a character is a shortcut, not text; with
-    /// Ctrl, xkbcommon gives control characters, which are ignored too.
-    pub fn from_xkb(keysym: Keysym, utf32: u32, alt_or_logo: bool) -> Option<Self> {
+    /// none), or `None`. With Alt, Logo or Ctrl held, a character is a shortcut, not text;
+    /// Ctrl+Backspace clears the password, as on GNOME's lock screen.
+    pub fn from_xkb(keysym: Keysym, utf32: u32, alt_or_logo: bool, ctrl: bool) -> Option<Self> {
         match keysym {
             Keysym::Return | Keysym::KP_Enter => Some(Key::Enter),
+            Keysym::BackSpace if ctrl => Some(Key::Clear),
             Keysym::BackSpace => Some(Key::Backspace),
-            Keysym::Escape => Some(Key::Escape),
-            _ if alt_or_logo => None,
+            Keysym::Escape => Some(Key::Clear),
+            _ if alt_or_logo || ctrl => None,
             _ => char::from_u32(utf32)
                 .filter(|c| !c.is_control())
                 .map(Key::Char),
@@ -133,7 +135,7 @@ impl Entry {
                 self.checking = !self.password.bytes().is_empty();
                 self.submitted = self.password.chars();
             }
-            Key::Escape => self.wipe(),
+            Key::Clear => self.wipe(),
             Key::Backspace | Key::Char(_) => {
                 self.edit(key, now);
                 let repeats = if key == Key::Backspace {
@@ -170,7 +172,7 @@ impl Entry {
         match key {
             Key::Backspace => self.password.pop(),
             Key::Char(c) => self.password.push(c),
-            Key::Enter | Key::Escape => {}
+            Key::Enter | Key::Clear => {}
         }
         self.forget_at = (!self.password.bytes().is_empty()).then(|| now + FORGET_AFTER);
     }
@@ -342,10 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn escape_wipes() {
+    fn clear_wipes() {
         let (mut entry, now) = entry();
         type_text(&mut entry, "secret", now);
-        assert!(!entry.press(Key::Escape, 3, now));
+        assert!(!entry.press(Key::Clear, 3, now));
         assert_eq!(typed(&entry), b"");
         assert_eq!(entry.look(now).status, Status::Idle);
     }
@@ -366,7 +368,7 @@ mod tests {
         let (mut entry, now) = entry();
         type_text(&mut entry, "pw", now);
         entry.press(Key::Enter, 4, now);
-        for key in [Key::Char('x'), Key::Backspace, Key::Escape, Key::Enter] {
+        for key in [Key::Char('x'), Key::Backspace, Key::Clear, Key::Enter] {
             assert!(!entry.press(key, 5, now));
         }
         assert_eq!(typed(&entry), b"pw");
@@ -451,10 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn enter_and_escape_do_not_repeat_and_stop_a_repeat() {
+    fn enter_and_clear_do_not_repeat_and_stop_a_repeat() {
         let (mut entry, now) = entry();
         entry.press(Key::Char('a'), 7, now);
-        entry.press(Key::Escape, 3, now);
+        entry.press(Key::Clear, 3, now);
         assert_eq!(entry.deadline(now), None);
         entry.set_repeat(None);
         entry.press(Key::Char('a'), 7, now);
@@ -496,7 +498,7 @@ mod tests {
         assert_eq!(entry.deadline(now), Some(now + Duration::from_secs(1)));
 
         // Keys type nothing and submit nothing until it ends.
-        for key in [Key::Char('x'), Key::Backspace, Key::Escape, Key::Enter] {
+        for key in [Key::Char('x'), Key::Backspace, Key::Clear, Key::Enter] {
             assert!(!entry.press(key, 5, now));
         }
         assert_eq!(typed(&entry), b"");
@@ -622,15 +624,37 @@ mod tests {
 
     #[test]
     fn keys_map_to_characters_except_with_alt_or_logo() {
-        let key = |keysym, c: char, alt_or_logo| Key::from_xkb(keysym, c as u32, alt_or_logo);
+        let key =
+            |keysym, c: char, alt_or_logo| Key::from_xkb(keysym, c as u32, alt_or_logo, false);
         assert!(key(Keysym::a, 'a', false) == Some(Key::Char('a')));
         assert!(key(Keysym::a, 'a', true).is_none());
-        // Ctrl+A, as xkbcommon gives it.
-        assert!(key(Keysym::a, '\u{1}', false).is_none());
         assert!(key(Keysym::Shift_L, '\0', false).is_none());
         assert!(key(Keysym::Return, '\r', true) == Some(Key::Enter));
         assert!(key(Keysym::KP_Enter, '\r', false) == Some(Key::Enter));
         assert!(key(Keysym::BackSpace, '\u{8}', false) == Some(Key::Backspace));
-        assert!(key(Keysym::Escape, '\u{1b}', false) == Some(Key::Escape));
+        assert!(key(Keysym::Escape, '\u{1b}', false) == Some(Key::Clear));
+    }
+
+    #[test]
+    fn ctrl_backspace_clears_and_ctrl_types_nothing() {
+        let ctrl = |keysym, c: char| Key::from_xkb(keysym, c as u32, false, true);
+        assert!(ctrl(Keysym::BackSpace, '\u{8}') == Some(Key::Clear));
+        // Ctrl+A and Ctrl+U, as xkbcommon gives them.
+        assert!(ctrl(Keysym::a, '\u{1}').is_none());
+        assert!(ctrl(Keysym::u, '\u{15}').is_none());
+        // Ctrl+1, which xkbcommon gives as '1'.
+        assert!(ctrl(Keysym::_1, '1').is_none());
+        assert!(ctrl(Keysym::Return, '\r') == Some(Key::Enter));
+    }
+
+    #[test]
+    fn ctrl_backspace_clears_without_repeat() {
+        let (mut entry, now) = entry();
+        type_text(&mut entry, "secret", now);
+        let key = Key::from_xkb(Keysym::BackSpace, 8, false, true).unwrap();
+        assert!(!entry.press(key, 14, now));
+        assert_eq!(typed(&entry), b"");
+        // Held, it does not repeat: nothing is due.
+        assert_eq!(entry.deadline(now), None);
     }
 }

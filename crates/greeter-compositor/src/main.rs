@@ -292,7 +292,8 @@ fn run(args: Args) -> anyhow::Result<Infallible> {
         .insert_source(
             Generic::new(display, Interest::READ, Mode::Level),
             |_, display, state| {
-                // Safety: the display is not dropped while the loop runs.
+                // SAFETY: the display is only dispatched, not dropped or replaced, so the fd
+                // the loop polls stays open.
                 unsafe { display.get_mut().dispatch_clients(state)? };
                 Ok(PostAction::Continue)
             },
@@ -376,7 +377,7 @@ fn spawn(greeter: &[OsString], socket_name: &OsStr) -> anyhow::Result<Child> {
         .env("WAYLAND_DISPLAY", socket_name);
     // std passes on the signal mask, in which SIGTERM and SIGINT are blocked for the signal
     // source; the greeter must be able to die of them.
-    // Safety: only async-signal-safe calls between fork and exec.
+    // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
         command.pre_exec(|| {
             let mut set = std::mem::zeroed::<libc::sigset_t>();
@@ -410,7 +411,8 @@ fn stop_child(mut child: Child) {
         &fd,
         rustix::event::PollFlags::IN,
     )];
-    let timeout = rustix::time::Timespec::try_from(CHILD_GRACE).unwrap();
+    let timeout =
+        rustix::time::Timespec::try_from(CHILD_GRACE).expect("CHILD_GRACE fits a timespec");
     if !matches!(rustix::event::poll(&mut poll, Some(&timeout)), Ok(1)) {
         warn!("the greeter did not exit on SIGTERM; killing it");
         let _ = child.kill();

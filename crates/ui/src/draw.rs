@@ -385,7 +385,7 @@ impl Painter {
             cr.paint()?;
         }
         let (top_end, bottom_start) = (GRADIENTS.0 * height, GRADIENTS.1 * height);
-        let (top, bottom) = (config.gradient.0.0, config.gradient.1.0);
+        let (top, bottom) = (config.gradient.top.0, config.gradient.bottom.0);
         for (from, to, alpha) in [(0.0, top_end, top), (height, bottom_start, bottom)] {
             let gradient = LinearGradient::new(0.0, from, 0.0, to);
             gradient.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, alpha);
@@ -487,7 +487,7 @@ impl Layout {
 
     /// The logical top-left corner of a widget of logical `size` at `place`.
     fn logical_top_left(self, place: &Place, size: (f64, f64)) -> (f64, f64) {
-        let Offset(x, y) = place.offset.unwrap_or_default();
+        let Offset { x, y } = place.offset.unwrap_or_default();
         let screen = (f64::from(self.logical.0), f64::from(self.logical.1));
         anchored(place.anchor.unwrap_or_default(), (x.0, y.0), size, screen)
     }

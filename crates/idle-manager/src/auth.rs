@@ -12,9 +12,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio::time::{self, Instant};
 use tracing::{error, info, warn};
+use zeroize::Zeroize;
 
 use ui::cloexec_above_stderr;
-use ui::password::{self, CAPACITY};
+use ui::password::CAPACITY;
 
 /// The PAM service; NixOS needs `security.pam.services.rust-wl-idle-manager = { };`.
 const SERVICE: &str = "rust-wl-idle-manager";
@@ -81,7 +82,7 @@ pub fn helper() -> ExitCode {
             false
         }
     };
-    password::wipe(&mut buffer);
+    buffer.zeroize();
     if ok {
         ExitCode::SUCCESS
     } else {

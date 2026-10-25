@@ -148,8 +148,11 @@ mod tests {
         timeout 1200 { suspend-then-hibernate; }
     "#;
 
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+    fn argv(args: &[&str]) -> Argv {
+        let (program, args) = args.split_first().unwrap();
+        let program = program.to_string();
+        let args = args.iter().map(|s| s.to_string()).collect();
+        Argv { program, args }
     }
 
     fn parse_err(text: &str) -> String {
@@ -163,7 +166,7 @@ mod tests {
         assert_eq!(
             config,
             Config {
-                locker: Some(Argv(argv(&["hyprlock-wallpaper"]))),
+                locker: Some(argv(&["hyprlock-wallpaper"])),
                 timeouts: vec![
                     Timeout {
                         after: Duration::from_secs(300),
@@ -173,8 +176,8 @@ mod tests {
                     },
                     Timeout {
                         after: Duration::from_secs(600),
-                        action: Action::Spawn(Argv(power("power-off-monitors"))),
-                        on_resume: Some(Argv(power("power-on-monitors"))),
+                        action: Action::Spawn(power("power-off-monitors")),
+                        on_resume: Some(power("power-on-monitors")),
                         ignore_inhibit: true,
                     },
                     Timeout {

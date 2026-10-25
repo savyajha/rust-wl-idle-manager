@@ -168,7 +168,10 @@ mod tests {
     use Command::*;
 
     fn argv(args: &[&str]) -> Argv {
-        Argv(args.iter().map(|s| s.to_string()).collect())
+        let (program, args) = args.split_first().unwrap();
+        let program = program.to_string();
+        let args = args.iter().map(|s| s.to_string()).collect();
+        Argv { program, args }
     }
 
     fn timeout(action: Action, on_resume: Option<&[&str]>, ignore_inhibit: bool) -> Timeout {

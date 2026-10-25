@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use knuffel::ast::{Literal, SpannedNode, TypeName};
+use knuffel::ast::{Literal, TypeName};
 use knuffel::decode::{Context as DecodeContext, Kind};
 use knuffel::errors::DecodeError;
 use knuffel::span::Spanned;
@@ -64,17 +64,21 @@ pub struct Place {
 }
 
 #[derive(knuffel::Decode, Clone, Copy, Debug, Default, PartialEq)]
-pub struct Offset(
-    #[knuffel(argument)] pub Distance,
-    #[knuffel(argument)] pub Distance,
-);
+pub struct Offset {
+    #[knuffel(argument)]
+    pub x: Distance,
+    #[knuffel(argument)]
+    pub y: Distance,
+}
 
 /// The opacities of the background's top and bottom gradients.
 #[derive(knuffel::Decode, Clone, Copy, Debug, PartialEq)]
-pub struct Gradient(
-    #[knuffel(argument)] pub Fraction,
-    #[knuffel(argument)] pub Fraction,
-);
+pub struct Gradient {
+    #[knuffel(argument)]
+    pub top: Fraction,
+    #[knuffel(argument)]
+    pub bottom: Fraction,
+}
 
 /// A color, and an opacity it is multiplied by.
 #[derive(knuffel::Decode, Clone, Debug, PartialEq)]
@@ -96,16 +100,13 @@ pub enum ColorName {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Format(pub String);
 
-/// A program and its arguments; never empty.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Argv(pub Vec<String>);
-
-#[derive(knuffel::Decode)]
-struct RawArgv {
+/// A program and its arguments.
+#[derive(knuffel::Decode, Clone, Debug, PartialEq)]
+pub struct Argv {
     #[knuffel(argument)]
-    program: String,
+    pub program: String,
     #[knuffel(arguments)]
-    args: Vec<String>,
+    pub args: Vec<String>,
 }
 
 /// The lock screen's widgets; only `password` is required, or nothing could unlock.
@@ -136,7 +137,7 @@ pub struct Background {
     pub brightness: Factor,
     #[knuffel(child, unwrap(argument), default = Number(1.1))]
     pub saturation: Factor,
-    #[knuffel(child, default = Gradient(Number(0.35), Number(0.45)))]
+    #[knuffel(child, default = Gradient { top: Number(0.35), bottom: Number(0.45) })]
     pub gradient: Gradient,
     /// Without a wallpaper (none configured, or it failed).
     #[knuffel(child, default = Color::new("#202428"))]
@@ -244,6 +245,15 @@ impl LockScreen {
     }
 }
 
+impl Argv {
+    /// The program, then its arguments.
+    pub fn to_vec(&self) -> Vec<String> {
+        let mut argv = vec![self.program.clone()];
+        argv.extend_from_slice(&self.args);
+        argv
+    }
+}
+
 impl Color {
     /// `name`, opaque; for the defaults, so it must parse.
     fn new(name: &str) -> Self {
@@ -251,16 +261,6 @@ impl Color {
             name: name.parse().expect("a valid color"),
             alpha: Number(1.0),
         }
-    }
-}
-
-impl<S: ErrorSpan> knuffel::Decode<S> for Argv {
-    fn decode_node(
-        node: &SpannedNode<S>,
-        ctx: &mut DecodeContext<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let RawArgv { program, args } = RawArgv::decode_node(node, ctx)?;
-        Ok(Self([program].into_iter().chain(args).collect()))
     }
 }
 
@@ -343,8 +343,11 @@ pub fn render(err: knuffel::Error) -> anyhow::Error {
 mod tests {
     use super::*;
 
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+    fn argv(args: &[&str]) -> Argv {
+        let (program, args) = args.split_first().unwrap();
+        let program = program.to_string();
+        let args = args.iter().map(|s| s.to_string()).collect();
+        Argv { program, args }
     }
 
     fn parse_err(text: &str) -> String {
@@ -368,10 +371,7 @@ mod tests {
         "#;
         let lock_screen = LockScreen::parse("test.kdl", text).unwrap();
         let background = lock_screen.background.unwrap();
-        assert_eq!(
-            background.wallpaper_command,
-            Some(Argv(argv(&["cat", "/x"])))
-        );
+        assert_eq!(background.wallpaper_command, Some(argv(&["cat", "/x"])));
         assert_eq!(
             (background.blur, background.brightness),
             (Number(10.0), Number(1.0))
@@ -388,7 +388,13 @@ mod tests {
         assert_eq!(name.style.color, Some(color));
         let place = lock_screen.password.place;
         assert_eq!(place.anchor, Some(Anchor::TopLeft));
-        assert_eq!(place.offset, Some(Offset(Number(10.0), Number(-2.5))));
+        assert_eq!(
+            place.offset,
+            Some(Offset {
+                x: Number(10.0),
+                y: Number(-2.5)
+            })
+        );
         assert_eq!(lock_screen.clock, None);
         let white = ColorName::Literal([1.0; 4]);
         assert_eq!(lock_screen.password.color.name, white);

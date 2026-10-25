@@ -10,8 +10,8 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::session::Session;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
-use smithay::input::keyboard::{FilterResult, keysyms};
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, keysyms};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER};
@@ -28,6 +28,14 @@ enum KeyAction {
 }
 
 impl State {
+    pub fn keyboard(&self) -> KeyboardHandle<State> {
+        self.seat.get_keyboard().expect("added in main")
+    }
+
+    pub fn pointer(&self) -> PointerHandle<State> {
+        self.seat.get_pointer().expect("added in main")
+    }
+
     /// Watches udev for monitor hotplug: change events of our own GPU rescan its connectors,
     /// probing them. No device is opened. Set up before the start-up scan, so that a hotplug
     /// from then on is queued, not missed.
@@ -94,7 +102,7 @@ impl State {
     }
 
     fn key<B: InputBackend>(&mut self, event: B::KeyboardKeyEvent) {
-        let keyboard = self.seat.get_keyboard().unwrap();
+        let keyboard = self.keyboard();
         let serial = SERIAL_COUNTER.next_serial();
         let grabbing = !self.grab.is_empty();
         let code = event.key_code();
@@ -170,7 +178,7 @@ impl State {
 
     /// The pointer's focus: the surface now under it.
     pub fn update_pointer_focus(&mut self, time: u32) {
-        let pointer = self.seat.get_pointer().unwrap();
+        let pointer = self.pointer();
         let focus = self.surface_under(self.pointer);
         let event = MotionEvent {
             location: self.pointer,
@@ -203,14 +211,14 @@ impl State {
             } else if let Some(t) = self
                 .toplevels
                 .iter()
-                .find(|t| Some(t.window.toplevel().unwrap().wl_surface()) == under.as_ref())
+                .find(|t| Some(t.surface().wl_surface()) == under.as_ref())
             {
                 // Click to focus.
                 self.focus = Some(t.window.clone());
                 self.refocus();
             }
         }
-        let pointer = self.seat.get_pointer().unwrap();
+        let pointer = self.pointer();
         pointer.button(
             self,
             &ButtonEvent {
@@ -244,7 +252,7 @@ impl State {
                 frame = frame.stop(axis);
             }
         }
-        let pointer = self.seat.get_pointer().unwrap();
+        let pointer = self.pointer();
         pointer.axis(self, frame);
         pointer.frame(self);
     }

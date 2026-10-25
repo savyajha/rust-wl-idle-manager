@@ -41,9 +41,9 @@ pub async fn load(
     brightness: f64,
     saturation: f64,
 ) -> anyhow::Result<Blurred> {
-    let program = &command.0[0];
+    let program = &command.program;
     let running = cloexec_above_stderr(&mut Command::new(program))
-        .args(&command.0[1..])
+        .args(&command.args)
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output();

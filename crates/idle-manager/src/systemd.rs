@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, ensure};
+use ui::config::Argv;
 use zbus::proxy;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
@@ -24,16 +25,16 @@ pub trait SystemdManager {
 }
 
 impl SystemdManagerProxy<'_> {
-    /// Run `argv` (not empty) as the transient service `unit`. Returns false, starting
-    /// nothing, if a unit by that name is already loaded.
+    /// Run `argv` as the transient service `unit`. Returns false, starting nothing, if a unit
+    /// by that name is already loaded.
     pub async fn start_service(
         &self,
         unit: &str,
         description: &str,
-        argv: &[String],
+        argv: &Argv,
     ) -> anyhow::Result<bool> {
         let path = env::var("PATH").unwrap_or_default();
-        let program = find_program(&argv[0], &path)?;
+        let program = find_program(&argv.program, &path)?;
         let properties = [
             ("Description", Value::from(description)),
             (

@@ -19,4 +19,5 @@ tokio.workspace = true
 tracing.workspace = true
 wayland-client.workspace = true
 xkbcommon = { version = "0.8", default-features = false, features = ["wayland"] }
+zeroize.workspace = true
 zune-jpeg = "0.5"

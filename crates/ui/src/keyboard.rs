@@ -35,10 +35,12 @@ impl Keyboard {
         let alt_or_logo = [xkb::MOD_NAME_ALT, xkb::MOD_NAME_LOGO]
             .iter()
             .any(|name| xkb.mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE));
+        let ctrl = xkb.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
         let key = Key::from_xkb(
             xkb.key_get_one_sym(keycode),
             xkb.key_get_utf32(keycode),
             alt_or_logo,
+            ctrl,
         );
         key.is_some_and(|key| entry.press(key, code, Instant::now()))
     }

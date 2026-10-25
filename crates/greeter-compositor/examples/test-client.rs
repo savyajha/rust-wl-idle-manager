@@ -100,7 +100,7 @@ fn main() {
     });
     println!("started");
     // SIGUSR1, read through a signalfd so the loop below sees it.
-    // Safety: plain libc calls on a local signal set; the fd is owned from here on.
+    // SAFETY: plain libc calls on a local signal set; the fd is owned from here on.
     let signals = unsafe {
         let mut set = std::mem::zeroed::<libc::sigset_t>();
         libc::sigemptyset(&mut set);
@@ -120,7 +120,7 @@ fn main() {
                 events: libc::POLLIN,
                 revents: 0,
             });
-        // Safety: two valid pollfds.
+        // SAFETY: two valid pollfds.
         unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
         if fds[0].revents != 0 {
             // WouldBlock on a partial message; a lost connection fails at the next flush.
@@ -128,7 +128,7 @@ fn main() {
         }
         if fds[1].revents != 0 {
             let mut info = [0u8; 128];
-            // Safety: reads one signalfd_siginfo into a buffer of its size.
+            // SAFETY: reads one signalfd_siginfo into a buffer of its size.
             unsafe { libc::read(signals.as_raw_fd(), info.as_mut_ptr().cast(), info.len()) };
             state.recolour(&qh);
         }
@@ -237,7 +237,7 @@ fn draw(
         (surface.size.1 as u32 * surface.scale120).div_ceil(120) as i32,
     );
     let len = (w * h * 4) as usize;
-    // Safety: memfd_create with a valid name; the fd is owned from here on.
+    // SAFETY: memfd_create with a valid name; the fd is owned from here on.
     let fd = unsafe { libc::memfd_create(c"test-client".as_ptr(), libc::MFD_CLOEXEC) };
     assert!(fd >= 0, "memfd_create");
     let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });

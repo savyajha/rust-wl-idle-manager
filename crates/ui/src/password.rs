@@ -1,20 +1,10 @@
 use std::io;
-use std::ptr;
-use std::sync::atomic::{Ordering, compiler_fence};
 
 use tracing::warn;
+use zeroize::Zeroize;
 
 /// The most bytes of UTF-8 a password can have; typing past it is ignored.
 pub const CAPACITY: usize = 1024;
-
-/// Zero `bytes` with volatile writes, which the compiler cannot remove as dead stores.
-pub fn wipe(bytes: &mut [u8]) {
-    for byte in bytes.iter_mut() {
-        // SAFETY: `byte` is a valid, aligned, exclusive reference.
-        unsafe { ptr::write_volatile(byte, 0) };
-    }
-    compiler_fence(Ordering::SeqCst);
-}
 
 /// Page-aligned, so that it fills exactly one page that `mlock` can pin.
 #[repr(align(4096))]
@@ -58,7 +48,7 @@ impl Password {
 
     pub fn pop(&mut self) {
         if let Some(start) = self.last_start() {
-            wipe(&mut self.page.0[start..self.len]);
+            self.page.0[start..self.len].zeroize();
             self.len = start;
         }
     }
@@ -72,7 +62,7 @@ impl Password {
     }
 
     pub fn wipe(&mut self) {
-        wipe(&mut self.page.0);
+        self.page.0.zeroize();
         self.len = 0;
     }
 
