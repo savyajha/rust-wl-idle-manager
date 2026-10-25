@@ -22,9 +22,6 @@ look {
 
 #[derive(knuffel::Decode, Debug, PartialEq)]
 pub struct Config {
-    /// The user who logs in.
-    #[knuffel(child, unwrap(argument))]
-    pub user: String,
     /// The directory of the sessions' `.desktop` files.
     #[knuffel(child, unwrap(argument))]
     pub sessions: PathBuf,
@@ -69,15 +66,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_config_takes_its_user_sessions_layout_and_look() {
+    fn a_config_takes_its_sessions_layout_and_look() {
         let text = r#"
-            user "alice"
             sessions "/run/sessions"
             keyboard-layout "de"
             look { password { anchor "top"; }; }
         "#;
         let config = Config::parse("test.kdl", text).unwrap();
-        assert_eq!(config.user, "alice");
         assert_eq!(config.sessions, PathBuf::from("/run/sessions"));
         assert_eq!(config.keyboard_layout.as_deref(), Some("de"));
         assert_eq!(config.look.avatar, None);
@@ -85,7 +80,7 @@ mod tests {
 
     #[test]
     fn without_a_look_the_default_one_is_used() {
-        let config = Config::parse("test.kdl", "user \"a\"; sessions \"/s\"").unwrap();
+        let config = Config::parse("test.kdl", "sessions \"/s\"").unwrap();
         let look = config.look;
         assert!(look.avatar.is_some() && look.clock.is_some());
         assert_eq!(config.keyboard_layout, None);
@@ -94,20 +89,15 @@ mod tests {
     #[test]
     fn bad_configs_are_rejected_where_they_are() {
         for (text, want) in [
-            ("sessions \"/s\"", "child node `user` is required"),
-            ("user \"a\"", "child node `sessions` is required"),
             (
-                "user 1; sessions \"/s\"",
-                "expected string scalar, found integer",
+                "keyboard-layout \"de\"",
+                "child node `sessions` is required",
             ),
-            (
-                "user \"a\"; sessions \"/s\"; colour 1",
-                "unexpected node `colour`",
-            ),
-            (
-                "user \"a\"; sessions \"/s\"; look { clock; }",
-                "`password` is required",
-            ),
+            ("sessions 1", "expected string scalar, found integer"),
+            ("sessions \"/s\"; colour 1", "unexpected node `colour`"),
+            // The user comes from the passwd database now.
+            ("user \"a\"; sessions \"/s\"", "unexpected node `user`"),
+            ("sessions \"/s\"; look { clock; }", "`password` is required"),
         ] {
             let err = format!("{:#}", Config::parse("test.kdl", text).unwrap_err());
             assert!(err.contains(want), "{text:?}: {err}");

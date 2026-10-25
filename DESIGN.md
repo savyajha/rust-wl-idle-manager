@@ -645,8 +645,8 @@ virtio-gpu hides it.
 
 ## The greeter
 
-`rust-wl-greeter` logs one configured user in through greetd. greetd runs it on
-the greeter compositor, as the `greeter` user:
+`rust-wl-greeter` lets the user choose who logs in, and logs them in through
+greetd. greetd runs it on the greeter compositor, as the `greeter` user:
 
 ```sh
 rust-wl-greeter-compositor [options] -- rust-wl-greeter --config PATH
@@ -659,13 +659,78 @@ layout) when the system is built. greetd connects a greeter's stdin, stdout and
 stderr to the VT, so the module runs both programs under `systemd-cat -t
 rust-wl-greeter`, which sends what they log to the journal.
 
-The config is KDL: `user` (who logs in), `sessions` (a directory of `.desktop`
-files), optionally `keyboard-layout` (an xkb layout the greeter compiles itself,
+The config is KDL: `sessions` (a directory of `.desktop` files), optionally
+`keyboard-layout` (an xkb layout the greeter compiles itself,
 instead of using the compositor's keymap; the compositor's modifiers are still
 used, as the eight real modifiers are the same in every keymap), and optionally
 `look`, which takes the lock screen's `lock-screen` widgets. Without a `look`,
 the lock screen's default is used with the avatar, name and field 100 pixels
 higher. There is no theme yet: GTK's built-in colours and "Sans".
+
+### Users
+
+The users offered are those of `/etc/passwd` (read directly: the nix crate has
+no way to list the passwd database) whose UID is in `/etc/login.defs`'s
+`UID_MIN`..`UID_MAX` (the last line of each counts; 1000 and 60000 where one is
+missing or invalid), and whose shell does not end in `nologin` or `false` (an
+empty one is `/bin/sh`), as GDM and LightDM list them without AccountsService.
+Each is called by their GECOS name, up to its first comma, else their user name;
+they are sorted by that, ignoring case. A byte that is not UTF-8 is replaced; if
+`/etc/passwd` cannot be read, none are listed.
+
+The avatar row has each user's avatar (their initial in a circle) with their
+name under it, then "Other…", centred where the look puts the avatar, in
+columns 120 pixels wide (wider for a longer name). With several users the
+greeter starts on it; with one, on that user's login, as below, with "‹ Users"
+leading to the row of them and "Other…". No greetd session is created until a
+user is chosen, by Enter or a click on their avatar; Escape at their login, or
+"‹ Users", cancels it and goes back to the row, on their avatar. "Other…" asks
+for any user name (root, a user outside the UID range, one known only to NSS) in
+a visible field; Enter there logs that user in, called by their full name if
+they are listed, else by the name typed, which the greeter never logs (it might
+be a password typed in the wrong place). PAM still may: pam_unix logs the name
+when a login is cancelled at its prompt ("could not identify password for
+[…]"), as it does for any login. Escape at a typed user's login goes back to the
+user name, and from there to the row. With no one listed the greeter starts on
+the user name, with no row. Typing on the row does nothing: it has no field.
+
+The row starts on the last user to log in: on "Other…" if they are not listed,
+on the first if there is none. The
+last user is remembered with the sessions (below). The first time the greeter
+runs without one, it takes tuigreet's, `/var/cache/tuigreet/lastuser` (a user
+name, read only if it is a plain file, not a link, of at most 256 bytes, naming
+a listed user; opened without blocking, as a FIFO would block). greetd's
+NixOS module creates that directory, owned by `greeter`, and tuigreet runs as
+that user, so the greeter can read it.
+
+Switching users and the login's conversation (below): going back cancels
+greetd's session at once at a prompt, else as soon as greetd has responded to
+the request in flight; an answer submitted ahead is discarded, as is anything
+typed. A failure's 2 s pause ends when the user goes back. Choosing a user
+again while the cancel is in flight creates their session once it is done. The
+field is for a secret again for each new user, so an answer typed ahead for
+them answers their password. A session already being started is not given up.
+Each user gets their own last session in the session chip; one chosen in the
+popup applies to that login only. The five-failure cooldown counts across
+users: it slows guessing at this screen, whoever is guessed at. A wrong answer
+still counts when the user goes back before greetd says it was wrong (nothing is
+shown), or going back and choosing again would be a way round the cooldown.
+
+### Keyboard focus
+
+The widgets shown take the keyboard's focus in reading order: the avatars on
+the row; on a login, the field, "‹ Users" (with a row), the session chip (with
+more than one session, once the user is known) and Log In. Tab and Shift+Tab
+move it, and round; Left and Right move it along the row. Enter and Space
+activate the widget focused (Space on the session chip opens the popup), except
+in the field, which takes them, as it takes any key that types (a character,
+Backspace); typed elsewhere, such a key moves the focus to the field first.
+Escape is the compositor's for the popup, which it dismisses, and otherwise
+cancels. A ring two pixels wide, white at 0.7 (brighter than the widgets'
+outlines), two pixels out, shows the focus once a key has moved it, until a
+click (which focuses what it hits, without the ring). The logic is `focus.rs`
+and `chooser.rs`, which do no I/O. In the session popup, Space chooses as Enter
+does.
 
 ### The screen
 
@@ -687,8 +752,10 @@ A click on the session chip opens the session popup: an `xdg_popup` under the
 chip, with a grab, listing the sessions. Up and Down move its highlight, Enter
 or a click on a row chooses; Escape or a click outside it (handled by the
 compositor) dismisses it. A click on the Log In button submits like Enter; a
-click on "‹ Users", or Escape, gives up the login and starts it again (with one
-user, there is no chooser to go back to yet).
+click on "‹ Users", or Escape, gives up the login and goes back (see Users).
+On the avatar row, the screen has the
+background, date and clock, and the row instead of the user's avatar, name and
+field.
 
 ### Logging in
 
@@ -709,7 +776,7 @@ user's (greetd reports every PAM failure as `auth_error`, a locked account or
 failed) would come back at once, so then the session is created again only
 after 2 s.
 greetd's description of an error is never shown or logged: it may contain what
-was typed. Escape at a prompt cancels and starts again at once. An answer
+was typed. Escape at a prompt goes back (see Users). An answer
 submitted before greetd's prompt has come (typed ahead at start-up, or during a
 pause) answers that prompt when it comes, if it is of the kind the field showed
 (a secret one at first, then the last prompt's); a prompt of the other kind
@@ -735,7 +802,8 @@ is sent in single quotes. The session's environment is `XDG_SESSION_TYPE=wayland
 The session chosen is the user's last one, else the first by name. Once
 greetd has accepted `start_session`, it is written to
 `/var/lib/rust-wl-greeter/state` (a directory the NixOS module creates, owned
-by `greeter`), as KDL `session "user" "file.desktop"` lines, into a new file of
+by `greeter`), with the user as the last user, as KDL: a `last-user "user"`
+line, then `session "user" "file.desktop"` lines, into a new file of
 mode 0600 (any left from before is removed first, and it is opened with
 `O_NOFOLLOW` and `O_EXCL`), which is then renamed over the old one, and the
 directory synced. A state file that cannot be read or parsed is logged and
@@ -760,7 +828,9 @@ password are outside the greeter's reach.
 
 ### Logging and tests
 
-It logs to stderr: the sessions and the one chosen, the user greeted, each
+It logs to stderr: the users listed and the last user (and whether it came
+from tuigreet), the sessions and the one chosen, the user greeted, going back to
+the row and "Other…", each
 output's first frame, each prompt's kind (never its answer), messages and
 failures by kind, cancels, the session popup, and the session started.
 
@@ -771,5 +841,8 @@ TOTP secret for a visible verification code (pam_google_authenticator with
 then the right one, Escape and the "‹ Users" chip, the Log In button, the
 session popup by keyboard and by click, the state file and the session
 remembered after greetd restarts, both prompts, the "de" keymap the greeter
-compiles, and that no password or code reaches the journal. Each session writes
+compiles, and that no password or code reaches the journal; the focus ring and
+keys; then, with users added, the avatar row, the last user and each user's
+session after a restart, going back to the row, "Other…" for an unlisted user,
+and seeding from tuigreet's last user. Each session writes
 a marker of its arguments and environment.

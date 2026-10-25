@@ -39,7 +39,8 @@ use wayland_protocols::xdg::shell::client::xdg_positioner::{
 };
 use xkbcommon::xkb::Keysym;
 
-use crate::login::{self, Extras, Hit, Login, SessionList, View};
+use crate::focus::{self, Action, Widget};
+use crate::login::{self, Extras, Login, SessionList, View};
 use ui::draw::{self, Layout, Painter, Scene};
 use ui::entry::{Key, Status};
 use ui::frames::{Frame, Frames};
@@ -51,8 +52,10 @@ const BTN_LEFT: u32 = 0x110;
 pub enum Event {
     /// The answer was submitted, by Enter or the Log In button; `Entry::submission` has it.
     Submit,
-    /// Escape or the "‹ Users" chip: give up this login and start over.
+    /// Escape or the "‹ Users" chip: give up this login.
     Cancel,
+    /// The avatar at this place in the row was activated.
+    Choose(usize),
 }
 
 pub struct Wayland {
@@ -248,6 +251,15 @@ impl Wayland {
         &mut self.state.login
     }
 
+    /// Greet `name`: the avatar's initial and the name under it, on every output again.
+    pub fn set_name(&mut self, name: String) {
+        self.state.painter.set_name(name);
+        for toplevel in &mut self.state.toplevels {
+            toplevel.prepared = None;
+            toplevel.surface.forget();
+        }
+    }
+
     /// Wait for the next event from the login screen; an error means the compositor is gone.
     /// Cancel-safe: what has been dispatched stays queued.
     pub async fn next(&mut self) -> anyhow::Result<Event> {
@@ -343,7 +355,11 @@ impl State {
         }
         let paint = |canvas: &mut [u8]| match &shows {
             Shown::Login(view) => {
-                prepared.scene.draw(canvas, view.look);
+                if view.row.is_some() {
+                    prepared.scene.draw_times(canvas);
+                } else {
+                    prepared.scene.draw(canvas, view.look);
+                }
                 if let Some(extras) = &prepared.extras {
                     let drawn = draw::draw_on(canvas, layout.pixels, cairo::Format::Rgb24, |cr| {
                         extras.paint(cr)
@@ -462,30 +478,44 @@ impl State {
             return;
         };
         let f = f64::from(toplevel.surface.scale) / 120.0;
-        match extras.hit(at.x * f, at.y * f) {
-            Some(Hit::LogIn) => {
-                if self.login.entry.press(Key::Enter, BTN_LEFT, Instant::now()) {
-                    self.events.push_back(Event::Submit);
-                }
-            }
-            Some(Hit::Users) => self.events.push_back(Event::Cancel),
-            Some(Hit::Session) => {
+        if let Some(widget) = extras.hit(at.x * f, at.y * f) {
+            self.login.chooser.focus.click(widget);
+            self.act(Action::Activate(widget), qh);
+        }
+    }
+
+    /// Do what a key or click on a widget does, but type.
+    fn act(&mut self, action: Action, qh: &QueueHandle<Self>) {
+        let Action::Activate(widget) = action else {
+            return;
+        };
+        match widget {
+            Widget::Avatar(i) => self.events.push_back(Event::Choose(i)),
+            Widget::Pill => {}
+            Widget::Users => self.events.push_back(Event::Cancel),
+            Widget::Session => {
                 if let Err(e) = self.open_popup(qh) {
                     error!("opening the session popup: {e:#}");
                 }
             }
-            None => {}
+            // As Enter in the field; the "key" is the button, which does not repeat.
+            Widget::LogIn => {
+                if self.login.entry.press(Key::Enter, BTN_LEFT, Instant::now()) {
+                    self.events.push_back(Event::Submit);
+                }
+            }
         }
     }
 
-    /// Act on a key pressed while the session popup is open: arrows move, Enter chooses.
+    /// Act on a key pressed while the session popup is open: arrows move, Enter or Space
+    /// chooses.
     fn popup_key(&mut self, keysym: Option<Keysym>) {
         let Some(popup) = &mut self.popup else { return };
         let last = self.login.sessions.len() - 1;
         match keysym {
             Some(Keysym::Up) => popup.selected = popup.selected.saturating_sub(1),
             Some(Keysym::Down) => popup.selected = (popup.selected + 1).min(last),
-            Some(Keysym::Return | Keysym::KP_Enter) => {
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => {
                 let selected = popup.selected;
                 self.choose(selected);
             }
@@ -672,7 +702,7 @@ impl Dispatch<WlKeyboard, ()> for State {
         wl_event: wl_keyboard::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         if let wl_keyboard::Event::Key {
             serial,
@@ -682,12 +712,31 @@ impl Dispatch<WlKeyboard, ()> for State {
         } = wl_event
         {
             state.serial = serial;
-            let keysym = state.login.keyboard.keysym(key);
+            let keyboard = &state.login.keyboard;
+            let keysym = keyboard.keysym(key);
             if state.popup.is_some() {
                 return state.popup_key(keysym);
             }
-            if keysym == Some(Keysym::Escape) {
-                return state.events.push_back(Event::Cancel);
+            let focus_key = match keysym {
+                Some(Keysym::Escape) => return state.events.push_back(Event::Cancel),
+                Some(Keysym::Tab) => Some(focus::Key::Tab),
+                Some(Keysym::ISO_Left_Tab) => Some(focus::Key::BackTab),
+                Some(Keysym::Left) => Some(focus::Key::Left),
+                Some(Keysym::Right) => Some(focus::Key::Right),
+                Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => {
+                    Some(focus::Key::Activate)
+                }
+                _ if keyboard.key(key).is_some() => Some(focus::Key::Text),
+                // Modifiers and keys that do nothing.
+                _ => None,
+            };
+            if let Some(focus_key) = focus_key {
+                let chooser = &mut state.login.chooser;
+                let shown = chooser.shown();
+                match chooser.focus.key(focus_key, &shown) {
+                    Action::Type => {}
+                    action => return state.act(action, qh),
+                }
             }
         }
         let login = &mut state.login;

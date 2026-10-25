@@ -1,15 +1,19 @@
 //! rust-wl-greeter: a greetd greeter that looks like rust-wl-idle-manager's lock screen.
 //!
 //! greetd runs it on its own compositor (`rust-wl-greeter-compositor … -- rust-wl-greeter
-//! --config <path>`). It logs the configured user in through greetd's prompts (flow.rs) and
-//! exits once greetd has the chosen session to start. `--check <path>` validates a config.
+//! --config <path>`). The user chooses who logs in (chooser.rs, users.rs), who is logged in
+//! through greetd's prompts (flow.rs); it exits once greetd has the chosen session to start.
+//! `--check <path>` validates a config.
 
+mod chooser;
 mod config;
 mod flow;
+mod focus;
 mod greetd;
 mod login;
 mod sessions;
 mod state;
+mod users;
 mod wayland;
 
 use std::env;
@@ -26,6 +30,7 @@ use tokio::time::{self, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
+use chooser::{Chooser, Screen};
 use config::Config;
 use flow::{Flow, Request, Show, Step};
 use greetd::Greetd;
@@ -34,10 +39,16 @@ use state::State;
 use ui::draw::Painter;
 use ui::entry::Entry;
 use ui::keyboard::Keyboard;
+use users::User;
 use wayland::{Event, Wayland};
 
-/// Each user's last session (see state.rs); the NixOS module creates its directory.
+/// The last user and each user's last session (see state.rs); the NixOS module creates its
+/// directory.
 const STATE: &str = "/var/lib/rust-wl-greeter/state";
+
+/// tuigreet's last user, which seeds ours. greetd's NixOS module creates its directory, the
+/// greeter user's, as tuigreet runs as that user too.
+const TUIGREET_LAST_USER: &str = "/var/cache/tuigreet/lastuser";
 
 /// How long after a failure with no answer the session is created again.
 const RETRY_PAUSE: Duration = Duration::from_secs(2);
@@ -104,23 +115,19 @@ async fn greet(path: &Path) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
     let config = Config::load(path)?;
     let sessions = sessions::load(&config.sessions)?;
-    let state = State::load(Path::new(STATE));
-    let remembered = state.session(&config.user);
-    let remembered = remembered.and_then(|file| sessions.iter().position(|s| s.file == file));
-    let chosen = remembered.unwrap_or(0);
-    let names: Vec<_> = sessions.iter().map(|s| s.name.as_str()).collect();
-    let how = if remembered.is_some() {
-        "remembered"
-    } else {
-        "first"
-    };
-    let chosen_name = &sessions[chosen].name;
-    info!(
-        "sessions: {}; {chosen_name} chosen ({how})",
-        names.join(", ")
-    );
-    let name = full_name(&config.user);
-    info!("greeting {} ({name})", config.user);
+    let users = users::load();
+    let mut state = State::load(Path::new(STATE));
+    let seeded = state.seed_last_user(Path::new(TUIGREET_LAST_USER), &users);
+    if let Some(last) = state.last_user() {
+        let how = if seeded {
+            "from tuigreet"
+        } else {
+            "remembered"
+        };
+        info!("last user {last} ({how})");
+    }
+    let session_chip = sessions.len() > 1;
+    let chooser = Chooser::new(users, state.last_user(), session_chip);
     let keyboard = match &config.keyboard_layout {
         Some(layout) => Keyboard::with_layout(layout)?,
         None => Keyboard::default(),
@@ -134,21 +141,28 @@ async fn greet(path: &Path) -> anyhow::Result<()> {
         },
         message: None,
         sessions,
-        chosen,
+        chosen: 0,
+        chooser,
     };
-    // No theme yet: GTK's built-in colours and font.
-    let wayland = Wayland::connect(login, Painter::new(config.look, None, name))?;
-    let (flow, step) = Flow::start();
+    // No theme yet: GTK's built-in colours and font. The name is set with the user.
+    let painter = Painter::new(config.look, None, String::new());
     let mut greeter = Greeter {
-        user: config.user,
-        wayland,
+        user: String::new(),
+        wayland: Wayland::connect(login, painter)?,
         greetd: Greetd::connect().await?,
-        flow,
+        flow: Flow::new(),
         state,
         started: None,
         retry_at: None,
     };
-    greeter.perform(step).await?;
+    match greeter.wayland.login().chooser.screen.clone() {
+        Screen::Login(user) => {
+            let step = greeter.begin(user);
+            greeter.perform(step).await?;
+        }
+        Screen::UserName => greeter.ask_user_name(),
+        Screen::Row => {}
+    }
     loop {
         let retry_at = greeter.retry_at.unwrap_or_else(Instant::now);
         let step = tokio::select! {
@@ -172,15 +186,22 @@ async fn greet(path: &Path) -> anyhow::Result<()> {
 
 /// The login: what the user does on the screen, and the conversation with greetd.
 struct Greeter {
+    /// The user being logged in, whose session is created.
     user: String,
     wayland: Wayland,
     greetd: Greetd,
     flow: Flow,
     state: State,
-    /// The session `start_session` was sent for, in `Login::sessions`.
-    started: Option<usize>,
+    started: Option<Started>,
     /// When to create the session again, after a failure.
     retry_at: Option<Instant>,
+}
+
+/// What `start_session` was sent for.
+struct Started {
+    user: String,
+    /// In `Login::sessions`.
+    session: usize,
 }
 
 impl Greeter {
@@ -188,15 +209,61 @@ impl Greeter {
         let login = self.wayland.login();
         login.message = None;
         match event {
-            Event::Submit => self.flow.submit(),
-            Event::Cancel => {
-                if self.flow.at_prompt() {
-                    info!("cancelled; starting over");
-                    login.entry.wipe();
+            Event::Choose(i) => match login.chooser.choose(i) {
+                Some(user) => self.begin(user),
+                None => {
+                    if login.chooser.screen == Screen::UserName {
+                        self.ask_user_name();
+                    }
+                    Step::default()
                 }
-                self.flow.cancel()
+            },
+            Event::Submit if login.chooser.screen == Screen::UserName => {
+                let typed = String::from_utf8_lossy(login.entry.submission().bytes()).into_owned();
+                login.entry.answered();
+                match login.chooser.name_typed(&typed) {
+                    Some(user) => self.begin(user),
+                    None => Step::default(),
+                }
             }
+            Event::Submit => self.flow.submit(),
+            Event::Cancel if login.chooser.back() => {
+                if login.chooser.screen == Screen::UserName {
+                    info!("cancelled; back to the user name");
+                    self.ask_user_name();
+                } else {
+                    info!("cancelled; back to the users");
+                }
+                self.flow.leave()
+            }
+            // On the row, or at the user name with no row: nothing to go back to.
+            Event::Cancel => Step::default(),
         }
+    }
+
+    /// Show "Other…"'s field for a user name.
+    fn ask_user_name(&mut self) {
+        info!("asking for a user name");
+        self.wayland.set_name(chooser::OTHER.to_owned());
+    }
+
+    /// Log `user` in, with their last session preselected.
+    fn begin(&mut self, user: User) -> Step {
+        let login = self.wayland.login();
+        login.chosen = sessions::preselect(&login.sessions, self.state.session(&user.name));
+        login.prompt = Prompt {
+            secret: true,
+            text: String::new(),
+        };
+        // What is typed for "Other…" may be a password typed in the wrong place.
+        if login.chooser.is_listed(&user) {
+            info!("greeting {} ({})", user.name, user.full_name);
+        } else {
+            info!("greeting a user who is not listed");
+        }
+        self.wayland.set_name(user.full_name);
+        self.user = user.name;
+        self.flow.begin()
     }
 
     /// Show and send what `step` says; returns whether the session is started.
@@ -230,9 +297,11 @@ impl Greeter {
                 login.message = Some("Could not log in; try again".into());
             }
             Some(Show::Started) => {
-                let started = self.started.expect("greetd starts only the session sent");
-                let session = &login.sessions[started];
-                self.state.set_session(&self.user, &session.file);
+                let started = self.started.take();
+                let started = started.expect("greetd starts only the session sent");
+                let session = &login.sessions[started.session];
+                self.state.set_last_user(&started.user);
+                self.state.set_session(&started.user, &session.file);
                 if let Err(e) = self.state.save(Path::new(STATE)) {
                     warn!("not remembering the session: {e:#}");
                 }
@@ -243,6 +312,10 @@ impl Greeter {
         if step.discard {
             login.entry.answered();
             login.entry.wipe();
+        }
+        if step.wrong {
+            info!("wrong password, for a login given up");
+            login.entry.count_failure(Instant::now());
         }
         // A failure with no answer (a locked account) would come back at once, every time.
         if step.pause {
@@ -267,7 +340,10 @@ impl Greeter {
             },
             Request::Acknowledge => ipc::Request::PostAuthMessageResponse { response: None },
             Request::Start => {
-                self.started = Some(login.chosen);
+                self.started = Some(Started {
+                    user: self.user.clone(),
+                    session: login.chosen,
+                });
                 let session = &login.sessions[login.chosen];
                 info!("starting session {} ({})", session.name, session.file);
                 ipc::Request::StartSession {
@@ -278,20 +354,6 @@ impl Greeter {
             Request::Cancel => ipc::Request::CancelSession,
         };
         self.greetd.request(&request).await
-    }
-}
-
-/// `user`'s full name: the passwd database's GECOS field up to its first comma, or without
-/// one, the user name.
-fn full_name(user: &str) -> String {
-    let entry = nix::unistd::User::from_name(user).ok().flatten();
-    let gecos = entry.map(|entry| entry.gecos.to_string_lossy().into_owned());
-    let gecos = gecos.unwrap_or_default();
-    let name = gecos.split(',').next().unwrap_or_default().trim();
-    if name.is_empty() {
-        user.to_owned()
-    } else {
-        name.to_owned()
     }
 }
 
@@ -307,12 +369,5 @@ mod tests {
         assert_eq!(parse(&["--config"]), None);
         assert_eq!(parse(&["--check", "a", "b"]), None);
         assert_eq!(parse(&[]), None);
-    }
-
-    #[test]
-    fn a_user_without_a_full_name_is_called_by_their_user_name() {
-        assert_eq!(full_name("no-such-user-here"), "no-such-user-here");
-        // root exists everywhere, with or without a GECOS name.
-        assert!(!full_name("root").is_empty());
     }
 }

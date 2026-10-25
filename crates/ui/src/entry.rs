@@ -188,21 +188,30 @@ impl Entry {
         if !self.checking {
             return false;
         }
-        let failures = if ok { 0 } else { self.failures + 1 };
+        let failures = self.failures;
         self.reset();
-        self.failures = failures;
         if ok {
             return true;
         }
-        if failures % COOLDOWN_AFTER == 0 {
-            info!(
-                "{COOLDOWN_AFTER} wrong passwords; waiting {} s",
-                COOLDOWN.as_secs()
-            );
-            self.cooldown_until = Some(now + COOLDOWN);
-        } else {
+        self.failures = failures;
+        if !self.count_failure(now) {
             self.failed_until = Some(now + FAILED_FOR);
         }
+        true
+    }
+
+    /// Count a wrong answer towards the cooldown, showing nothing (`checked` shows it); for
+    /// one whose attempt was given up. Returns whether a cooldown started.
+    pub fn count_failure(&mut self, now: Instant) -> bool {
+        self.failures += 1;
+        if !self.failures.is_multiple_of(COOLDOWN_AFTER) {
+            return false;
+        }
+        info!(
+            "{COOLDOWN_AFTER} wrong passwords; waiting {} s",
+            COOLDOWN.as_secs()
+        );
+        self.cooldown_until = Some(now + COOLDOWN);
         true
     }
 
@@ -690,5 +699,19 @@ mod tests {
         assert_eq!(typed(&entry), b"");
         // Held, it does not repeat: nothing is due.
         assert_eq!(entry.deadline(now), None);
+    }
+
+    #[test]
+    fn failures_counted_silently_join_the_cooldown() {
+        let (mut entry, now) = entry();
+        for _ in 0..4 {
+            assert!(!entry.count_failure(now));
+        }
+        // Nothing shown for those.
+        assert_eq!(entry.look(now).status, Status::Idle);
+        entry.press(Key::Char('x'), 1, now);
+        entry.press(Key::Enter, 2, now);
+        entry.checked(/* ok */ false, now);
+        assert_eq!(entry.look(now).status, Status::Cooldown(30));
     }
 }

@@ -125,7 +125,8 @@ struct Widgets {
     field: Field,
 }
 
-struct Avatar {
+/// A user's avatar: a frosted circle with their initial.
+pub struct Avatar {
     circle: Circle,
     initial: Label,
 }
@@ -176,6 +177,11 @@ impl Painter {
             name,
             wallpaper: None,
         }
+    }
+
+    /// Draw `name` under the avatar, and its initial in it, in the scenes prepared from now.
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
     }
 
     pub fn reload(&mut self, wallpaper: Option<Blurred>) {
@@ -233,23 +239,23 @@ impl Painter {
     fn avatar(&self, avatar: &config::Avatar, layout: Layout) -> Result<Avatar, cairo::Error> {
         let d = avatar.diameter.0;
         let rect = layout.physical(layout.logical_top_left(&avatar.place, (d, d)), (d, d));
+        self.avatar_in(&self.name, rect, layout.factor())
+    }
+
+    /// `name`'s avatar filling `square` (physical pixels), at `factor` physical pixels per
+    /// logical one, its initial sized and coloured as the configured avatar's.
+    pub fn avatar_in(&self, name: &str, square: Rect, factor: f64) -> Result<Avatar, cairo::Error> {
         let circle = Circle {
-            center: rect.center(),
-            radius: rect.w / 2.0,
+            center: square.center(),
+            radius: square.w / 2.0,
         };
-        let initial: String = self
-            .name
-            .chars()
-            .take(1)
-            .flat_map(char::to_uppercase)
-            .collect();
-        let font = Font::new(
-            d * INITIAL_SIZE,
-            Weight::Semibold,
-            self.palette.get(&avatar.color),
-        );
+        let initial: String = name.chars().take(1).flat_map(char::to_uppercase).collect();
+        let avatar = self.config.avatar.as_ref();
+        let diameter = avatar.map_or(square.w / factor, |avatar| avatar.diameter.0);
+        let color = avatar.map_or([1.0; 4], |avatar| self.palette.get(&avatar.color));
+        let font = Font::new(diameter * INITIAL_SIZE, Weight::Semibold, color);
         let place = |size| centered(size, circle.center);
-        let initial = self.label(&initial, &font, layout.factor(), place)?;
+        let initial = self.label(&initial, &font, factor, place)?;
         Ok(Avatar { circle, initial })
     }
 
@@ -611,6 +617,15 @@ impl Scene {
         });
     }
 
+    /// Draw the background with the date and clock, and no user (avatar, name or field),
+    /// into `canvas`, as `draw` does.
+    pub fn draw_times(&self, canvas: &mut [u8]) {
+        self.draw_with(canvas, |cr, widgets| {
+            widgets.paint_background(cr, self.layout)?;
+            widgets.paint_times(cr)
+        });
+    }
+
     fn draw_with(
         &self,
         canvas: &mut [u8],
@@ -635,6 +650,11 @@ impl Scene {
     /// The password field, in physical pixels; `None` in a plain scene.
     pub fn pill(&self) -> Option<Rect> {
         self.widgets.as_ref().map(|widgets| widgets.field.pill)
+    }
+
+    /// The avatar's square, in physical pixels; `None` without one.
+    pub fn avatar(&self) -> Option<Rect> {
+        self.widgets.as_ref()?.avatar.as_ref().map(Avatar::square)
     }
 }
 
@@ -671,18 +691,43 @@ impl Widgets {
         cr.restore()
     }
 
+    fn paint_times(&self, cr: &Context) -> Result<(), cairo::Error> {
+        for time in [&self.date, &self.clock].into_iter().flatten() {
+            time.label.paint(cr, 1.0)?;
+        }
+        Ok(())
+    }
+
     fn paint(&self, cr: &Context, layout: Layout, look: Look) -> Result<(), cairo::Error> {
-        let times = [&self.date, &self.clock].into_iter().flatten();
-        for label in times.map(|time| &time.label).chain(&self.name) {
-            label.paint(cr, 1.0)?;
+        self.paint_times(cr)?;
+        if let Some(name) = &self.name {
+            name.paint(cr, 1.0)?;
         }
         let line = layout.factor();
         if let Some(avatar) = &self.avatar {
-            avatar.circle.trace(cr);
-            frost(cr, AVATAR, [1.0, 1.0, 1.0, AVATAR_OUTLINE], line)?;
-            avatar.initial.paint(cr, 1.0)?;
+            avatar.paint(cr, line)?;
         }
         self.field.paint(cr, look, line)
+    }
+}
+
+impl Avatar {
+    /// Draw it; `line` is a logical pixel's width.
+    pub fn paint(&self, cr: &Context, line: f64) -> Result<(), cairo::Error> {
+        self.circle.trace(cr);
+        frost(cr, AVATAR, [1.0, 1.0, 1.0, AVATAR_OUTLINE], line)?;
+        self.initial.paint(cr, 1.0)
+    }
+
+    /// The square around it, in physical pixels.
+    pub fn square(&self) -> Rect {
+        let Circle { center, radius } = self.circle;
+        Rect {
+            x: center.0 - radius,
+            y: center.1 - radius,
+            w: 2.0 * radius,
+            h: 2.0 * radius,
+        }
     }
 }
 

@@ -1188,7 +1188,6 @@ dependencies = [
  "greetd_ipc",
  "knuffel",
  "libc",
- "nix",
  "pango",
  "rust-wl-ui",
  "smithay-client-toolkit",

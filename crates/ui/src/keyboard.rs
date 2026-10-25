@@ -55,23 +55,26 @@ impl Keyboard {
         Some(xkb.key_get_one_sym(xkb::Keycode::new(code + 8)))
     }
 
-    /// Act on the key with evdev `code`, pressed; returns whether it submitted the password.
-    fn press(&self, entry: &mut Entry, code: u32) -> bool {
-        let Some(xkb) = &self.xkb_state else {
-            return false;
-        };
+    /// What the key with evdev `code` means to an `Entry`, with the modifiers in effect.
+    pub fn key(&self, code: u32) -> Option<Key> {
+        let xkb = self.xkb_state.as_ref()?;
         // xkbcommon numbers keys from 8.
         let keycode = xkb::Keycode::new(code + 8);
         let alt_or_logo = [xkb::MOD_NAME_ALT, xkb::MOD_NAME_LOGO]
             .iter()
             .any(|name| xkb.mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE));
         let ctrl = xkb.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
-        let key = Key::from_xkb(
+        Key::from_xkb(
             xkb.key_get_one_sym(keycode),
             xkb.key_get_utf32(keycode),
             alt_or_logo,
             ctrl,
-        );
+        )
+    }
+
+    /// Act on the key with evdev `code`, pressed; returns whether it submitted the password.
+    fn press(&self, entry: &mut Entry, code: u32) -> bool {
+        let key = self.key(code);
         key.is_some_and(|key| entry.press(key, code, Instant::now()))
     }
 

@@ -10,8 +10,6 @@ cairo-rs = { version = "0.22", default-features = false }
 greetd_ipc = { version = "0.10.3", features = ["tokio-codec"] }
 knuffel.workspace = true
 libc.workspace = true
-# getpwnam_r, for the user's full name.
-nix = { version = "0.31", default-features = false, features = ["user"] }
 pango.workspace = true
 rust-wl-ui.workspace = true
 smithay-client-toolkit = { version = "0.21", default-features = false }

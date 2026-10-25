@@ -6,7 +6,7 @@ use std::mem;
 use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
@@ -105,6 +105,22 @@ pub fn load(dir: &Path) -> anyhow::Result<Vec<Session>> {
     sessions.sort_by(|a, b| (&a.name, &a.file).cmp(&(&b.name, &b.file)));
     ensure!(!sessions.is_empty(), "no sessions in {}", dir.display());
     Ok(sessions)
+}
+
+/// Which of `sessions` to start for a user whose last was `remembered` (its file name):
+/// that one while it is there, else the first.
+pub fn preselect(sessions: &[Session], remembered: Option<&str>) -> usize {
+    let remembered = remembered.and_then(|file| sessions.iter().position(|s| s.file == file));
+    let chosen = remembered.unwrap_or(0);
+    let names: Vec<_> = sessions.iter().map(|s| s.name.as_str()).collect();
+    let how = if remembered.is_some() {
+        "remembered"
+    } else {
+        "first"
+    };
+    let (names, name) = (names.join(", "), &sessions[chosen].name);
+    info!("sessions: {names}; {name} chosen ({how})");
+    chosen
 }
 
 /// A string value's escapes: `\s`, `\n`, `\t`, `\r` and `\\`. Any other backslash is kept,
@@ -291,5 +307,18 @@ mod tests {
         assert_eq!(names, ["Alpha", "Beta", "Gamma"]);
         fs::remove_dir_all(&dir).unwrap();
         assert!(load(&dir).is_err());
+    }
+
+    #[test]
+    fn the_remembered_session_is_preselected_while_it_is_there() {
+        let sessions = ["a", "b"].map(|name| Session {
+            file: format!("{name}.desktop"),
+            name: name.into(),
+            exec: vec![name.into()],
+            desktop_names: Vec::new(),
+        });
+        assert_eq!(preselect(&sessions, Some("b.desktop")), 1);
+        assert_eq!(preselect(&sessions, Some("gone.desktop")), 0);
+        assert_eq!(preselect(&sessions, None), 0);
     }
 }

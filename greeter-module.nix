@@ -14,7 +14,6 @@ let
     pkgs.runCommand "rust-wl-greeter.kdl"
       {
         text = ''
-          user ${quote cfg.user}
           sessions ${quote cfg.sessions}
           ${lib.optionalString (cfg.keyboardLayout != null) "keyboard-layout ${quote cfg.keyboardLayout}"}
           ${cfg.extraConfig}
@@ -41,10 +40,6 @@ in
       type = lib.types.package;
       default = pkgs.callPackage ./greeter-compositor.nix { };
       description = "The greeter's compositor.";
-    };
-    user = lib.mkOption {
-      type = lib.types.str;
-      description = "The user who logs in.";
     };
     sessions = lib.mkOption {
       type = lib.types.str;
@@ -86,6 +81,9 @@ in
     };
     # The compositor's Ctrl+Alt+Fn goes through logind, which asks polkit.
     security.polkit.enable = true;
+    # The greeter also reads tuigreet's last user, once, from /var/cache/tuigreet/lastuser:
+    # greetd's module creates that directory (the greeter user's, 0755) and tuigreet, run as
+    # that user too, writes the file 0644, so nothing more is needed.
     systemd.tmpfiles.rules = [ "d /var/lib/rust-wl-greeter 0700 greeter greeter -" ];
   };
 }
