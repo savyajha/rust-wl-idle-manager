@@ -53,6 +53,14 @@ impl Keyboard {
         Ok(())
     }
 
+    /// Forget the keys held, whose releases may never come (the keyboard left, or the
+    /// machine slept), and stop repeating.
+    pub fn forget_held(&mut self, entry: &mut Entry) {
+        entry.stop_repeat();
+        self.held.clear();
+        self.renew(entry);
+    }
+
     /// Follow the key with evdev `code`, pressed for something else than `entry` (a popup,
     /// the focus): its modifier only. The compositor's keymap needs nothing: its modifiers
     /// come in their own events.
@@ -168,11 +176,7 @@ impl Keyboard {
                 }
             }
             // The release may go elsewhere; so may a modifier's, which is forgotten.
-            wl_keyboard::Event::Leave { .. } => {
-                entry.stop_repeat();
-                self.held.clear();
-                self.renew(entry);
-            }
+            wl_keyboard::Event::Leave { .. } => self.forget_held(entry),
             wl_keyboard::Event::Key {
                 key,
                 state: WEnum::Value(key_state),

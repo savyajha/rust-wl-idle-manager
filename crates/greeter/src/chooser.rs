@@ -2,9 +2,14 @@
 //! name. Enter or a click on one starts their login; Escape or "‹ Users" goes back, to the
 //! user name for a user typed, else to the row. With one user listed the greeter starts on
 //! their login, and with none on "Other…"'s user name, which has no row to go back to. The
-//! screen decides which widgets the focus moves through. No I/O.
+//! screen decides which widgets the focus moves through.
+//!
+//! Over any screen, the confirmation dialog of Restart or Shut Down holds the focus: only
+//! its Cancel (focused at first) and its button take keys, and closing it puts the focus
+//! back where it was. Escape closes it first; then it cancels the login. No I/O.
 
 use crate::focus::{Focus, Widget};
+use crate::power::Action;
 use crate::users::User;
 
 /// The last avatar's name.
@@ -32,6 +37,20 @@ pub struct Chooser {
     session_chip: bool,
     /// Whether the layout indicator opens a popup: there is more than one layout.
     layout_chip: bool,
+    /// The power row's actions, once logind has said which it allows.
+    pub power: Vec<Action>,
+    /// The action the dialog asks to confirm, while it is open.
+    pub dialog: Option<Action>,
+    /// Where the focus was before the dialog.
+    before_dialog: Widget,
+}
+
+/// What Escape does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Escape {
+    CloseDialog,
+    /// Cancel the login, going back (see `back`).
+    Cancel,
 }
 
 impl Chooser {
@@ -57,6 +76,9 @@ impl Chooser {
             typed: false,
             session_chip,
             layout_chip,
+            power: Vec::new(),
+            dialog: None,
+            before_dialog: focused,
         }
     }
 
@@ -78,6 +100,9 @@ impl Chooser {
     /// The widgets shown, in reading order; the layout indicator last (W2's order), so
     /// that Tab from the field goes through the login's widgets first.
     pub fn shown(&self) -> Vec<Widget> {
+        if self.dialog.is_some() {
+            return vec![Widget::Cancel, Widget::Confirm];
+        }
         let mut shown = Vec::new();
         if self.screen == Screen::Row {
             shown.extend((0..=self.users.len()).map(Widget::Avatar));
@@ -91,10 +116,45 @@ impl Chooser {
             }
             shown.push(Widget::LogIn);
         }
+        shown.extend((0..self.power.len()).map(Widget::Power));
         if self.layout_chip {
             shown.push(Widget::Layout);
         }
         shown
+    }
+
+    /// Ask to confirm `action` in the dialog, its Cancel focused.
+    pub fn open_dialog(&mut self, action: Action) {
+        if self.dialog.is_none() {
+            self.before_dialog = self.focus.focused;
+        }
+        self.dialog = Some(action);
+        self.focus.focused = Widget::Cancel;
+    }
+
+    /// Close the dialog, the focus back where it was; returns what it asked to confirm.
+    pub fn close_dialog(&mut self) -> Option<Action> {
+        let action = self.dialog.take()?;
+        self.focus.focused = self.before_dialog;
+        Some(action)
+    }
+
+    /// The machine woke: the focus leaves the power row, so that Enter (or a key typed on
+    /// it) does not put it to sleep again. To the field, or on the row the first avatar.
+    pub fn resumed(&mut self) {
+        if matches!(self.focus.focused, Widget::Power(_)) {
+            self.focus.focused = self.shown()[0];
+        }
+    }
+
+    /// What Escape does: the topmost first. (Popups are closed by the compositor's grab
+    /// before the key would come here.)
+    pub fn escape(&self) -> Escape {
+        if self.dialog.is_some() {
+            Escape::CloseDialog
+        } else {
+            Escape::Cancel
+        }
     }
 
     /// Avatar `i` of the row was activated: its user, whose login it shows, or `None` for
@@ -292,5 +352,55 @@ mod tests {
         // Typed there, it goes to the field.
         assert_eq!(chooser.focus.key(Key::Text, &shown), Action::Type);
         assert_eq!(chooser.focus.focused, Pill);
+    }
+
+    #[test]
+    fn the_power_buttons_follow_log_in_and_the_dialog_holds_the_focus() {
+        let mut chooser = Chooser::new(two(), None, false, /* layout_chip */ true);
+        chooser.power = vec![crate::power::Action::Sleep, crate::power::Action::Restart];
+        assert_eq!(
+            chooser.shown(),
+            [Avatar(0), Avatar(1), Avatar(2), Power(0), Power(1), Layout]
+        );
+        chooser.choose(0);
+        assert_eq!(
+            chooser.shown(),
+            [Pill, Users, LogIn, Power(0), Power(1), Layout]
+        );
+        chooser.focus.focused = Power(1);
+        assert_eq!(chooser.escape(), Escape::Cancel);
+        chooser.open_dialog(crate::power::Action::Restart);
+        assert_eq!(chooser.shown(), [Cancel, Confirm]);
+        assert_eq!(chooser.focus.focused, Cancel);
+        assert_eq!(chooser.escape(), Escape::CloseDialog);
+        // Tab goes round its two buttons only, and typing does nothing.
+        let shown = chooser.shown();
+        chooser.focus.key(Key::Tab, &shown);
+        chooser.focus.key(Key::Tab, &shown);
+        assert_eq!(chooser.focus.focused, Cancel);
+        assert_eq!(chooser.focus.key(Key::Text, &shown), Action::None);
+        // Closed, the focus is back.
+        assert_eq!(chooser.close_dialog(), Some(crate::power::Action::Restart));
+        assert_eq!((chooser.focus.focused, chooser.dialog), (Power(1), None));
+        assert_eq!(chooser.close_dialog(), None);
+        // The login under it is as it was.
+        assert!(matches!(chooser.screen, Screen::Login(_)));
+    }
+
+    #[test]
+    fn waking_moves_the_focus_off_the_power_row() {
+        let mut chooser = Chooser::new(two(), None, false, false);
+        chooser.power = vec![crate::power::Action::Sleep];
+        chooser.focus.focused = Power(0);
+        chooser.resumed();
+        assert_eq!(chooser.focus.focused, Avatar(0));
+        chooser.choose(1);
+        chooser.focus.focused = Power(0);
+        chooser.resumed();
+        assert_eq!(chooser.focus.focused, Pill);
+        // Elsewhere, it stays.
+        chooser.focus.focused = LogIn;
+        chooser.resumed();
+        assert_eq!(chooser.focus.focused, LogIn);
     }
 }

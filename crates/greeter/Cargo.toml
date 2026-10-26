@@ -21,5 +21,5 @@ wayland-client.workspace = true
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 xkbcommon = { version = "0.8", default-features = false }
 # The battery, from UPower.
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus.workspace = true
 zeroize.workspace = true

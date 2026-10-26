@@ -487,6 +487,9 @@ pkgs.testers.runNixOSTest {
         uctl(f"systemd-run --user --unit=caps-lock -E WAYLAND_DISPLAY={display} ${pkgs.wtype}/bin/wtype -M capslock -s 3000 -m capslock")
         retry(lambda _: marked(*caps_line, PLAIN) > 20, 10)
         retry(lambda _: marked(*caps_line, PLAIN) == 0, 10)
+        # A real key restarts sway's 5 s idle window (wtype's modifiers alone do not), so
+        # that it does not end just after the unlock and lock again.
+        wtype("-k Escape")
         unlock()
 
     with subtest("five wrong passwords in a row start a cooldown"):

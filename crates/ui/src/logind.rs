@@ -1,3 +1,5 @@
+//! logind's D-Bus interfaces, as the daemon and the greeter use them.
+
 use std::env;
 use std::os::fd::OwnedFd;
 
@@ -28,6 +30,21 @@ pub trait LogindManager {
     fn suspend_then_hibernate(&self, interactive: bool) -> zbus::Result<()>;
 
     fn hibernate(&self, interactive: bool) -> zbus::Result<()>;
+
+    fn reboot(&self, interactive: bool) -> zbus::Result<()>;
+
+    fn power_off(&self, interactive: bool) -> zbus::Result<()>;
+
+    /// Whether the caller may suspend: "yes", "no", "challenge" (polkit would ask for a
+    /// password), "na" (not supported), or, since systemd 261, "inhibited",
+    /// "inhibitor-blocked" or "challenge-inhibitor-blocked". As for the three below.
+    fn can_suspend(&self) -> zbus::Result<String>;
+
+    fn can_hibernate(&self) -> zbus::Result<String>;
+
+    fn can_reboot(&self) -> zbus::Result<String>;
+
+    fn can_power_off(&self) -> zbus::Result<String>;
 
     /// What block-mode inhibitors are held for, colon-separated, e.g. "idle:sleep".
     #[zbus(property)]

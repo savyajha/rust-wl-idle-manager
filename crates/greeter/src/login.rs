@@ -7,14 +7,16 @@ use pango::Weight;
 use tokio::time::Instant;
 use tracing::error;
 use ui::draw::{self, Avatar, Font, Label, Layout, Painter, Rect, Scene};
-use ui::entry::{Entry, Look};
+use ui::entry::{Entry, Look, Status};
 use ui::keyboard::Keyboard;
 use ui::theme::Rgba;
 
 use crate::battery::Battery;
 use crate::chooser::{Chooser, Screen};
 use crate::focus::Widget;
+use crate::icons;
 use crate::layouts::Layout as KeyboardLayout;
+use crate::power::Action;
 use crate::sessions::Session;
 
 // In logical pixels. The Log In button and the "‹ Users" chip sit beside the field, the
@@ -54,6 +56,20 @@ const INDICATOR_HEIGHT: f64 = 24.0;
 const INDICATOR_GAP: f64 = 8.0;
 /// The battery: a body 21 by 12, outlined 1 wide, with a nub 2 by 6.
 const BATTERY_WIDTH: f64 = 23.0;
+
+// The power row, centred at the bottom: buttons 72 by 56 (the icon 24 high, 4 from the
+// top; the label 34 from it), 16 apart, 24 from the bottom.
+const POWER_WIDTH: f64 = 72.0;
+const POWER_HEIGHT: f64 = 56.0;
+const POWER_GAP: f64 = 16.0;
+const POWER_BOTTOM: f64 = 24.0;
+// The dialog, centred, over the screen dimmed: 320 by 132, its question 28 from the top,
+// its buttons 120 by 32, 16 apart, 20 from the bottom.
+const DIALOG_WIDTH: f64 = 320.0;
+const DIALOG_HEIGHT: f64 = 132.0;
+const DIALOG_BUTTON_WIDTH: f64 = 120.0;
+const DIALOG_BUTTON_HEIGHT: f64 = 32.0;
+const DIM: Rgba = [0.0, 0.0, 0.0, 0.45];
 
 /// The field's hint for "Other…"'s user name.
 const USER_NAME: &str = "User name";
@@ -103,6 +119,9 @@ pub struct View {
     users: bool,
     ring: Option<Widget>,
     indicators: Indicators,
+    power: Vec<Action>,
+    /// The dialog's action, while it is open.
+    dialog: Option<Action>,
 }
 
 /// What the indicator row shows.
@@ -126,6 +145,18 @@ impl Login {
             Ok(()) => self.layout = i,
             Err(e) => error!("{e:#}"),
         }
+    }
+
+    /// The machine woke from sleep. What was typed goes, unless it was submitted (an
+    /// answer greetd is to have): someone else may be at the machine now, and the timer
+    /// that forgets a password stood still in sleep, as on the lock screen. The keys held
+    /// are forgotten, their releases may never come; and the focus leaves the power row.
+    pub fn resumed(&mut self, now: Instant) {
+        if self.entry.look(now).status != Status::Checking {
+            self.entry.wipe();
+        }
+        self.keyboard.forget_held(&mut self.entry);
+        self.chooser.resumed();
     }
 
     pub fn view(&self, now: Instant) -> View {
@@ -154,6 +185,8 @@ impl Login {
                 picker: self.layouts.len() > 1,
                 battery: self.battery,
             },
+            power: self.chooser.power.clone(),
+            dialog: self.chooser.dialog,
         }
     }
 }
@@ -170,6 +203,22 @@ struct Button {
 struct Line {
     text: String,
     label: Label,
+}
+
+/// A power button: its box and its label (the icon is drawn each time).
+struct PowerButton {
+    action: Action,
+    rect: Rect,
+    label: Label,
+}
+
+/// The confirmation dialog.
+struct Dialog {
+    action: Action,
+    panel: Rect,
+    question: Label,
+    cancel: Button,
+    confirm: Button,
 }
 
 /// The avatar row, with each avatar's name under it.
@@ -201,6 +250,10 @@ pub struct Extras {
     layout_chip: Option<Button>,
     /// Where the battery is.
     battery: Option<Rect>,
+    /// The frame's height.
+    height: f64,
+    power: Vec<PowerButton>,
+    dialog: Option<Dialog>,
 }
 
 impl Extras {
@@ -248,6 +301,9 @@ impl Extras {
             indicators: Indicators::default(),
             layout_chip: None,
             battery: None,
+            height: f64::from(scene.layout.pixels.1),
+            power: Vec::new(),
+            dialog: None,
         }))
     }
 
@@ -293,6 +349,16 @@ impl Extras {
         if self.indicators != view.indicators {
             self.render_indicators(painter, &view.indicators)?;
         }
+        let actions = self.power.iter().map(|button| button.action);
+        if !actions.eq(view.power.iter().copied()) {
+            self.render_power(painter, &view.power)?;
+        }
+        if self.dialog.as_ref().map(|dialog| dialog.action) != view.dialog {
+            self.dialog = None;
+            if let Some(action) = view.dialog {
+                self.dialog = Some(self.render_dialog(painter, action)?);
+            }
+        }
         self.users_shown = view.users;
         self.ring = view.ring;
         Ok(())
@@ -327,6 +393,76 @@ impl Extras {
         }
         self.indicators = indicators.clone();
         Ok(())
+    }
+
+    /// The power row of `actions`, centred at the bottom.
+    fn render_power(&mut self, painter: &Painter, actions: &[Action]) -> Result<(), cairo::Error> {
+        let f = self.factor;
+        let n = actions.len() as f64;
+        let left = self.width / 2.0 - (n * POWER_WIDTH + (n - 1.0) * POWER_GAP) * f / 2.0;
+        let y = self.height - (POWER_BOTTOM + POWER_HEIGHT) * f;
+        let font = Font::new(draw::HINT_SIZE, Weight::Medium, WHITE);
+        self.power.clear();
+        for (i, &action) in actions.iter().enumerate() {
+            let x = left + i as f64 * (POWER_WIDTH + POWER_GAP) * f;
+            let rect = whole(Rect {
+                x,
+                y,
+                w: POWER_WIDTH * f,
+                h: POWER_HEIGHT * f,
+            });
+            let label = painter.label(action.label(), &font, f, |(w, _)| {
+                ((rect.center().0 - w / 2.0).round(), rect.y + 34.0 * f)
+            })?;
+            self.power.push(PowerButton {
+                action,
+                rect,
+                label,
+            });
+        }
+        Ok(())
+    }
+
+    /// The dialog asking to confirm `action`, centred.
+    fn render_dialog(&self, painter: &Painter, action: Action) -> Result<Dialog, cairo::Error> {
+        let f = self.factor;
+        let panel = whole(Rect {
+            x: (self.width - DIALOG_WIDTH * f) / 2.0,
+            y: (self.height - DIALOG_HEIGHT * f) / 2.0,
+            w: DIALOG_WIDTH * f,
+            h: DIALOG_HEIGHT * f,
+        });
+        let font = Font::new(15.0, Weight::Semibold, WHITE);
+        // Only those that ask first open it.
+        let text = action.question().unwrap_or_default();
+        let question = painter.label(text, &font, f, |(w, _)| {
+            ((panel.center().0 - w / 2.0).round(), panel.y + 28.0 * f)
+        })?;
+        let (w, h) = (DIALOG_BUTTON_WIDTH * f, DIALOG_BUTTON_HEIGHT * f);
+        let y = panel.y + panel.h - 20.0 * f - h;
+        let beside = |x| whole(Rect { x, y, w, h });
+        let middle = panel.center().0;
+        let cancel = beside(middle - 8.0 * f - w);
+        Ok(Dialog {
+            action,
+            panel,
+            question,
+            cancel: button(painter, "Cancel", cancel, draw::FIELD, f)?,
+            confirm: button(
+                painter,
+                action.label(),
+                beside(middle + 8.0 * f),
+                draw::BUTTON,
+                f,
+            )?,
+        })
+    }
+
+    /// Whether `(x, y)`, in physical pixels, is in the dialog.
+    pub fn in_dialog(&self, x: f64, y: f64) -> bool {
+        self.dialog
+            .as_ref()
+            .is_some_and(|dialog| inside(dialog.panel, x, y))
     }
 
     /// The avatars of `names` in a row centred where the scene's avatar is, with their
@@ -393,6 +529,25 @@ impl Extras {
         if let (Some(rect), Some(battery)) = (self.battery, self.indicators.battery) {
             paint_battery(cr, rect, battery, f)?;
         }
+        for button in &self.power {
+            let icon = (button.rect.center().0, button.rect.y + 16.0 * f);
+            icons::power(cr, button.action, icon, f)?;
+            button.label.paint(cr, 1.0)?;
+        }
+        if let Some(dialog) = &self.dialog {
+            draw::set_color(cr, DIM);
+            cr.paint()?;
+            draw::rounded(cr, dialog.panel, POPUP_RADIUS * f);
+            draw::set_color(cr, POPUP_FILL);
+            cr.fill_preserve()?;
+            draw::frost(cr, 0.0, OUTLINE, f)?;
+            dialog.question.paint(cr, 1.0)?;
+            for button in [&dialog.cancel, &dialog.confirm] {
+                draw::rounded(cr, button.rect, button.rect.h / 2.0);
+                draw::frost(cr, button.alpha, OUTLINE, f)?;
+                button.label.paint(cr, 1.0)?;
+            }
+        }
         // Round every widget's shape, a field's or a chip's or an avatar's.
         if let Some(rect) = self.ring.and_then(|widget| self.place(widget)) {
             let out = (RING_GAP + RING_WIDTH / 2.0) * f;
@@ -412,7 +567,17 @@ impl Extras {
 
     /// Where `widget` is, in physical pixels, if it is shown.
     pub fn place(&self, widget: Widget) -> Option<Rect> {
+        // The dialog's buttons alone while it is open.
+        if let Some(dialog) = &self.dialog {
+            return match widget {
+                Widget::Cancel => Some(dialog.cancel.rect),
+                Widget::Confirm => Some(dialog.confirm.rect),
+                _ => None,
+            };
+        }
         match (widget, &self.row) {
+            (Widget::Power(i), _) => self.power.get(i).map(|button| button.rect),
+            (Widget::Cancel | Widget::Confirm, _) => None,
             (Widget::Layout, _) => {
                 let chip = self.layout_chip.as_ref().filter(|_| self.indicators.picker);
                 chip.map(|chip| chip.rect)
@@ -428,18 +593,18 @@ impl Extras {
 
     /// The widget a click at `(x, y)`, in physical pixels, is on; never the field.
     pub fn hit(&self, x: f64, y: f64) -> Option<Widget> {
-        let inside = |rect: Rect| {
-            (rect.x..rect.x + rect.w).contains(&x) && (rect.y..rect.y + rect.h).contains(&y)
-        };
         let avatars = self.row.as_ref().map_or(0, |row| row.avatars.len());
         let buttons = [
             Widget::LogIn,
             Widget::Users,
             Widget::Session,
             Widget::Layout,
+            Widget::Cancel,
+            Widget::Confirm,
         ];
-        let mut widgets = (0..avatars).map(Widget::Avatar).chain(buttons);
-        widgets.find(|&widget| self.place(widget).is_some_and(inside))
+        let power = (0..self.power.len()).map(Widget::Power);
+        let mut widgets = (0..avatars).map(Widget::Avatar).chain(buttons).chain(power);
+        widgets.find(|&widget| self.place(widget).is_some_and(|rect| inside(rect, x, y)))
     }
 }
 
@@ -502,6 +667,10 @@ fn button(
         label,
         alpha,
     })
+}
+
+fn inside(rect: Rect, x: f64, y: f64) -> bool {
+    (rect.x..rect.x + rect.w).contains(&x) && (rect.y..rect.y + rect.h).contains(&y)
 }
 
 /// `rect` with its corners on whole pixels.
@@ -706,5 +875,24 @@ mod tests {
             (indicators.layout.as_deref(), indicators.picker),
             (Some("DE"), false)
         );
+    }
+
+    #[test]
+    fn waking_wipes_what_was_typed_but_not_an_answer_submitted() {
+        let now = Instant::now();
+        let mut login = login(&["Alice"], &["A"], true, "");
+        login.chooser.power = vec![Action::Sleep];
+        login.chooser.focus.focused = Widget::Power(0);
+        for c in "ab".chars() {
+            login.entry.press(ui::entry::Key::Char(c), 1, now);
+        }
+        login.resumed(now);
+        assert_eq!(login.entry.typed(), b"");
+        assert_eq!(login.chooser.focus.focused, Widget::Pill);
+        // Submitted (Enter, before greetd's prompt came): it stays, for greetd.
+        login.entry.press(ui::entry::Key::Char('c'), 1, now);
+        login.entry.press(ui::entry::Key::Enter, 2, now);
+        login.resumed(now);
+        assert_eq!(login.entry.submission().bytes(), b"c");
     }
 }

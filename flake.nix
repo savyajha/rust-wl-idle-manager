@@ -67,6 +67,8 @@
           greeter = import ./tests/greeter.nix { inherit pkgs; };
           # The greeter's indicator row: the keyboard-layout picker and the battery.
           greeter-indicators = import ./tests/greeter-indicators.nix { inherit pkgs; };
+          # The greeter's power row and confirmation dialog: sleeps, a reboot, a power off.
+          greeter-power = import ./tests/greeter-power.nix { inherit pkgs; };
 
           fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --all --check";
           clippy = cargoCheck "clippy" [

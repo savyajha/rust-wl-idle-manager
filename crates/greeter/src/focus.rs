@@ -1,8 +1,9 @@
 //! The keyboard focus on the login screen. Tab and Shift+Tab move it through the widgets
-//! shown, in reading order, and round; Left and Right move it along the avatar row. Enter
-//! and Space activate the widget it is on, except in the field, which takes them as it
-//! takes any key that types; such a key, typed elsewhere, moves the focus to the field
-//! first. A ring shows it once a key has moved it, until a click. No I/O.
+//! shown, in reading order, and round; Left and Right move it along a row (the avatars, the
+//! power buttons, the dialog's buttons). Enter and Space activate the widget it is on,
+//! except in the field, which takes them as it takes any key that types; such a key, typed
+//! elsewhere, moves the focus to the field first, if it is shown (not on the avatar row, nor
+//! in the dialog). A ring shows it once a key has moved it, until a click. No I/O.
 
 /// A widget the focus can be on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,6 +19,11 @@ pub enum Widget {
     LogIn,
     /// The keyboard layout's indicator, when it opens a popup.
     Layout,
+    /// The power button at this place in the power row.
+    Power(usize),
+    /// The confirmation dialog's buttons.
+    Cancel,
+    Confirm,
 }
 
 /// A key, as the focus has it.
@@ -28,8 +34,11 @@ pub enum Key {
     BackTab,
     Left,
     Right,
-    /// Enter or Space.
+    /// Enter.
     Activate,
+    /// Space: Enter, except on a power button, where it is text (a password may start with
+    /// one, and must not put the machine to sleep).
+    Space,
     /// A key the field acts on: a character, Backspace.
     Text,
 }
@@ -67,6 +76,11 @@ impl Focus {
     /// Act on `key`, with the widgets `shown` (in reading order).
     pub fn key(&mut self, key: Key, shown: &[Widget]) -> Action {
         let at = shown.iter().position(|&widget| widget == self.focused);
+        let key = match key {
+            Key::Space if matches!(self.focused, Widget::Power(_)) => Key::Text,
+            Key::Space => Key::Activate,
+            key => key,
+        };
         match key {
             Key::Tab | Key::BackTab if !shown.is_empty() => {
                 let n = shown.len();
@@ -77,13 +91,14 @@ impl Focus {
                 };
                 self.move_to(shown[next]);
             }
-            // To the neighbour in the row, if it is an avatar too.
-            Key::Left | Key::Right if matches!(self.focused, Widget::Avatar(_)) => {
+            // To the neighbour, if it is in the same row.
+            Key::Left | Key::Right if row(self.focused).is_some() => {
                 let next = at.and_then(|i| match key {
                     Key::Left => i.checked_sub(1),
                     _ => Some(i + 1),
                 });
-                if let Some(&next @ Widget::Avatar(_)) = next.and_then(|i| shown.get(i)) {
+                let next = next.and_then(|i| shown.get(i)).copied();
+                if let Some(next) = next.filter(|&next| row(next) == row(self.focused)) {
                     self.move_to(next);
                 }
             }
@@ -108,6 +123,23 @@ impl Focus {
     fn move_to(&mut self, widget: Widget) {
         self.focused = widget;
         self.ring = true;
+    }
+}
+
+/// Which row `widget` is in, for Left and Right, if any.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Row {
+    Avatars,
+    Power,
+    Dialog,
+}
+
+fn row(widget: Widget) -> Option<Row> {
+    match widget {
+        Widget::Avatar(_) => Some(Row::Avatars),
+        Widget::Power(_) => Some(Row::Power),
+        Widget::Cancel | Widget::Confirm => Some(Row::Dialog),
+        _ => None,
     }
 }
 
@@ -202,5 +234,30 @@ mod tests {
         assert_eq!(focus.ring(), None);
         focus.key(Key::BackTab, &LOGIN);
         assert_eq!(focus.ring(), Some(Session));
+    }
+
+    #[test]
+    fn left_and_right_move_along_the_power_row_and_the_dialog() {
+        let shown = [Pill, LogIn, Power(0), Power(1), Layout];
+        let mut focus = Focus::new(Power(0));
+        focus.key(Key::Left, &shown);
+        assert_eq!(focus.focused, Power(0));
+        focus.key(Key::Right, &shown);
+        focus.key(Key::Right, &shown);
+        assert_eq!(focus.focused, Power(1));
+        // Typed there, it goes to the field; so does Space, which is no Enter there.
+        assert_eq!(focus.key(Key::Text, &shown), Action::Type);
+        focus.focused = Power(0);
+        assert_eq!(focus.key(Key::Space, &shown), Action::Type);
+        assert_eq!(focus.focused, Pill);
+        focus.focused = LogIn;
+        assert_eq!(focus.key(Key::Space, &shown), Action::Activate(LogIn));
+        let dialog = [Cancel, Confirm];
+        let mut focus = Focus::new(Cancel);
+        focus.key(Key::Right, &dialog);
+        assert_eq!(focus.key(Key::Activate, &dialog), Action::Activate(Confirm));
+        // The dialog has no field: typing does nothing.
+        assert_eq!(focus.key(Key::Text, &dialog), Action::None);
+        assert_eq!(focus.focused, Confirm);
     }
 }

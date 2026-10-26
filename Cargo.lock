@@ -1254,6 +1254,7 @@ dependencies = [
  "tracing",
  "wayland-client",
  "xkbcommon",
+ "zbus",
  "zeroize",
  "zune-jpeg",
 ]

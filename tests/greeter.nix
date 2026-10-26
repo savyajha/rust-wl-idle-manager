@@ -255,6 +255,13 @@ pkgs.testers.runNixOSTest {
     def read_log():
         return machine.succeed(LOG)
 
+    def power_buttons():
+        """How many power buttons the greeter shows: logind's answers that are yes."""
+        wait_for_line("power: sleep ")
+        line = re.findall(r"power: sleep .*$", read_log(), re.M)[-1]
+        return len(re.findall(r"\byes\b", line))
+
+
     def count(text):
         return read_log().count(text)
 
@@ -306,10 +313,12 @@ pkgs.testers.runNixOSTest {
         return machine.succeed(f"stat -c %U {path} && cat {path} && rm {path}").strip()
 
     def end_session(ready):
-        """End the running session; wait until the next greeter logs `ready` once more."""
-        n = count(ready)
+        """End the running session; wait until the next greeter logs `ready` once more, and
+        its compositor takes input (a key or click before that is lost)."""
+        n, inputs = count(ready), count("input ready")
         machine.succeed(f"touch {DIR}/end")
         wait_for_line(ready, n + 1)
+        wait_for_line("input ready", inputs + 1)
 
     def restart_greetd():
         """Restart greetd; wait until the new greeter's compositor takes input."""
@@ -354,6 +363,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("one user, the sessions, and the login screen on the primary output"):
         wait_for_line("prompt: secret")
+        wait_for_line("input ready")
         wait_for_line("first frame on Virtual-1")
         wait_for_line("first frame on Virtual-2")
         text = read_log()
@@ -409,8 +419,8 @@ pkgs.testers.runNixOSTest {
 
     with subtest("keys move the focus ring; typing goes to the field; Enter on Log In submits"):
         # One layout: its label at the top right opens nothing (keys typed next would go
-        # to a popup), and Tab never reaches it (below, Tab goes round from Log In to the
-        # field).
+        # to a popup), and Tab never reaches it (below, Tab goes round from Log In, past
+        # the power row, to the field).
         click(*LAYOUT_LABEL)
         # A new greeter, its focus on the field: no ring until a key moves it.
         assert marked(FIELD_RING) == 0 and marked(LOG_IN_RING) == 0
@@ -429,10 +439,13 @@ pkgs.testers.runNixOSTest {
             machine.send_key("tab")
         retry(lambda _: marked(LOG_IN_RING) > 0, 10)
         assert marked(SESSION_RING) == 0 and marked(FIELD_RING) == 0
-        # Tab goes round to the field, Shift+Tab back to Log In.
-        machine.send_key("tab")
+        # Tab goes past the power row and round to the field, Shift+Tab back to Log In.
+        power = power_buttons()
+        for _ in range(power + 1):
+            machine.send_key("tab")
         retry(lambda _: marked(FIELD_RING) > 0 and marked(LOG_IN_RING) == 0, 10)
-        machine.send_key("shift-tab")
+        for _ in range(power + 1):
+            machine.send_key("shift-tab")
         retry(lambda _: marked(LOG_IN_RING) > 0 and marked(FIELD_RING) == 0, 10)
         # Moving the focus typed nothing; Enter, on Log In, submits.
         assert dots() == len(PASSWORD), dots()
@@ -466,7 +479,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("after greetd restarts, the remembered session is preselected"):
         n = count("prompt: secret")
-        machine.succeed("systemctl restart greetd")
+        restart_greetd()
         wait_for_line("prompt: secret", n + 1)
         wait_for_line("sessions: Alpha, Beta; Beta chosen (remembered)")
         log_in("beta", BETA)
@@ -626,10 +639,11 @@ pkgs.testers.runNixOSTest {
         machine.send_key("ret")
         wait_for_line("asking for a user name")
         prompts = count("prompt: secret")
+        unlisted = "greeting a user who is not listed"
+        greeted = count(unlisted)
         type_text("dave\n")
         # Not listed: not logged by the name typed (it might be a password).
-        unlisted = "greeting a user who is not listed"
-        wait_for_line(unlisted, count(unlisted) + 1)
+        wait_for_line(unlisted, greeted + 1)
         wait_for_line("prompt: secret", prompts + 1)
         log_in("alpha", ALPHA, password=DAVE_PASSWORD, user="dave", ready="input ready")
         assert 'last-user "dave"' in machine.succeed(f"cat {STATE}")

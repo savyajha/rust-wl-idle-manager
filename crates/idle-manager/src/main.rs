@@ -1,6 +1,5 @@
 mod auth;
 mod config;
-mod logind;
 mod policy;
 mod systemd;
 mod wayland;
@@ -24,11 +23,11 @@ use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::Subscr
 use zbus::Connection;
 
 use config::Config;
-use logind::{LogindManagerProxy, idle_inhibited};
 use policy::{Command, Input, Policy};
 use systemd::SystemdManagerProxy;
 use ui::config::{Argv, Background};
 use ui::entry::Entry;
+use ui::logind::{LogindManagerProxy, idle_inhibited};
 use ui::wallpaper::{self, Blurred};
 use wayland::{Next, Wayland};
 

@@ -15,8 +15,8 @@
 #
 # Behaviours asserted:
 #   1. the layouts and their short names; without UPower, no battery is shown
-#   2. Tab reaches the layout indicator, last after Log In; Enter opens its popup, Down and
-#      Enter choose "us"; the row's pixels change; the user name typed for "Other…" is then
+#   2. Tab reaches the layout indicator, last after Log In and the power row; Enter opens
+#      its popup, Down and Enter choose "us"; the row's pixels change; the user name typed for "Other…" is then
 #      typed with "us" (yves logs in, typed with the Y key), and the layout he logged in with
 #      is remembered for him
 #   3. after a restart, alice (with none remembered) has the first layout again, the row
@@ -203,6 +203,12 @@ pkgs.testers.runNixOSTest {
             print(read_log())
             raise
 
+    def power_buttons():
+        """How many power buttons the greeter shows: logind's answers that are yes."""
+        wait_for_line("power: sleep ")
+        line = re.findall(r"power: sleep .*$", read_log(), re.M)[-1]
+        return len(re.findall(r"\byes\b", line))
+
     def wait_for_more(text, action):
         """Do `action`; wait until `text` is logged once more than before."""
         n = count(text)
@@ -254,6 +260,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the layouts' short names; without UPower, no battery"):
         wait_for_line("prompt: secret")
+        wait_for_line("input ready")
         wait_for_line("no battery from UPower: ")
         wait_for_line("battery: none")
         text = read_log()
@@ -263,8 +270,8 @@ pkgs.testers.runNixOSTest {
         plain = row()
 
     with subtest("Tab, Enter, Down, Enter choose us; yves's name is typed with it"):
-        # The field, "‹ Users", Log In, then the indicator.
-        for _ in range(3):
+        # The field, "‹ Users", Log In, the power row, then the indicator.
+        for _ in range(3 + power_buttons()):
             machine.send_key("tab")
         wait_for_more("layout popup shown", lambda: machine.send_key("ret"))
         machine.send_key("down")
@@ -313,7 +320,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a variant: us(dvorak), whose A P G I D type alice"):
         wait_for_line("DE chosen (first)", 3)
-        for _ in range(3):
+        for _ in range(3 + power_buttons()):
             machine.send_key("tab")
         wait_for_more("layout popup shown", lambda: machine.send_key("ret"))
         machine.send_key("down")

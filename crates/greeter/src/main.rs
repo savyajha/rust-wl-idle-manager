@@ -11,8 +11,10 @@ mod config;
 mod flow;
 mod focus;
 mod greetd;
+mod icons;
 mod layouts;
 mod login;
+mod power;
 mod sessions;
 mod state;
 mod users;
@@ -38,6 +40,7 @@ use config::Config;
 use flow::{Flow, Request, Show, Step};
 use greetd::Greetd;
 use login::{Login, Prompt};
+use power::News;
 use state::State;
 use ui::draw::Painter;
 use ui::entry::Entry;
@@ -166,9 +169,12 @@ async fn greet_on(path: &Path) -> anyhow::Result<()> {
     // No theme yet: GTK's built-in colours and font. The name is set with the user.
     let painter = Painter::new(config.look, None, String::new());
     let wayland = Wayland::connect(login, painter)?;
-    // Alongside the rest: a slow bus or a missing UPower holds up nothing.
+    // Alongside the rest: a slow bus, or a missing UPower or logind, holds up nothing.
     let (battery_sender, mut batteries) = mpsc::channel(1);
     tokio::spawn(battery::watch(battery_sender));
+    let (news_sender, mut power_news) = mpsc::channel(1);
+    let (power, actions) = mpsc::channel(1);
+    tokio::spawn(power::serve(news_sender, actions));
     let mut greeter = Greeter {
         user: String::new(),
         wayland,
@@ -177,6 +183,7 @@ async fn greet_on(path: &Path) -> anyhow::Result<()> {
         state,
         started: None,
         retry_at: None,
+        power,
     };
     match greeter.wayland.login().chooser.screen.clone() {
         Screen::Login(user) => {
@@ -194,6 +201,10 @@ async fn greet_on(path: &Path) -> anyhow::Result<()> {
             response = greeter.greetd.receive() => greeter.flow.handle(response?),
             Some(battery) = batteries.recv() => {
                 greeter.wayland.login().battery = battery;
+                Step::default()
+            }
+            Some(news) = power_news.recv() => {
+                greeter.power_news(news);
                 Step::default()
             }
             () = time::sleep_until(retry_at), if greeter.retry_at.is_some() => {
@@ -222,6 +233,8 @@ struct Greeter {
     started: Option<Started>,
     /// When to create the session again, after a failure.
     retry_at: Option<Instant>,
+    /// To the power task: what to do.
+    power: mpsc::Sender<power::Action>,
 }
 
 /// What `start_session` was sent for.
@@ -234,7 +247,9 @@ struct Started {
 impl Greeter {
     fn event(&mut self, event: Event) -> Step {
         let login = self.wayland.login();
-        login.message = None;
+        if event.clears_message() {
+            login.message = None;
+        }
         match event {
             Event::Choose(i) => match login.chooser.choose(i) {
                 Some(user) => self.begin(user),
@@ -265,6 +280,49 @@ impl Greeter {
             }
             // On the row, or at the user name with no row: nothing to go back to.
             Event::Cancel => Step::default(),
+            Event::Power(i) => {
+                if let Some(&action) = login.chooser.power.get(i) {
+                    if let Some(question) = action.question() {
+                        info!("dialog: {question}");
+                        login.chooser.open_dialog(action);
+                    } else {
+                        self.act(action);
+                    }
+                }
+                Step::default()
+            }
+            Event::Confirm => {
+                if let Some(action) = login.chooser.close_dialog() {
+                    self.act(action);
+                }
+                Step::default()
+            }
+            Event::Dismiss => {
+                if login.chooser.close_dialog().is_some() {
+                    info!("dialog cancelled");
+                }
+                Step::default()
+            }
+        }
+    }
+
+    /// Ask the power task to do `action`, unless it is busy with one.
+    fn act(&mut self, action: power::Action) {
+        if self.power.try_send(action).is_err() {
+            warn!("power: busy, or no logind: not asking to {}", action.name());
+        }
+    }
+
+    fn power_news(&mut self, news: News) {
+        let login = self.wayland.login();
+        match news {
+            News::Buttons(actions) => login.chooser.power = actions,
+            // The error is logged; D-Bus's text is not for the screen.
+            News::Failed(action) => login.message = Some(format!("Could not {}", action.name())),
+            News::Resumed => {
+                login.resumed(Instant::now());
+                info!("resumed; what was typed is wiped");
+            }
         }
     }
 

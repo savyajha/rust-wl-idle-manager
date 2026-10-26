@@ -798,6 +798,59 @@ so that no change is missed. With no battery, or while UPower is not running
 The greeter's runtime does not wait for that task when it exits, so a hung bus
 never holds up the session.
 
+### Power
+
+Along the bottom of the login screen's output, centred, are the power buttons,
+in this order: Sleep, Hibernate, Restart, Shut Down. Each is an icon (cairo paths
+in the indicators' style: white, lines 2 wide, in a circle 18 across: a crescent,
+a snowflake, an arrow round, the power symbol) over its label, in a box 72 by 56,
+16 apart, 24 from the bottom. A task of its own asks logind (`CanSuspend`,
+`CanHibernate`, `CanReboot`, `CanPowerOff`, over the system bus, through the
+proxy the daemon shares, `ui::logind`), once, started with the login screen as
+the battery's is: until it has answered there is no row, and with no bus or
+logind none at all. A button is shown where the answer is `yes`; any other
+(`no`, `na`, `challenge`, or systemd 261's `inhibited`, `inhibitor-blocked`
+and `challenge-inhibitor-blocked`) hides it, and as logind is asked once, a
+button hidden so stays hidden while that greeter runs. The calls are
+`Suspend`, `Hibernate`, `Reboot` and `PowerOff`, with `interactive` false; one
+that fails is logged and shows "Could not …", never D-Bus's text.
+
+logind lets the greeter do these: greetd's greeter session (class `greeter`,
+user `greeter`) is the active one on its seat, and systemd's polkit policy (261)
+allows `power-off`, `reboot`, `suspend` and `hibernate` to an active session,
+and their `-multiple-sessions` forms too, so every answer is `yes`, even while
+other users are logged in.
+
+Sleep and Hibernate act at once: nothing is lost. Restart and Shut Down ask
+first, in a dialog drawn in the login screen (not a popup), over the screen
+dimmed: "Restart now?" or "Shut down now?", with Cancel, focused, and the
+action's button (320 by 132, centred; its buttons 120 by 32). While it is open it
+holds the focus: Tab and Left and Right go between its two buttons, typing does
+nothing, Escape or a click outside it cancels, and closing it puts the focus
+back where it was. The power row and its dialog leave the message line as it
+is: a "Wrong password" or PAM's message showing stays, and one that comes while
+the dialog is open is still there when it closes. On a power button, Space is
+text, as in the field, not Enter: a password may start with one, and must not
+put the machine to sleep.
+
+The login goes on under the dialog, untouched: what is typed stays, and nothing
+can be typed; an answer submitted before it opened still answers greetd's prompt
+when it comes; greetd's prompts, messages and failures are shown under it as
+ever. Restart or Shut Down, confirmed, leaves the login as it is: the machine
+goes down.
+
+Escape closes the topmost first: a popup is closed by the compositor's grab (the
+key is the popup's, and the compositor dismisses it), then the dialog, and only
+then does Escape cancel the login.
+
+On waking from sleep or hibernation (logind's `PrepareForSleep` false), what was
+typed is wiped, unless it was submitted (an answer greetd is to have): someone
+else may be at the machine, and the timer that forgets a password stood still
+in sleep, as on the lock screen. The keys held are forgotten (their releases may
+never come), the focus leaves the power row (to the field, or on the avatar row
+the first avatar), so that Enter does not put the machine to sleep again, and
+the clock is redrawn.
+
 ### The screen
 
 Each output gets a fullscreen `xdg_toplevel`. The login screen is on the output
@@ -914,6 +967,14 @@ session after a restart, going back to the row, "Other…" for an unlisted user,
 and seeding from tuigreet's last user. Each session writes
 a marker of its arguments and environment. It has one layout, whose label opens
 nothing, and no UPower.
+
+`tests/greeter-power.nix` has logind do the power actions, with sleep and
+hibernate made harmless (their services only write a marker; hibernation has a
+swap disk to be safe on): Sleep by a click (the wipe on waking, and the focus
+off the power row, so Enter does not sleep again), Hibernate by the keyboard,
+the dialog's Cancel, Escape and a click outside it (the dialog gone from the
+screen each time), then a real reboot back to the greeter, and a real power off
+by the keyboard.
 
 `tests/greeter-indicators.nix` has three layouts, "de", "us" and "us(dvorak)",
 on one output: the popup by keyboard and by click, what each layout types into

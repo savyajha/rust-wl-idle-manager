@@ -6,6 +6,7 @@ pub mod draw;
 pub mod entry;
 pub mod frames;
 pub mod keyboard;
+pub mod logind;
 pub mod password;
 pub mod queue;
 pub mod theme;

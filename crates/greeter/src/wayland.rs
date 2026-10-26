@@ -39,6 +39,7 @@ use wayland_protocols::xdg::shell::client::xdg_positioner::{
 };
 use xkbcommon::xkb::Keysym;
 
+use crate::chooser::Escape;
 use crate::focus::{self, Action, Widget};
 use crate::login::{self, Extras, Login, PopupList, View};
 use ui::draw::{self, Layout, Painter, Scene};
@@ -56,6 +57,21 @@ pub enum Event {
     Cancel,
     /// The avatar at this place in the row was activated.
     Choose(usize),
+    /// The power button at this place in the row was activated.
+    Power(usize),
+    /// The dialog's button: do what it asks.
+    Confirm,
+    /// The dialog's Cancel, Escape on it, or a click outside it.
+    Dismiss,
+}
+
+impl Event {
+    /// Whether the message line is cleared: by anything the user does about the login, not
+    /// by the power row and its dialog, which leave a "Wrong password" or PAM's message
+    /// showing.
+    pub fn clears_message(&self) -> bool {
+        !matches!(self, Event::Power(_) | Event::Confirm | Event::Dismiss)
+    }
 }
 
 pub struct Wayland {
@@ -515,9 +531,12 @@ impl State {
             return;
         };
         let f = f64::from(toplevel.surface.scale) / 120.0;
-        if let Some(widget) = extras.hit(at.x * f, at.y * f) {
+        let (x, y) = (at.x * f, at.y * f);
+        if let Some(widget) = extras.hit(x, y) {
             self.login.chooser.focus.click(widget);
             self.act(Action::Activate(widget), qh);
+        } else if self.login.chooser.dialog.is_some() && !extras.in_dialog(x, y) {
+            self.events.push_back(Event::Dismiss);
         }
     }
 
@@ -530,6 +549,9 @@ impl State {
             Widget::Avatar(i) => self.events.push_back(Event::Choose(i)),
             Widget::Pill => {}
             Widget::Users => self.events.push_back(Event::Cancel),
+            Widget::Power(i) => self.events.push_back(Event::Power(i)),
+            Widget::Cancel => self.events.push_back(Event::Dismiss),
+            Widget::Confirm => self.events.push_back(Event::Confirm),
             Widget::Session | Widget::Layout => {
                 if let Err(e) = self.open_popup(widget, qh) {
                     error!("opening the {} popup: {e:#}", name(widget));
@@ -555,14 +577,19 @@ impl State {
         }
         let focus_key = match keysym {
             Some(Keysym::Escape) => {
-                self.events.push_back(Event::Cancel);
+                let event = match self.login.chooser.escape() {
+                    Escape::CloseDialog => Event::Dismiss,
+                    Escape::Cancel => Event::Cancel,
+                };
+                self.events.push_back(event);
                 return false;
             }
             Some(Keysym::Tab) => focus::Key::Tab,
             Some(Keysym::ISO_Left_Tab) => focus::Key::BackTab,
             Some(Keysym::Left) => focus::Key::Left,
             Some(Keysym::Right) => focus::Key::Right,
-            Some(Keysym::Return | Keysym::KP_Enter | Keysym::space) => focus::Key::Activate,
+            Some(Keysym::Return | Keysym::KP_Enter) => focus::Key::Activate,
+            Some(Keysym::space) => focus::Key::Space,
             _ if keyboard.key(code).is_some() => focus::Key::Text,
             // Modifiers and keys that do nothing, which the field's keyboard follows.
             _ => return true,
@@ -861,3 +888,18 @@ delegate_noop!(State: WpViewporter);
 delegate_noop!(State: WpViewport);
 // Each toplevel covers its one output, so its enter, leave and scale events change nothing.
 delegate_noop!(State: ignore WlSurface);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_power_row_and_its_dialog_leave_the_message() {
+        for event in [Event::Power(0), Event::Confirm, Event::Dismiss] {
+            assert!(!event.clears_message());
+        }
+        for event in [Event::Submit, Event::Cancel, Event::Choose(0)] {
+            assert!(event.clears_message());
+        }
+    }
+}
