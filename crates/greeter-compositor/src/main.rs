@@ -57,13 +57,24 @@ const CHILD_GRACE: Duration = Duration::from_millis(500);
 /// Ctrl+Alt+Fn still works with a greeter that never draws.
 const INPUT_DEADLINE: Duration = Duration::from_secs(1);
 
+/// The cursor's size in logical pixels, without `--cursor-size`: the usual default.
+const DEFAULT_CURSOR_SIZE: u32 = 24;
+
 const USAGE: &str = "usage: rust-wl-greeter-compositor [--drm-device PATH] \
-                     [--scale CONNECTOR=SCALE]... [--log-timing] -- GREETER [ARGS...]";
+                     [--scale CONNECTOR=SCALE]... [--tap] [--clickfinger] \
+                     [--cursor-theme DIR [--cursor-size N]] [--log-timing] -- GREETER [ARGS...]";
 
 #[derive(Debug, Default, PartialEq)]
 struct Args {
     drm_device: Option<PathBuf>,
     scales: Vec<(String, f64)>,
+    /// Tap-to-click on touchpads, which libinput leaves off.
+    tap: bool,
+    /// Clickfinger on touchpads: the number of fingers picks the button.
+    clickfinger: bool,
+    /// A cursor theme's directory (`…/share/icons/NAME`), and the cursor's logical size.
+    cursor_theme: Option<PathBuf>,
+    cursor_size: Option<u32>,
     log_timing: bool,
     greeter: Vec<OsString>,
 }
@@ -77,6 +88,18 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> 
                 break;
             }
             Some("--log-timing") => parsed.log_timing = true,
+            Some("--tap") => parsed.tap = true,
+            Some("--clickfinger") => parsed.clickfinger = true,
+            Some("--cursor-theme") => {
+                parsed.cursor_theme =
+                    Some(args.next().ok_or("--cursor-theme needs a path")?.into());
+            }
+            Some("--cursor-size") => {
+                let value = args.next().ok_or("--cursor-size needs a size")?;
+                let size = value.to_str().and_then(|v| v.parse::<u32>().ok());
+                parsed.cursor_size =
+                    Some(size.ok_or_else(|| format!("--cursor-size {value:?}: not a number"))?);
+            }
             Some("--drm-device") => {
                 parsed.drm_device = Some(args.next().ok_or("--drm-device needs a path")?.into());
             }
@@ -122,6 +145,10 @@ pub struct State {
     signal: LoopSignal,
     started: Instant,
     log_timing: bool,
+    /// Turn tap-to-click on for each touchpad (`--tap`).
+    tap: bool,
+    /// Switch each touchpad to clickfinger (`--clickfinger`).
+    clickfinger: bool,
     session: LibSeatSession,
 
     compositor: CompositorState,
@@ -146,6 +173,10 @@ pub struct State {
     renderer: PixmanRenderer,
     gpu: drm::Gpu,
     scales: Vec<(String, f64)>,
+    /// The theme's pointer images, with their nominal sizes; empty for the built-in arrow.
+    cursor_theme: Vec<(u32, cursor::Image)>,
+    /// The cursor's size in logical pixels.
+    cursor_size: u32,
     pointer: Point<f64, Logical>,
     /// The cursor shows from the first pointer motion on.
     cursor_visible: bool,
@@ -226,6 +257,18 @@ fn run(args: Args) -> anyhow::Result<Infallible> {
     let (session, notifier) =
         LibSeatSession::new().map_err(|e| anyhow!("no seat session (libseat): {e:?}"))?;
     let (gpu, drm_events) = drm::Gpu::open(session.clone(), args.drm_device)?;
+    let cursor_theme = match &args.cursor_theme {
+        Some(dir) => {
+            let read = Instant::now();
+            let theme = cursor::read_theme(dir)
+                .inspect_err(|e| warn!("cursor theme: {e}; the built-in arrow instead"))
+                .unwrap_or_default();
+            let sizes: Vec<u32> = theme.iter().map(|(s, _)| *s).collect();
+            info!("cursor theme: sizes {sizes:?} read in {:?}", read.elapsed());
+            theme
+        }
+        None => Vec::new(),
+    };
 
     let display: Display<State> = Display::new()?;
     let dh = display.handle();
@@ -240,6 +283,8 @@ fn run(args: Args) -> anyhow::Result<Infallible> {
         signal: event_loop.get_signal(),
         started,
         log_timing: args.log_timing,
+        tap: args.tap,
+        clickfinger: args.clickfinger,
         session,
         compositor: CompositorState::new_v6::<State>(&dh),
         shm: ShmState::new::<State>(&dh, vec![]),
@@ -260,6 +305,8 @@ fn run(args: Args) -> anyhow::Result<Infallible> {
         renderer: PixmanRenderer::new()?,
         gpu,
         scales: args.scales,
+        cursor_theme,
+        cursor_size: args.cursor_size.unwrap_or(DEFAULT_CURSOR_SIZE),
         pointer: Point::default(),
         cursor_visible: false,
         libinput: None,
@@ -438,6 +485,12 @@ mod tests {
             "--scale",
             "HDMI-A-1=2",
             "--log-timing",
+            "--tap",
+            "--clickfinger",
+            "--cursor-theme",
+            "/theme",
+            "--cursor-size",
+            "32",
             "--",
             "greeter",
             "--flag",
@@ -449,6 +502,10 @@ mod tests {
                 drm_device: Some("/dev/dri/card1".into()),
                 scales: vec![("eDP-1".into(), 1.5), ("HDMI-A-1".into(), 2.0)],
                 log_timing: true,
+                tap: true,
+                clickfinger: true,
+                cursor_theme: Some("/theme".into()),
+                cursor_size: Some(32),
                 greeter: vec!["greeter".into(), "--flag".into()],
             }
         );
@@ -473,5 +530,7 @@ mod tests {
         assert!(parse(&["--scale", "eDP-1=4", "--", "g"]).is_ok());
         assert!(parse(&["--scale", "eDP-1=nan", "--", "g"]).is_err());
         assert!(parse(&["--drm-device"]).is_err());
+        assert!(parse(&["--cursor-theme"]).is_err());
+        assert!(parse(&["--cursor-size", "big", "--", "g"]).is_err());
     }
 }

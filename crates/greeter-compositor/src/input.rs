@@ -12,11 +12,11 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::input::keyboard::{FilterResult, KeyboardHandle, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle};
-use smithay::reexports::input::Libinput;
+use smithay::reexports::input::{ClickMethod, Device, Libinput};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER};
 use smithay::wayland::compositor::get_parent;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::State;
 
@@ -69,10 +69,12 @@ impl State {
         }
         self.libinput = Some(libinput.clone());
         let backend = LibinputInputBackend::new(libinput);
-        if let Err(e) = self
-            .handle
-            .insert_source(backend, |event, _, state| state.input(event))
-        {
+        if let Err(e) = self.handle.insert_source(backend, |event, _, state| {
+            if let InputEvent::DeviceAdded { device } = &event {
+                configure(device.clone(), state.tap, state.clickfinger);
+            }
+            state.input(event)
+        }) {
             warn!("libinput: {e}");
         }
         self.timing("input ready");
@@ -264,4 +266,22 @@ pub fn root(mut surface: WlSurface) -> WlSurface {
         surface = parent;
     }
     surface
+}
+
+/// A new touchpad set up as the desktop may have it, both of which libinput leaves off:
+/// tap-to-click (`--tap`), and clickfinger (`--clickfinger`: the number of fingers picks the
+/// button, not where the pad is pressed).
+fn configure(mut device: Device, tap: bool, clickfinger: bool) {
+    if tap && device.config_tap_finger_count() > 0 {
+        let result = device.config_tap_set_enabled(true);
+        info!("{}: tap-to-click on: {result:?}", device.name());
+    }
+    if clickfinger
+        && device
+            .config_click_methods()
+            .contains(&ClickMethod::Clickfinger)
+    {
+        let result = device.config_click_set_method(ClickMethod::Clickfinger);
+        info!("{}: clickfinger on: {result:?}", device.name());
+    }
 }

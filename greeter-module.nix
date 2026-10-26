@@ -27,6 +27,11 @@ let
   scales = lib.concatMapAttrsStringSep " " (
     connector: scale: "--scale ${lib.escapeShellArg "${connector}=${toString scale}"}"
   ) cfg.scales;
+  touchpad =
+    lib.optionalString cfg.tapToClick "--tap " + lib.optionalString cfg.clickfinger "--clickfinger ";
+  cursor = lib.optionalString (cfg.cursorTheme != null) (
+    "--cursor-theme ${lib.escapeShellArg cfg.cursorTheme} --cursor-size ${toString cfg.cursorSize} "
+  );
 in
 {
   options.programs.rust-wl-greeter = {
@@ -59,6 +64,33 @@ in
         `layout(variant)`; the first at first. By default, the compositor's keymap.
       '';
     };
+    tapToClick = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      example = true;
+      description = "Whether a tap on a touchpad clicks, as it may in the desktop; libinput leaves it off.";
+    };
+    clickfinger = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      example = true;
+      description = ''
+        Whether a touchpad's click is the left, right or middle button by the number of
+        fingers on it (libinput's clickfinger), as it may be in the desktop, instead of by
+        where the pad is pressed.
+      '';
+    };
+    cursorTheme = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = lib.literalExpression ''"''${pkgs.capitaine-cursors}/share/icons/capitaine-cursors"'';
+      description = "The pointer's cursor theme, its directory; by default, a built-in arrow.";
+    };
+    cursorSize = lib.mkOption {
+      type = lib.types.ints.between 8 256;
+      default = 24;
+      description = "The cursor's size in logical pixels, with `cursorTheme`.";
+    };
     scales = lib.mkOption {
       type = lib.types.attrsOf lib.types.float;
       default = { };
@@ -81,7 +113,7 @@ in
       # journal instead.
       settings.default_session.command = lib.concatStringsSep " " [
         "${pkgs.systemd}/bin/systemd-cat -t rust-wl-greeter"
-        "${lib.getExe cfg.compositorPackage} --log-timing ${scales}"
+        "${lib.getExe cfg.compositorPackage} --log-timing ${touchpad}${cursor}${scales}"
         "-- ${lib.getExe cfg.package} --config ${configFile}"
       ];
     };

@@ -71,6 +71,9 @@
           greeter-power = import ./tests/greeter-power.nix { inherit pkgs; };
           # The greeter shows its last user's theme, as their lock screen copies it.
           greeter-theme = import ./tests/greeter-theme.nix { inherit pkgs; };
+          # The power row and dialog at a fractional scale, and the cursor theme, as on the
+          # laptop.
+          greeter-power-scale = import ./tests/greeter-power-scale.nix { inherit pkgs; };
 
           fmt = cargoCheck "fmt" [ pkgs.rustfmt ] "cargo fmt --all --check";
           clippy = cargoCheck "clippy" [

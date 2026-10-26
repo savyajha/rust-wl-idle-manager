@@ -11,6 +11,8 @@ calloop = { version = "0.14", features = ["signals"] }
 libc.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3"
+# Reads the cursor theme; already in the tree through Smithay.
+xcursor = "0.3"
 
 # No backend_gbm, backend_egl or renderer_gl: nothing here links Mesa, GBM or EGL.
 [dependencies.smithay]

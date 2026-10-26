@@ -106,7 +106,7 @@ impl Drop for Dumb {
     }
 }
 
-/// The pointer's arrow, on an output's cursor plane.
+/// The pointer's image, on an output's cursor plane.
 struct CursorPlane {
     plane: plane::Handle,
     _claim: PlaneClaim,
@@ -148,8 +148,10 @@ pub struct Head {
     /// (Legacy KMS, and virtual GPUs, which hide cursor planes from clients that cannot set
     /// a hotspot, as Smithay cannot.)
     cursor_plane: Option<CursorPlane>,
-    /// The arrow drawn into the frame, and its logical size there.
+    /// The cursor drawn into the frame, and its logical size there.
     soft_cursor: (MemoryRenderBuffer, Size<i32, Logical>),
+    /// The pixel of the cursor's image that points, in either.
+    hotspot: Point<i32, Physical>,
     global: GlobalId,
 }
 
@@ -279,7 +281,8 @@ impl State {
             .iter()
             .find(|(n, _)| *n == name)
             .map_or(1.0, |(_, s)| *s);
-        let cursor_plane = cursor_plane(&self.gpu, &surface, scale);
+        let image = cursor::pick(&self.cursor_theme, self.cursor_size, scale);
+        let cursor_plane = cursor_plane(&self.gpu, &surface, &image);
 
         let output = Output::new(
             name.clone(),
@@ -331,7 +334,8 @@ impl State {
             client_in_flip: false,
             refresh: Duration::from_nanos(1_000_000_000_000 / output_mode.refresh.max(1) as u64),
             cursor_plane,
-            soft_cursor: soft_cursor(scale),
+            soft_cursor: soft_cursor(&image, scale),
+            hotspot: (image.hotspot.0 as i32, image.hotspot.1 as i32).into(),
             global,
         });
         Ok(())
@@ -401,8 +405,9 @@ impl State {
         }
     }
 
-    /// Where the cursor shows on an output, in its physical pixels; None where it doesn't.
-    /// (The logical size is rounded up, so the last logical pixel can reach past the mode.)
+    /// Where the cursor's image goes on an output, in its physical pixels (its hotspot at the
+    /// pointer); None where it doesn't show. (The logical size is rounded up, so the last
+    /// logical pixel can reach past the mode.)
     fn cursor_position(&self, head: &Head) -> Option<Point<i32, Physical>> {
         let geometry = self.space.output_geometry(&head.output)?;
         (self.cursor_visible && geometry.to_f64().contains(self.pointer)).then(|| {
@@ -410,7 +415,7 @@ impl State {
                 .to_physical(head.output.current_scale().fractional_scale())
                 .to_i32_floor::<i32>();
             let (w, h) = head.mode.size();
-            (p.x.min(w as i32 - 1), p.y.min(h as i32 - 1)).into()
+            Point::from((p.x.min(w as i32 - 1), p.y.min(h as i32 - 1))) - head.hotspot
         })
     }
 
@@ -727,13 +732,12 @@ fn preferred_mode(conn: &connector::Info) -> Mode {
         .unwrap_or(&conn.modes()[0])
 }
 
-/// The arrow, to be drawn into the frame, at the output's scale rounded, with the logical
-/// size to draw it at. The renderer sizes it in logical pixels: the image is padded to a
-/// logical size that is a whole number of pixels at this scale, so that it is drawn pixel
-/// for pixel, not stretched and filtered.
-fn soft_cursor(scale: f64) -> (MemoryRenderBuffer, Size<i32, Logical>) {
-    let factor = (scale.round() as usize).max(1);
-    let (w, h) = cursor::size(factor);
+/// The cursor's image, to be drawn into the frame, with the logical size to draw it at. The
+/// renderer sizes it in logical pixels: the image is padded to a logical size that is a whole
+/// number of pixels at this scale, so that it is drawn pixel for pixel, not stretched and
+/// filtered.
+fn soft_cursor(image: &cursor::Image, scale: f64) -> (MemoryRenderBuffer, Size<i32, Logical>) {
+    let (w, h) = (image.width, image.height);
     let whole = |px: usize| {
         let least = (px as f64 / scale).ceil() as i32;
         (least..least + 120)
@@ -745,7 +749,8 @@ fn soft_cursor(scale: f64) -> (MemoryRenderBuffer, Size<i32, Logical>) {
         (logical.w as f64 * scale).round() as usize,
         (logical.h as f64 * scale).round() as usize,
     );
-    let bytes: Vec<u8> = cursor::arrow(factor, w, h)
+    let bytes: Vec<u8> = image
+        .padded(w, h)
         .iter()
         .flat_map(|p| p.to_ne_bytes())
         .collect();
@@ -775,10 +780,15 @@ fn soft_cursor_element(
     )
 }
 
-/// The output's cursor plane (atomic KMS only), with the arrow drawn at the output's scale,
-/// rounded.
-fn cursor_plane(gpu: &Gpu, surface: &DrmSurface, scale: f64) -> Option<CursorPlane> {
+/// The output's cursor plane (atomic KMS only), with `image` on it, if it fits.
+fn cursor_plane(gpu: &Gpu, surface: &DrmSurface, image: &cursor::Image) -> Option<CursorPlane> {
     if surface.is_legacy() {
+        return None;
+    }
+    let size = gpu.cursor_size;
+    if image.width > size.0 as usize || image.height > size.1 as usize {
+        let (w, h) = (image.width, image.height);
+        info!("cursor image {w}x{h} larger than the cursor plane's {size:?}");
         return None;
     }
     let (plane, claim) = surface
@@ -786,12 +796,11 @@ fn cursor_plane(gpu: &Gpu, surface: &DrmSurface, scale: f64) -> Option<CursorPla
         .cursor
         .iter()
         .find_map(|p| Some((p.handle, surface.claim_plane(p.handle)?)))?;
-    let size = gpu.cursor_size;
     let mut dumb = Dumb::new(&gpu.fd, size, Fourcc::Argb8888)
         .inspect_err(|e| warn!("cursor buffer: {e:#}"))
         .ok()?;
     let (w, h) = (size.0 as usize, size.1 as usize);
-    let pixels = cursor::arrow((scale.round() as usize).max(1), w, h);
+    let pixels = image.padded(w, h);
     let pitch = dumb.pitch;
     let mapping = dumb.bytes_mut();
     for (y, row) in pixels.chunks(w).enumerate() {
@@ -828,7 +837,7 @@ mod tests {
     /// whole arrow, and its edge where it is cut off by the bottom and the right of the output.
     #[test]
     fn soft_cursor_is_not_stretched() {
-        let cursor = soft_cursor(1.5);
+        let cursor = soft_cursor(&cursor::arrow(2), 1.5);
         let (w, h) = (1024, 768);
         for ((x, y), outline) in [((450, 450), 172), ((450, 766), 4), ((1023, 450), 30)] {
             let mut renderer = PixmanRenderer::new().unwrap();

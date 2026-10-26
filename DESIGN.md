@@ -552,7 +552,8 @@ The `--auth` helper exits with 0 for the right password and 1 otherwise.
 greeter runs on. greetd starts it as the greeter, as the `greeter` user:
 
 ```sh
-rust-wl-greeter-compositor [--drm-device PATH] [--scale CONNECTOR=SCALE]... [--log-timing] -- GREETER [ARGS...]
+rust-wl-greeter-compositor [--drm-device PATH] [--scale CONNECTOR=SCALE]... [--tap] [--clickfinger] \
+    [--cursor-theme DIR [--cursor-size N]] [--log-timing] -- GREETER [ARGS...]
 ```
 
 It takes the seat through libseat (logind or seatd), opens one GPU, creates
@@ -599,9 +600,15 @@ connectors (read their modes): after a hotplug it does not do so by itself
 while the device has a master. The start-up scan uses the state from boot,
 which is faster.
 
-The cursor is a built-in arrow, drawn at the output's scale rounded, hidden
-until the pointer first moves. It goes on the output's cursor plane where
-there is one; otherwise, and if a flip with the cursor plane ever fails, it
+The cursor is a theme's pointer with `--cursor-theme` (a theme's directory,
+`…/share/icons/NAME`), or else a built-in arrow, drawn at the output's scale
+rounded; it is hidden until the pointer first moves. From the theme it reads
+`cursors/left_ptr`, or else `cursors/default`, once at start-up, and for each
+output takes the smallest of its sizes at least `--cursor-size` (default 24)
+times the output's scale, or else the largest; the image's hotspot is at the
+pointer. A theme that cannot be read is logged, and the arrow is used. The
+cursor goes on the output's cursor plane where there is one and the image
+fits it; otherwise, and if a flip with the cursor plane ever fails, it
 is drawn into the frame (and the plane is switched off), pixel for pixel at
 any scale. Legacy KMS has no usable cursor plane here, and
 virtual GPUs hide theirs from clients that cannot set a cursor hotspot, as
@@ -639,6 +646,12 @@ on the outputs: motion off them, and an absolute position in a gap of the
 layout, go to the nearest point of an output, and after outputs change it is
 moved back onto one. Touch is not
 handled. Power, sleep and lid keys are left to logind.
+
+Touchpads keep libinput's defaults (no tap-to-click; clicks by where the pad is
+pressed: its right-hand area is the right button) unless asked: `--tap` turns
+tap-to-click on, and `--clickfinger` makes the number of fingers pick the
+button, as a desktop may have them. Each device added is set up so, and the
+result logged.
 
 On a VT switch away the compositor stops drawing and suspends libinput; on
 the way back it rescans the connectors and redraws every output in full.
@@ -868,7 +881,9 @@ allows `power-off`, `reboot`, `suspend` and `hibernate` to an active session,
 and their `-multiple-sessions` forms too, so every answer is `yes`, even while
 other users are logged in.
 
-Sleep and Hibernate act at once: nothing is lost. Restart and Shut Down ask
+Sleep and Hibernate act at once: nothing is lost. Only the left button clicks
+a button. With tap-to-click on (the compositor's `--tap`), a stray tap on Sleep
+puts the machine to sleep at once, with no dialog: an accepted risk. Restart and Shut Down ask
 first, in a dialog drawn in the login screen (not a popup), over the screen
 dimmed: "Restart now?" or "Shut down now?", with Cancel, focused, and the
 action's button (320 by 132, centred; its buttons 120 by 32). While it is open it
@@ -1024,6 +1039,13 @@ off the power row, so Enter does not sleep again), Hibernate by the keyboard,
 the dialog's Cancel, Escape and a click outside it (the dialog gone from the
 screen each time), then a real reboot back to the greeter, and a real power off
 by the keyboard.
+
+`tests/greeter-power-scale.nix` has the laptop's setup on one output at scale
+1.6: tap-to-click and clickfinger asked for (QEMU has no touchpad, so only the
+compositor's flags are checked) and capitaine-cursors at size 24. The theme's
+48 px image drawn at the pointer by its hotspot, checked pixel by pixel; the
+dialog by a click and by the keyboard; a right click doing nothing; and Sleep
+by a click.
 
 `tests/greeter-indicators.nix` has three layouts, "de", "us" and "us(dvorak)",
 on one output: the popup by keyboard and by click, what each layout types into
