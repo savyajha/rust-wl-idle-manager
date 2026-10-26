@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -21,6 +21,10 @@ pub struct Config {
     pub timeouts: Vec<Timeout>,
     #[knuffel(child)]
     pub lock_screen: Option<LockScreen>,
+    /// Where the built-in lock screen's theme is copied for the greeter (see
+    /// `ui::export`); nothing is copied without one, or with a `locker`.
+    #[knuffel(child, unwrap(argument))]
+    pub greeter_theme: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -188,8 +192,20 @@ mod tests {
                     },
                 ],
                 lock_screen: None,
+                greeter_theme: None,
             }
         );
+    }
+
+    #[test]
+    fn the_greeter_theme_is_a_directory() {
+        let config = Config::parse("test.kdl", "greeter-theme \"/var/cache/g/alice\"").unwrap();
+        assert_eq!(
+            config.greeter_theme,
+            Some(PathBuf::from("/var/cache/g/alice"))
+        );
+        assert!(config.lock_screen.is_some());
+        assert!(parse_err("greeter-theme 1").contains("expected string"));
     }
 
     #[test]

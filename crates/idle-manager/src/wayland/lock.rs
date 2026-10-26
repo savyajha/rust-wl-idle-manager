@@ -61,6 +61,8 @@ pub struct Screen {
     /// The lock's latencies, measured while dispatching and logged after the flush.
     drawn: Option<(&'static str, Duration)>,
     locked: Option<Duration>,
+    /// Where the theme is copied for the greeter.
+    greeter_theme: Option<PathBuf>,
 }
 
 struct Lock {
@@ -120,6 +122,7 @@ impl Screen {
         globals: &GlobalList,
         qh: &QueueHandle<State>,
         config: LockScreen,
+        greeter_theme: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let can_lock = globals.contents().with_list(|list| {
             list.iter()
@@ -151,6 +154,7 @@ impl Screen {
             minute: draw::minute(),
             drawn: None,
             locked: None,
+            greeter_theme,
         })
     }
 
@@ -188,15 +192,27 @@ impl Screen {
         }
     }
 
-    /// Read GTK's colors again, and show `wallpaper` from now on if there is one.
+    /// Read GTK's colors again, and show `wallpaper` from now on if there is one; copy
+    /// the theme for the greeter.
     pub(super) fn reload(&mut self, wallpaper: Option<Blurred>) {
         self.painter.reload(wallpaper);
+        self.export();
         for output in &mut self.outputs {
             output.prepared = None;
         }
         self.prepare();
         if let Some(lock) = &mut self.lock {
             lock.shown = None;
+        }
+    }
+
+    /// Copy the theme for the greeter, if it is to be (`greeter-theme`).
+    pub(super) fn export(&self) {
+        if let Some(dir) = &self.greeter_theme {
+            match self.painter.export(dir) {
+                Ok(()) => info!("theme written for the greeter to {}", dir.display()),
+                Err(e) => warn!("not writing the theme for the greeter: {e:#}"),
+            }
         }
     }
 

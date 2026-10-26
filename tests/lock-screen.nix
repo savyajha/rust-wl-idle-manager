@@ -42,6 +42,8 @@
 #  15. a lock while the wallpaper is still loading shows the prepared frame at
 #      once, and the new wallpaper once it is ready
 #  16. ten reloads in a row leave the daemon's private memory as it was
+#  17. the theme is copied for the greeter (`greeter-theme`): the colours and the font at
+#      start, then with the background on each reload; files of 0640, each replaced
 
 { pkgs, idleManager }:
 
@@ -67,6 +69,7 @@ let
 
   config = pkgs.writeText "idle.kdl" ''
     timeout 5 { lock; }
+    greeter-theme "/var/cache/rust-wl-greeter/${user}"
     lock-screen {
         background { wallpaper-command "${wallpaperCommand}"; }
         clock {
@@ -78,6 +81,12 @@ let
         name { anchor "bottom"; offset 0 40; }
         password { anchor "top"; offset 0 320; }
     }
+  '';
+
+  # A daemon with no wallpaper command, which copies the theme for the greeter at start.
+  plainThemeConfig = pkgs.writeText "idle-plain.kdl" ''
+    timeout 3600 { lock; }
+    greeter-theme "/home/${user}/plain-theme"
   '';
 
   mkIdleManager = {
@@ -305,6 +314,16 @@ pkgs.testers.runNixOSTest {
     caps_line = (middle - 70, output["y"] + 358, 140, 22)
     hint = (middle - 60, output["y"] + 322, 120, 26)
     FIELD = over(PLAIN, 0.2)
+
+    # The greeter's theme directory, as the greeter's NixOS module would make it.
+    THEME = "/var/cache/rust-wl-greeter/${user}"
+    machine.succeed(f"install -d -m 2750 -o ${user} {THEME}")
+
+    def background_header():
+        """The copied background's magic, version, width and height, and its size."""
+        words = machine.succeed(f"head -c 16 {THEME}/background | od -An -tu4").split()
+        size = int(machine.succeed(f"stat -c %s {THEME}/background"))
+        return [int(w) for w in words], size
 
     with subtest("an idle lock shows the lock screen; logind unlock removes it"):
         since = cursor()
@@ -551,13 +570,51 @@ pkgs.testers.runNixOSTest {
         swaymsg("output HEADLESS-1 scale 1")
         wait_for_log(since, "lock screen prepared for 1280×720 at scale 1 (1280×720 px) in")
         probe = (output["x"] + 5, output["y"] + output["height"] // 2)
+        # From here to the memory subtest, no idle lock (its frames would count there):
+        # held within a second of the last key, well inside the 5 s idle timeout.
+        since = cursor()
+        uctl("systemd-run --user --unit=no-idle systemd-inhibit --what=idle sleep 300")
+        wait_for_log(since, "logind idle inhibitor held")
+
+    with subtest("the theme is copied for the greeter: colours and font at start"):
+        # Written when the first (failed) wallpaper load was done with.
+        css = machine.succeed(f"cat {THEME}/gtk.css")
+        assert "@define-color error_color #ff4040ff;" in css, css
+        ini = machine.succeed(f"cat {THEME}/settings.ini")
+        assert "gtk-font-name=Adwaita Sans 11" in ini, ini
+        machine.fail(f"test -e {THEME}/background")
+        modes = machine.succeed(f"stat -c '%a %U' {THEME}/gtk.css {THEME}/settings.ini")
+        assert modes.split("\n")[:2] == ["640 ${user}", "640 ${user}"], modes
+        # A daemon with no wallpaper command copies them at start too.
+        since = cursor()
+        uctl("mkdir -p /home/${user}/plain-theme")
+        daemon = "${idleManager}/bin/rust-wl-idle-manager --config ${plainThemeConfig}"
+        uctl(f"systemd-run --user --unit=plain-theme -E WAYLAND_DISPLAY={display} {daemon}")
+        wait_for_log(since, "theme written for the greeter to /home/${user}/plain-theme")
+        uctl("systemctl --user stop plain-theme.service")
+        css = machine.succeed("cat /home/${user}/plain-theme/gtk.css")
+        assert "@define-color error_color #ff4040ff;" in css, css
+        machine.fail("test -e /home/${user}/plain-theme/background")
 
     with subtest("a wallpaper, then another, taken up on SIGHUP"):
+        inodes = []
         for path, colour in [("${wallpapers}/blue.png", [0x40, 0x80, 0xc0]), ("${wallpapers}/orange.jpg", [0xc0, 0x60, 0x30])]:
             since = cursor()
             machine.succeed(f"echo {path} > /etc/wallpaper")
             uctl("systemctl --user reload idle-manager.service")
             wait_for_log(since, f"wallpaper {path} ready in")
+            # Copied for the greeter, with it: a new file, of its header's size.
+            wait_for_log(since, f"theme written for the greeter to {THEME}")
+            # As the greeter reads it: the magic, the version, at most 2048 × 2048 pixels,
+            # and exactly the header's size.
+            (magic, version, width, height), size = background_header()
+            assert (magic, version) == (int.from_bytes(b"RWGB", "little"), 1), (magic, version)
+            assert 1 <= width * height <= 2048 * 2048, (width, height)
+            assert size == 16 + width * height * 4, (size, width, height)
+            inode = machine.succeed(f"stat -c '%i %a' {THEME}/background").split()
+            assert inode[1] == "640", inode
+            assert inode[0] not in inodes, "not replaced"
+            inodes.append(inode[0])
             want = toned(colour)
             machine.succeed(f"loginctl lock-session {session}")
             wait_for_log(since, "lock screen drawn")
@@ -585,10 +642,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("rm /etc/wallpaper-delay")
 
     with subtest("ten reloads leave the private memory as it was"):
-        # Held off the 5 s idle lock, which would draw frames of its own.
-        since = cursor()
-        uctl("systemd-run --user --unit=no-idle systemd-inhibit --what=idle sleep 60")
-        wait_for_log(since, "logind idle inhibitor held")
+        # The idle lock is held off (since the scale subtest): it would draw frames.
         before = memory(pid)
         for _ in range(10):
             since = cursor()

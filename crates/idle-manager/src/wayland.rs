@@ -3,6 +3,7 @@ mod lock;
 
 use std::collections::VecDeque;
 use std::mem;
+use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use smithay_client_toolkit::output::OutputState;
@@ -57,7 +58,12 @@ struct State {
 
 impl Wayland {
     /// Connect to the compositor and create one notification per timeout.
-    pub fn connect(timeouts: &[Timeout], lock_screen: Option<LockScreen>) -> anyhow::Result<Self> {
+    /// The lock screen's theme is copied to `greeter_theme` on each reload.
+    pub fn connect(
+        timeouts: &[Timeout],
+        lock_screen: Option<LockScreen>,
+        greeter_theme: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let conn = Connection::connect_to_env().context("connecting to the Wayland compositor")?;
         let (globals, queue) =
             registry_queue_init::<State>(&conn).context("listing Wayland globals")?;
@@ -76,7 +82,7 @@ impl Wayland {
             registry: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
             lock_screen: lock_screen
-                .map(|config| Screen::new(&globals, &qh, config))
+                .map(|config| Screen::new(&globals, &qh, config, greeter_theme))
                 .transpose()?,
         };
         let mut wayland = Self {
@@ -140,6 +146,13 @@ impl Wayland {
     pub fn unlock(&mut self) {
         if let Some(screen) = &mut self.state.lock_screen {
             screen.unlock(&mut self.state.inputs);
+        }
+    }
+
+    /// Copy the lock screen's theme for the greeter, as a reload does.
+    pub fn export_theme(&self) {
+        if let Some(screen) = &self.state.lock_screen {
+            screen.export();
         }
     }
 

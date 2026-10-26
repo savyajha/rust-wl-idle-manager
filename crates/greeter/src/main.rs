@@ -17,6 +17,7 @@ mod login;
 mod power;
 mod sessions;
 mod state;
+mod theme;
 mod users;
 mod wayland;
 
@@ -166,8 +167,17 @@ async fn greet_on(path: &Path) -> anyhow::Result<()> {
         layout: 0,
         battery: None,
     };
-    // No theme yet: GTK's built-in colours and font. The name is set with the user.
-    let painter = Painter::new(config.look, None, String::new());
+    // The last user's theme, before the first frame. The name is set with the user.
+    let theme = theme::load(state.last_user());
+    let painter = Painter::given(
+        config.look,
+        theme.palette,
+        &theme.font,
+        theme.wallpaper,
+        String::new(),
+    );
+    // What Pango draws with: the theme's font, or the one it falls back to.
+    info!("font: {}", painter.font_family());
     let wayland = Wayland::connect(login, painter)?;
     // Alongside the rest: a slow bus, or a missing UPower or logind, holds up nothing.
     let (battery_sender, mut batteries) = mpsc::channel(1);

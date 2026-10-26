@@ -4,6 +4,7 @@
 pub mod config;
 pub mod draw;
 pub mod entry;
+pub mod export;
 pub mod frames;
 pub mod keyboard;
 pub mod logind;

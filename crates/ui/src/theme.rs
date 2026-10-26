@@ -49,6 +49,19 @@ impl Palette {
         Self([built_in].into_iter().chain(defined).collect())
     }
 
+    /// Its colors as `@define-color` lines of `#rrggbbaa`, which `parse` reads back as
+    /// they are (each channel is a byte's), sorted by name.
+    pub fn to_css(&self) -> String {
+        let mut names: Vec<_> = self.0.keys().collect();
+        names.sort();
+        let mut css = String::new();
+        for name in names {
+            let [r, g, b, a] = self.0[name].map(|c| (c * 255.0).round() as u8);
+            css += &format!("@define-color {name} #{r:02x}{g:02x}{b:02x}{a:02x};\n");
+        }
+        css
+    }
+
     /// `color`, with its opacity applied; an unknown name gives white.
     pub fn get(&self, color: &Color) -> Rgba {
         let [r, g, b, a] = match &color.name {
@@ -67,7 +80,8 @@ pub fn font(dir: Option<&Path>) -> String {
         .to_owned()
 }
 
-fn font_in(text: &str) -> Option<&str> {
+/// The `gtk-font-name` in `text`, a settings.ini's.
+pub fn font_in(text: &str) -> Option<&str> {
     text.lines()
         .find_map(|line| {
             line.trim()
@@ -135,6 +149,18 @@ mod tests {
             palette.get(&color("error_color", 0.5)),
             [1.0, 0.0, 0.0, 128.0 / 510.0]
         );
+    }
+
+    #[test]
+    fn a_palette_written_as_css_reads_back_the_same() {
+        let palette = Palette::parse("@define-color b #add28e;\n@define-color a #ff000080;\n");
+        let css = palette.to_css();
+        assert_eq!(
+            css,
+            "@define-color a #ff000080;\n@define-color b #add28eff;\n\
+             @define-color error_color #ffb4abff;\n"
+        );
+        assert_eq!(Palette::parse(&css).0, palette.0);
     }
 
     #[test]

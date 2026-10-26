@@ -333,6 +333,22 @@ colour). The home-manager unit that follows the wallpaper reloads the daemon
 (`systemctl --user reload rust-wl-idle-manager`), which also rereads gtk.css,
 so matugen's new colours arrive with the new wallpaper.
 
+With `greeter-theme "<dir>"`, each reload (and the end of each wallpaper load,
+and startup when there is no wallpaper command) also copies the theme for the
+greeter, which cannot read the user's files (`ui::export`): `gtk.css` with only
+the `@define-color` lines, each as `#rrggbbaa` from the parsed colours (which
+are bytes, so they read back exactly); `settings.ini` with one `gtk-font-name`
+line, the font in use; and, once there is a wallpaper, `background`: a 16-byte
+header (`RWGB`, then the version, 1, the width and the height, each a
+little-endian u32), then the small processed wallpaper as it is, cairo's
+`Rgb24` pixels in native byte order, without decoding anything again. Each is
+written with mode 0640 to a new file beside it (any left from before is removed
+first, and it is created with `O_EXCL`) and renamed over the old one. A failure
+is logged and changes nothing else. With a `locker` there is no lock screen,
+and nothing is copied (the daemon warns). The font is the one read at the
+daemon's start: a reload rereads gtk.css, not settings.ini, so a new font
+reaches the greeter only after the daemon restarts.
+
 #### Scale
 
 Each output is drawn at its real scale. With `wp-fractional-scale-v1` and
@@ -664,7 +680,34 @@ The config is KDL: `sessions` (a directory of `.desktop` files), optionally
 itself instead of using the compositor's keymap; see Keyboard layouts), and
 optionally `look`, which takes the lock screen's `lock-screen` widgets. Without a `look`,
 the lock screen's default is used with the avatar, name and field 100 pixels
-higher. There is no theme yet: GTK's built-in colours and "Sans".
+higher.
+
+The theme is the last user's, as their lock screen copied it (the idle daemon's
+`greeter-theme`, see the wallpaper): read once, before the first frame, from
+`/var/cache/rust-wl-greeter/<user>`, and used for the whole run, on every output
+and screen. The NixOS module creates `/var/cache/rust-wl-greeter` (0755, root's)
+and, for each normal user, their directory: 2750, theirs and the group
+`greeter`'s, so that only they and the greeter can read it. The user writes
+those files and the greeter reads them before anyone has logged in, so each is
+taken only if it is opened without following a link (`O_NOFOLLOW`, and not
+blocking), is a plain file, is owned by the directory's owner (whom root made
+it for), and is small: `gtk.css` and `settings.ini` at most 64 kB, `background`
+at most 2048 × 2048 pixels, of any shape (a panorama's is wide), and exactly its
+header's size. A last user named "", "." or "..", or with a "/", has no theme.
+A file that is not, or
+cannot be read, is skipped with a warning, and the rest of the theme still
+applies. The background replaces the look's (its blur, brightness and
+saturation are ignored: it is already processed; its gradients still apply),
+gtk.css's colours replace the built-in ones the look names (such as
+`error_color`, the field's outline for a wrong password), and the font is
+settings.ini's (the family Pango finds for it is logged, so a fallback shows).
+The focus ring and the frosted widgets are as ever. With no
+last user, no directory or no files, the look's own: GTK's built-in colours,
+"Sans" and the plain background, logged once. A copy left from before (the
+wallpaper changed while the daemon was not running) is shown as it is. The font
+must be installed for the whole system: the greeter user cannot see one in the
+user's own profile, and Pango falls back. Avatars are still the initial in a
+circle.
 
 ### Users
 

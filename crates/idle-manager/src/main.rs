@@ -236,6 +236,9 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let mut sighup = signal(SignalKind::hangup()).context("listening for SIGHUP")?;
     let mut sigterm = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
     let config = Config::load(config_path)?;
+    if config.locker.is_some() && config.greeter_theme.is_some() {
+        warn!("greeter-theme has no effect with locker: there is no lock screen to copy");
+    }
     let session = Connection::session()
         .await
         .context("connecting to the session bus")?;
@@ -269,11 +272,15 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         .lock_screen
         .as_ref()
         .and_then(|look| look.background.clone());
-    let mut wayland = Wayland::connect(&config.timeouts, config.lock_screen)?;
+    let mut wayland = Wayland::connect(&config.timeouts, config.lock_screen, config.greeter_theme)?;
     let inhibitor = logind.sleep_inhibitor().await?;
     // Not before: a child forked while the inhibit reply is in flight could inherit its fd.
     let load = || background.as_ref().and_then(load_wallpaper);
     let mut loading = load();
+    // No wallpaper to wait for: the colours and font are copied for the greeter now.
+    if loading.is_none() {
+        wayland.export_theme();
+    }
     // A SIGHUP while the wallpaper loads: load it again once it has.
     let mut reload = false;
     let mut last_idle_inhibited = None;

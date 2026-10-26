@@ -73,6 +73,12 @@ Elsewhere, create `/etc/pam.d/rust-wl-idle-manager`, for instance with
 `auth include login`. Layouts that need dead keys or compose sequences to type
 the password's characters are not supported yet.
 
+`greeter-theme "/var/cache/rust-wl-greeter/<user>"` copies the built-in lock
+screen's theme (its colours, font and blurred wallpaper) for
+`rust-wl-greeter`, which then looks like the lock screen; its NixOS module
+creates that directory for each normal user. Nothing is copied with a
+`locker`.
+
 ### The lock screen's look
 
 Without a `lock-screen` block, the lock screen is the default below, which has

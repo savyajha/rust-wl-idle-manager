@@ -1,5 +1,5 @@
 use std::f64::consts::PI;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cairo::{
@@ -9,11 +9,12 @@ use cairo::{
 use pango::FontDescription;
 use pango::Weight;
 use pango::glib::DateTime;
-use pango::prelude::FontMapExt;
+use pango::prelude::{FontExt, FontMapExt};
 use tracing::error;
 
 use crate::config::{self, Anchor, LockScreen, Offset, Place, Style, Text};
 use crate::entry::{Look, Status};
+use crate::export;
 use crate::theme::{self, Palette, Rgba};
 use crate::wallpaper::Blurred;
 
@@ -155,6 +156,28 @@ impl Painter {
         Self::from_theme(config, theme, palette, &font, name)
     }
 
+    /// A theme the greeter was given rather than read (see `export`): `palette`, `font` and
+    /// `wallpaper`, already processed.
+    pub fn given(
+        config: LockScreen,
+        palette: Palette,
+        font: &str,
+        wallpaper: Option<Blurred>,
+        name: String,
+    ) -> Self {
+        Self {
+            wallpaper: wallpaper.and_then(surface),
+            ..Self::from_theme(config, None, palette, font, name)
+        }
+    }
+
+    /// The font family Pango draws with: the configured one, or the one it falls back to.
+    pub fn font_family(&self) -> String {
+        let font = self.fonts.load_font(&self.font);
+        let family = font.and_then(|font| font.describe().family());
+        family.map_or_else(|| "none".to_owned(), |family| family.to_string())
+    }
+
     fn from_theme(
         config: LockScreen,
         theme: Option<PathBuf>,
@@ -186,15 +209,27 @@ impl Painter {
 
     pub fn reload(&mut self, wallpaper: Option<Blurred>) {
         if let Some(wallpaper) = wallpaper {
-            let (width, height) = (wallpaper.width, wallpaper.height);
-            let pixels = wallpaper.pixels;
-            let surface =
-                ImageSurface::create_for_data(pixels, Format::Rgb24, width, height, width * 4);
-            self.wallpaper = surface
-                .inspect_err(|e| error!("using the wallpaper: {e}"))
-                .ok();
+            self.wallpaper = surface(wallpaper);
         }
         self.palette = Palette::load(self.theme.as_deref(), &self.config);
+    }
+
+    /// Copy the theme in use to `dir` for the greeter (see `export`): the colors, the font
+    /// and, once there is one, the processed wallpaper, as they are, without decoding again.
+    pub fn export(&self, dir: &Path) -> anyhow::Result<()> {
+        export::write(dir, "gtk.css", self.palette.to_css().as_bytes())?;
+        let font = format!("[Settings]\ngtk-font-name={}\n", self.font);
+        export::write(dir, "settings.ini", font.as_bytes())?;
+        let Some(wallpaper) = &self.wallpaper else {
+            return Ok(());
+        };
+        let (width, height) = (wallpaper.width(), wallpaper.height());
+        let mut written = Ok(());
+        wallpaper.with_data(|pixels| {
+            let background = export::encode(width, height, pixels);
+            written = export::write(dir, export::BACKGROUND, &background);
+        })?;
+        written
     }
 
     /// A scene of nothing but the background's color, for when `scene` fails.
@@ -800,6 +835,16 @@ impl Label {
             f64::from(self.surface.height()),
         )
     }
+}
+
+/// `wallpaper` as a surface to paint; a failure is logged.
+fn surface(wallpaper: Blurred) -> Option<ImageSurface> {
+    let (width, height) = (wallpaper.width, wallpaper.height);
+    let pixels = wallpaper.pixels;
+    let surface = ImageSurface::create_for_data(pixels, Format::Rgb24, width, height, width * 4);
+    surface
+        .inspect_err(|e| error!("using the wallpaper: {e}"))
+        .ok()
 }
 
 /// Paint `surface` with bilinear filtering, its edge pixels repeated beyond it.

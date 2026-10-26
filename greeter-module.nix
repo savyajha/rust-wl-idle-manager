@@ -90,6 +90,16 @@ in
     # The greeter also reads tuigreet's last user, once, from /var/cache/tuigreet/lastuser:
     # greetd's module creates that directory (the greeter user's, 0755) and tuigreet, run as
     # that user too, writes the file 0644, so nothing more is needed.
-    systemd.tmpfiles.rules = [ "d /var/lib/rust-wl-greeter 0700 greeter greeter -" ];
+    # Each user's lock screen copies its theme for the greeter to a directory of theirs
+    # here (the idle daemon's `greeter-theme`): setgid, so that its files are the greeter's
+    # group's, which alone may read them. The greeter takes them only if they are the
+    # directory's owner's.
+    systemd.tmpfiles.rules = [
+      "d /var/lib/rust-wl-greeter 0700 greeter greeter -"
+      "d /var/cache/rust-wl-greeter 0755 root root -"
+    ]
+    ++ lib.mapAttrsToList (_: user: "d /var/cache/rust-wl-greeter/${user.name} 2750 ${user.name} greeter -") (
+      lib.filterAttrs (_: user: user.isNormalUser) config.users.users
+    );
   };
 }
