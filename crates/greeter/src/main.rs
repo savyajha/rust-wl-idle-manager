@@ -181,6 +181,7 @@ async fn greet_on(path: &Path) -> anyhow::Result<()> {
         greetd: Greetd::connect().await?,
         flow: Flow::new(),
         state,
+        picked: State::default(),
         started: None,
         retry_at: None,
         power,
@@ -230,11 +231,31 @@ struct Greeter {
     greetd: Greetd,
     flow: Flow,
     state: State,
+    /// An unsaved `State`, used only as a map from each user to the session and layout in
+    /// use when their login was given up in this greeter: theirs again if they are greeted
+    /// again, before what they last logged in with.
+    picked: State,
     started: Option<Started>,
     /// When to create the session again, after a failure.
     retry_at: Option<Instant>,
     /// To the power task: what to do.
     power: mpsc::Sender<power::Action>,
+}
+
+/// What a user chose before, as file and layout names.
+#[derive(Debug, PartialEq)]
+struct Earlier<'a> {
+    session: Option<&'a str>,
+    layout: Option<&'a str>,
+}
+
+/// What `user` chose before: what was in use when they left a login in this greeter
+/// (`picked`), else what they last logged in with (`state`); each on its own.
+fn earlier<'a>(picked: &'a State, state: &'a State, user: &str) -> Earlier<'a> {
+    Earlier {
+        session: picked.session(user).or(state.session(user)),
+        layout: picked.layout(user).or(state.layout(user)),
+    }
 }
 
 /// What `start_session` was sent for.
@@ -247,6 +268,14 @@ struct Started {
 impl Greeter {
     fn event(&mut self, event: Event) -> Step {
         let login = self.wayland.login();
+        // Leaving a login (Escape or "‹ Users" always goes back from one).
+        if matches!(event, Event::Cancel) && matches!(login.chooser.screen, Screen::Login(_)) {
+            self.picked
+                .set_session(&self.user, &login.sessions[login.chosen].file);
+            if let Some(layout) = login.layouts.get(login.layout) {
+                self.picked.set_layout(&self.user, &layout.name);
+            }
+        }
         if event.clears_message() {
             login.message = None;
         }
@@ -332,12 +361,13 @@ impl Greeter {
         self.wayland.set_name(chooser::OTHER.to_owned());
     }
 
-    /// Log `user` in, with their last session preselected.
+    /// Log `user` in, with the session and layout picked for them earlier in this greeter
+    /// preselected, else those they last logged in with (see `earlier`).
     fn begin(&mut self, user: User) -> Step {
         let login = self.wayland.login();
-        login.chosen = sessions::preselect(&login.sessions, self.state.session(&user.name));
-        let layout =
-            layouts::preselect(&login.layouts, self.state.layout(&user.name), login.layout);
+        let earlier = earlier(&self.picked, &self.state, &user.name);
+        login.chosen = sessions::preselect(&login.sessions, earlier.session);
+        let layout = layouts::preselect(&login.layouts, earlier.layout, login.layout);
         if layout != login.layout {
             login.set_layout(layout);
             info!("layout {} (remembered)", login.layouts[login.layout].name);
@@ -463,5 +493,28 @@ mod tests {
         assert_eq!(parse(&["--config"]), None);
         assert_eq!(parse(&["--check", "a", "b"]), None);
         assert_eq!(parse(&[]), None);
+    }
+
+    #[test]
+    fn what_was_picked_before_going_back_wins_over_the_last_login() {
+        let mut state = State::default();
+        state.set_session("alice", "niri.desktop");
+        state.set_layout("alice", "us");
+        state.set_session("bob", "sway.desktop");
+        let mut picked = State::default();
+        picked.set_session("alice", "beta.desktop");
+        let alice = earlier(&picked, &state, "alice");
+        let want = Earlier {
+            session: Some("beta.desktop"),
+            layout: Some("us"),
+        };
+        assert_eq!(alice, want);
+        picked.set_layout("alice", "de");
+        assert_eq!(earlier(&picked, &state, "alice").layout, Some("de"));
+        // Another user: their own.
+        let bob = earlier(&picked, &state, "bob");
+        assert_eq!((bob.session, bob.layout), (Some("sway.desktop"), None));
+        let carol = earlier(&picked, &state, "carol");
+        assert_eq!((carol.session, carol.layout), (None, None));
     }
 }

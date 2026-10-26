@@ -43,8 +43,9 @@
 #      Down and Enter choose the next session, which starts; the state file remembers it
 #      and the last user (mode 0600, owned by greeter)
 #   6. after greetd restarts, the remembered session is preselected
-#   7. two prompts: the visible verification code, then the password; a click in the popup
-#      chooses a session
+#   7. a session chosen in the popup, then a cancel: chosen again when the same user is
+#      greeted again (not her last), and started; two prompts: the visible verification
+#      code, then the password; a click in the popup chooses a session
 #   8. "Other…" from the one user's login, by a click on its avatar: a password typed as a
 #      user name is never logged; Escape at its prompt goes back to the user name; root,
 #      typed there, logs in (greetd's PAM stack lets root in with a password)
@@ -484,6 +485,24 @@ pkgs.testers.runNixOSTest {
         wait_for_line("sessions: Alpha, Beta; Beta chosen (remembered)")
         log_in("beta", BETA)
 
+    with subtest("a session chosen, then a cancel: still chosen when greeted again"):
+        # alice last logged in to Beta: Alpha, by a click on its row.
+        click(*SESSION_CHIP)
+        wait_for_line("session popup shown", 3)
+        click(*popup_row(0))
+        wait_for_line("session Alpha chosen")
+        backs = count("cancelled; back to the users")
+        machine.send_key("esc")
+        wait_for_line("cancelled; back to the users", backs + 1)
+        # The row of alice and "Other…", on alice: Enter greets her again.
+        before = read_log()
+        machine.send_key("ret")
+        wait_for_line("greeting alice (Alice Liddell)", before.count("greeting alice") + 1)
+        wait_for_line("prompt: secret", before.count("prompt: secret") + 1)
+        after = read_log()[len(before):]
+        assert "sessions: Alpha, Beta; Alpha chosen (remembered)" in after, after
+        log_in("alpha", ALPHA)
+
     with subtest("two prompts: a visible verification code, then the password"):
         machine.succeed("install -o alice -m 0400 ${otpFile} /home/alice/.google_authenticator")
         # The session greetd has was created before the secret: start over, by the row.
@@ -491,11 +510,11 @@ pkgs.testers.runNixOSTest {
         machine.send_key("esc")
         machine.send_key("ret")
         wait_for_line("prompt: visible", n + 1)
-        # Alpha, by a click on its row. (Going back resets it to her last, Beta.)
+        # Alpha, by a click on its row.
         click(*SESSION_CHIP)
-        wait_for_line("session popup shown", 3)
+        wait_for_line("session popup shown", 4)
         click(*popup_row(0))
-        wait_for_line("session Alpha chosen")
+        wait_for_line("session Alpha chosen", 2)
         code = machine.succeed("oathtool --totp -b ${otpSecret}").strip()
         prompts = count("prompt: secret")
         type_text(code + "\n")

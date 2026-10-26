@@ -22,8 +22,10 @@
 #   3. after a restart, alice (with none remembered) has the first layout again, the row
 #      looks as before; yves, typed with "de", gets his "us" back; then, at his prompt, a
 #      click on the indicator and Up and Enter choose "de", whose AltGr types his "@"
-#   4. the variant "us(dvorak)", chosen with the keyboard: its keys type "alice"
-#   5. in one greeter, with no restart: UPower starting shows the battery (the row
+#   4. a layout chosen at a prompt, then a cancel: still chosen when the same user is
+#      greeted again (not his last)
+#   5. the variant "us(dvorak)", chosen with the keyboard: its keys type "alice"
+#   6. in one greeter, with no restart: UPower starting shows the battery (the row
 #      changes); a change of its properties redraws it; UPower stopping hides it, and
 #      starting again shows it again; no battery present hides it
 
@@ -317,6 +319,30 @@ pkgs.testers.runNixOSTest {
         type_de("home\n")
         logged_in("yves", before)
         assert 'layout "yves" "de"' in machine.succeed(f"cat {STATE}")
+
+    with subtest("a layout chosen, then a cancel: still chosen when greeted again"):
+        # yves last logged in with de, the first; the next greeter is alice's, with de.
+        wait_for_line("DE chosen (first)", 3)
+        to_other()
+        unlisted = "greeting a user who is not listed"
+        greeted, prompts = count(unlisted), count("prompt: secret")
+        type_de("yves\n")
+        wait_for_line(unlisted, greeted + 1)
+        wait_for_line("prompt: secret", prompts + 1)
+        # At his prompt, us; then back to the user name.
+        wait_for_more("layout popup shown", lambda: click(*CHIP))
+        machine.send_key("down")
+        wait_for_more("layout us chosen", lambda: machine.send_key("ret"))
+        move(100, 700)
+        wait_for_more("back to the user name", lambda: machine.send_key("esc"))
+        # yves again, typed with us: us stays, and his de is not taken back.
+        before = read_log()
+        machine.send_chars("yves\n")
+        wait_for_line(unlisted, greeted + 2)
+        wait_for_line("prompt: secret", prompts + 2)
+        assert "layout de (remembered)" not in read_log()[len(before):]
+        retry(lambda _: row() == us, 10)
+        restart_greetd()
 
     with subtest("a variant: us(dvorak), whose A P G I D type alice"):
         wait_for_line("DE chosen (first)", 3)

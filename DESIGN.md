@@ -709,8 +709,10 @@ typed. A failure's 2 s pause ends when the user goes back. Choosing a user
 again while the cancel is in flight creates their session once it is done. The
 field is for a secret again for each new user, so an answer typed ahead for
 them answers their password. A session already being started is not given up.
-Each user gets their own last session in the session chip; one chosen in the
-popup applies to that login only. The five-failure cooldown counts across
+Each user gets their own last session in the session chip. One chosen in the
+popup is kept for that user while this greeter runs: going back and greeting
+them again, a failure and the retry after it, all keep it. It is never saved
+until a session starts, so a restart of greetd loses it. The five-failure cooldown counts across
 users: it slows guessing at this screen, whoever is guessed at. A wrong answer
 still counts when the user goes back before greetd says it was wrong (nothing is
 shown), or going back and choosing again would be a way round the cooldown.
@@ -754,8 +756,10 @@ changes, and so are the keys held then (pressed again in the new keymap). Held
 keys are forgotten when the keyboard leaves the surface. Every key pressed
 counts for the modifiers, also one that goes to a popup or the focus.
 
-Choosing a user switches to the layout they last logged in with, if it is still
-configured; otherwise the layout stays as it was, so one chosen before the user
+Choosing a user switches to the layout picked for them earlier while this
+greeter runs (in use when they went back, as for the session above), else to
+the one they last logged in with, if it is still configured; otherwise the
+layout stays as it was, so one chosen before the user
 (on the row, or for "Other…"'s name) carries on. A layout changes only what keys
 type from then on: what is typed, or submitted ahead, stays as it was typed
 (and is wiped when the user goes back, as anything typed is). Characters typed
@@ -918,7 +922,8 @@ is sent in single quotes. The session's environment is `XDG_SESSION_TYPE=wayland
 `XDG_SESSION_DESKTOP` (the file's name without `.desktop`) and, if the file has
 `DesktopNames`, `XDG_CURRENT_DESKTOP` (those names, joined by colons).
 
-The session chosen is the user's last one, else the first by name. Once
+The session chosen is the one picked for the user earlier while this greeter
+runs (see Users), else their last one, else the first by name. Once
 greetd has accepted `start_session`, it is written to
 `/var/lib/rust-wl-greeter/state` (a directory the NixOS module creates, owned
 by `greeter`), with the user as the last user, as KDL: a `last-user "user"`
@@ -960,7 +965,8 @@ TOTP secret for a visible verification code (pam_google_authenticator with
 `echo_verification_code` and `nullok`) before the password: a wrong password
 then the right one, Escape and the "‹ Users" chip, the Log In button, the
 session popup by keyboard and by click, the state file and the session
-remembered after greetd restarts, both prompts, the "de" keymap the greeter
+remembered after greetd restarts, a session picked and then cancelled kept when
+the same user is greeted again, both prompts, the "de" keymap the greeter
 compiles, and that no password or code reaches the journal; the focus ring and
 keys; then, with users added, the avatar row, the last user and each user's
 session after a restart, going back to the row, "Other…" for an unlisted user,
@@ -979,7 +985,8 @@ by the keyboard.
 `tests/greeter-indicators.nix` has three layouts, "de", "us" and "us(dvorak)",
 on one output: the popup by keyboard and by click, what each layout types into
 "Other…"'s visible field (and AltGr under "de"), the layout remembered for a
-user, and the battery from a fake UPower, checked by the indicator row's pixels:
+user, a layout picked and then cancelled kept when the same user is greeted
+again, and the battery from a fake UPower, checked by the indicator row's pixels:
 none without UPower; then, in one running greeter, shown when the fake starts,
 redrawn when it charges, hidden when it stops (the bus cannot start another),
 shown when it starts again, and hidden when no battery is present.
