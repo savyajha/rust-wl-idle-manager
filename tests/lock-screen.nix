@@ -313,6 +313,9 @@ pkgs.testers.runNixOSTest {
     edge = (middle - 70, output["y"] + 320)
     caps_line = (middle - 70, output["y"] + 358, 140, 22)
     hint = (middle - 60, output["y"] + 322, 120, 26)
+    # The field's button, a circle 20 across 5 inside its right end: a point on its arrow's
+    # shaft, a line 2 wide along its middle row.
+    arrow = (middle + 88 - 5 - 10 - 3, output["y"] + 335)
     FIELD = over(PLAIN, 0.2)
 
     # The greeter's theme directory, as the greeter's NixOS module would make it.
@@ -455,12 +458,13 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a wrong password fails; the right one unlocks"):
         lock()
-        assert pixel(*inside) == PLAIN
+        assert pixel(*inside) == PLAIN and pixel(*arrow) == PLAIN
         since = cursor()
         type_file("/etc/wrong-password")
         # The frosted field, with the middle one of 11 dots, drawn into at most two
-        # 1280×720 buffers however fast the keys come.
+        # 1280×720 buffers however fast the keys come; and its button's arrow.
         wait_for_pixel(WHITE, *dot)
+        assert near(pixel(*arrow), WHITE), pixel(*arrow)
         assert memory(pid)["RssShmem"] <= 2 * 3600
         assert near(pixel(*inside), FIELD), pixel(*inside)
         wtype("-k Return")

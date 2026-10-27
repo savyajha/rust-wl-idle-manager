@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cairo::{
-    Antialias, Context, Extend, Filter, Format, HintMetrics, HintStyle, ImageSurface,
-    LinearGradient, Operator,
+    Antialias, Context, Extend, Filter, Format, HintMetrics, HintStyle, ImageSurface, LineCap,
+    LineJoin, LinearGradient, Operator,
 };
 use pango::FontDescription;
 use pango::Weight;
@@ -24,7 +24,7 @@ const BUTTON_INSET: f64 = 5.0;
 
 // Text sizes, in logical pixels.
 const TEXT_SIZE: f64 = 15.0;
-/// The hint's, the arrow's and the countdown's.
+/// The hint's and the countdown's.
 pub const HINT_SIZE: f64 = 13.0;
 const CAPS_SIZE: f64 = 12.0;
 /// A fraction of the avatar's diameter.
@@ -141,7 +141,6 @@ struct Field {
     color: Rgba,
     error: Rgba,
     hint: Rendered,
-    arrow: Label,
     caps: Label,
     countdown: Option<Rendered>,
     /// The answer to a visible prompt, shown in place of the dots.
@@ -319,7 +318,6 @@ impl Painter {
             ..caps
         };
         let hint = faded(HINT_SIZE, Weight::Normal, HINT_ALPHA);
-        let arrow = faded(HINT_SIZE, Weight::Bold, 1.0);
         Ok(Field {
             pill,
             radius: password.radius.0.min(height / 2.0) * factor,
@@ -331,7 +329,6 @@ impl Painter {
                 text: HINT.to_owned(),
                 label: self.label(HINT, &hint, factor, |size| centered(size, pill.center()))?,
             },
-            arrow: self.label("→", &arrow, factor, |size| centered(size, button.center))?,
             caps,
             countdown: None,
             text: None,
@@ -687,6 +684,18 @@ impl Scene {
         self.widgets.as_ref().map(|widgets| widgets.field.pill)
     }
 
+    /// The square around the field's arrow button, in physical pixels; `None` without a
+    /// field.
+    pub fn button(&self) -> Option<Rect> {
+        let Circle { center, radius } = self.widgets.as_ref()?.field.button;
+        Some(Rect {
+            x: center.0 - radius,
+            y: center.1 - radius,
+            w: 2.0 * radius,
+            h: 2.0 * radius,
+        })
+    }
+
     /// The avatar's square, in physical pixels; `None` without one.
     pub fn avatar(&self) -> Option<Rect> {
         self.widgets.as_ref()?.avatar.as_ref().map(Avatar::square)
@@ -812,7 +821,21 @@ impl Field {
                 }
                 self.button.trace(cr);
                 frost(cr, BUTTON * dim, [0.0; 4], line)?;
-                self.arrow.paint(cr, dim)?;
+                // An arrow to the right, in the power icons' style: lines two logical pixels
+                // wide with round ends, 12 long.
+                let ((cx, cy), a) = (self.button.center, 6.0 * line);
+                cr.save()?;
+                cr.move_to(cx - a, cy);
+                cr.line_to(cx + a, cy);
+                cr.move_to(cx + a / 6.0, cy - 5.0 * a / 6.0);
+                cr.line_to(cx + a, cy);
+                cr.line_to(cx + a / 6.0, cy + 5.0 * a / 6.0);
+                set_color(cr, fade(self.color, dim));
+                cr.set_line_width(2.0 * line);
+                cr.set_line_cap(LineCap::Round);
+                cr.set_line_join(LineJoin::Round);
+                cr.stroke()?;
+                cr.restore()?;
             }
         }
         if look.caps_lock {

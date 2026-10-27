@@ -23,7 +23,7 @@
 #
 # Behaviours asserted:
 #   1. with one user, the greeter greets them by the full name at once, with no avatar row
-#      but the "‹ Users" chip; the one layout's short name; no battery without UPower
+#      but Cancel at the left of the bottom row; the one layout's short name; no battery without UPower
 #      (which the bus cannot start); Hidden and NoDisplay sessions are not offered; the first
 #      session by name is chosen; the login screen is on the primary output and the other
 #      shows the background alone
@@ -33,18 +33,20 @@
 #      itself (not by greetd's SIGTERM), and it and the compositor are gone while the
 #      session runs
 #   3. Escape at the prompt goes back to the row of the one user and "Other…" (what was
-#      typed is gone); Enter picks her again; the Log In button submits
+#      typed is gone); Enter picks her again; the field's arrow is not there until
+#      something is typed, and a click on it submits
 #   4. keyboard focus: the one layout's label opens no popup on a click; no ring until a
-#      key moves the focus; Tab moves it to the "‹ Users"
-#      chip, then the session chip; typing there goes to the field (and the focus with it);
-#      Tab cycles to Log In and around, Shift+Tab back, and Enter on Log In submits
+#      key moves the focus; Tab moves it to the session chip; typing there goes to the
+#      field (and the focus with it); Tab then goes to the field's arrow, and on round,
+#      Shift+Tab back, and Enter on the arrow submits
 #   5. the session popup, opened from the session chip: Escape dismisses it and changes
 #      nothing (the chip looks the same, nothing is chosen, a click shows no focus ring);
 #      Down and Enter choose the next session, which starts; the state file remembers it
 #      and the last user (mode 0600, owned by greeter)
 #   6. after greetd restarts, the remembered session is preselected
-#   7. a session chosen in the popup, then a cancel: chosen again when the same user is
-#      greeted again (not her last), and started; two prompts: the visible verification
+#   7. a session chosen in the popup (the pointer on its row highlights it, and Enter
+#      chooses it), then a cancel: chosen again when the same user is greeted again (not
+#      her last), and started; two prompts: the visible verification
 #      code, then the password; a click in the popup chooses a session
 #   8. "Other…" from the one user's login, by a click on its avatar: a password typed as a
 #      user name is never logged; Escape at its prompt goes back to the user name; root,
@@ -55,13 +57,14 @@
 #      and no focus ring until a key; Right and Enter pick the second, bob; Space on the
 #      session chip opens the popup; bob logs in to the session chosen there
 #  11. after greetd restarts, the last user (bob) is preselected, with his own session;
-#      Escape at his prompt, and the "‹ Users" chip, go back to the row (what was typed is
+#      Escape at his prompt, and a click on Cancel, go back to the row (what was typed is
 #      gone); a click on alice's avatar picks her, with her own session
 #  12. "Other…" asks for a user name: dave, who is not listed, logs in, not logged by name
 #  13. tuigreet's lastuser seeds the last user when the state has none; not when it has
 #      one (one not listed starts the row on "Other…"); not when it names no listed user
 #  14. no one listed (login.defs's range matching no one): the user name at once, with no
-#      "‹ Users" chip; Escape at a mistyped user's prompt goes back to the user name
+#      Cancel; at a mistyped user's prompt Cancel shows, and Escape goes back to the user
+#      name
 #  15. the password typed is the one the greeter's own "de" keymap gives ("z" is typed
 #      with the Y key); no password or code reaches the journal, and a password typed
 #      as a user name doesn't reach the greeter's log; the greeter is not dumpable;
@@ -219,25 +222,23 @@ pkgs.testers.runNixOSTest {
     LAYOUT = (683 + 800, 600)
     SCALE = 1.5
     # Where the test's look and the greeter's fixed sizes put things on Virtual-1, in
-    # logical pixels: the field, 176x30 at (253.5, 220); the Log In button, 80 wide, 12
-    # right of it; the "‹ Users" chip, 80x24, 12 left of it; the error line, 20 high, 32
-    # under it; the session chip, 24 high, 58 under it; the popup's rows, 28 high, from
-    # 8 under the chip.
+    # logical pixels: the field, 176x30 at (253.5, 220), its arrow a circle 20 across, 5
+    # inside its right end; the error line, 20 high, 32 under it; the session chip, 24
+    # high, 58 under it; the popup's rows, 28 high, from 8 under the chip.
     FIELD = (253.5, 220, 176, 30)
-    LOG_IN = (253.5 + 176 + 12 + 40, 235)
-    USERS = (253.5 - 12 - 40, 235)
+    LOG_IN = (253.5 + 176 - 5 - 10, 235)
+    ARROW = (LOG_IN[0] - 10, 225, 20, 20)
     MESSAGE = (253.5, 250 + 32, 176, 20)
     SESSION_CHIP = (341.5, 250 + 58 + 12)
     def popup_row(i):
         return (341.5, 250 + 58 + 24 + 8 + 28 * i + 14)
     # The layout's label, top right: 8 from the top, 24 high, ending 12 from the right.
     LAYOUT_LABEL = (683 - 12 - 10, 8 + 12)
-    # The "‹ Users" chip's rectangle.
-    USERS_CHIP = (253.5 - 12 - 80, 223, 80, 24)
-    # Strips of the focus rings (2 wide, 2 to 4 outside a widget) of the field and Log In,
-    # above them, and of the session chip, above it (under the message line).
+    # Strips of the focus rings (2 wide, 2 to 4 outside a widget) of the field, above it,
+    # of its arrow, above that (in the field: found by brightness, not `marked`), and of
+    # the session chip, above it (under the message line).
     FIELD_RING = (321.5, 216.5, 40, 1)
-    LOG_IN_RING = (461.5, 216.5, 40, 1)
+    ARROW_RING = (LOG_IN[0] - 3, 235 - 13.5, 6, 1)
     SESSION_RING = (331.5, 304.5, 20, 1)
     # The avatar row, where the test's look puts the avatar: circles 64 across centred 132
     # from the top, 120 apart, centred on the screen; "Other…" is last of `n`.
@@ -261,6 +262,22 @@ pkgs.testers.runNixOSTest {
         wait_for_line("power: sleep ")
         line = re.findall(r"power: sleep .*$", read_log(), re.M)[-1]
         return len(re.findall(r"\byes\b", line))
+
+    def cancel_box():
+        """Cancel's place, first in the bottom row (boxes 72x56, 16 apart, centred, 24 from
+        the bottom), with the power buttons after it."""
+        n = power_buttons() + 1
+        return (683 / 2 - (n * 72 + (n - 1) * 16) / 2, 512 - 24 - 56, 72, 56)
+
+    def cancel_shown():
+        """Whether Cancel is drawn: the left of its box, where without it the row,
+        centred, has nothing."""
+        x, y, _, h = cancel_box()
+        return marked((x, y, 40, h)) > 0
+
+    def click_cancel():
+        x, y, w, h = cancel_box()
+        click(x + w / 2, y + h / 2)
 
 
     def count(text):
@@ -327,16 +344,32 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl restart greetd")
         wait_for_line("input ready", n + 1)
 
+    # greetd (0.10, Context::start) sets an alarm 5 s after a session is started, to SIGTERM
+    # a greeter that has not exited by then, and does not cancel it when the greeter exits:
+    # one that fires as the next session is started terminates that greeter, as if it had
+    # not exited by itself. So a session is asked for only once 5.5 s have passed since the
+    # last one started: `past_greetd_alarm` before the step that submits, which
+    # `logged_in` checks was done.
+    last_start = [-10.0]
+    cleared = [False]
+
+    def past_greetd_alarm():
+        time.sleep(max(0.0, last_start[0] + 5.5 - time.monotonic()))
+        cleared[0] = True
+
     def logged_in(name, want, before, user="alice", ready="prompt: secret"):
         """Session `name` must start as `user` and write `want`, with the greeter having
         exited by itself (not by greetd's SIGTERM) since the log was `before`; then it is
         ended, and the next greeter waited for until it logs `ready`."""
+        assert cleared[0], "submitted without past_greetd_alarm()"
+        cleared[0] = False
         # At once: a wrong password fails here, not after the marker's long wait.
         def started(_):
             after = read_log()[len(before):]
             assert "wrong password" not in after, after
             return "starting session" in after
         retry(started, 30)
+        last_start[0] = time.monotonic()
         marker = session_marker(name)
         assert marker == f"{user}\n{want}", marker
         machine.fail(f"pgrep -f {PROGRAMS}")
@@ -350,6 +383,7 @@ pkgs.testers.runNixOSTest {
 
     def log_in(name, want, password=PASSWORD, user="alice", ready="prompt: secret"):
         """Type the password and Enter, as `logged_in` checks."""
+        past_greetd_alarm()
         before = read_log()
         type_text(password + "\n")
         logged_in(name, want, before, user, ready)
@@ -369,7 +403,7 @@ pkgs.testers.runNixOSTest {
         wait_for_line("first frame on Virtual-2")
         text = read_log()
         # Only alice is listed (not root, the greeter or other system users): straight to
-        # her prompt, with no avatar row beside her avatar, but "‹ Users" for one.
+        # her prompt, with no avatar row beside her avatar, but Cancel for one.
         assert re.search(r"users: Alice Liddell$", text, re.M), text
         assert "greeting alice (Alice Liddell)" in text, text
         assert "layouts: de (DE); DE chosen (first)" in text, text
@@ -385,7 +419,7 @@ pkgs.testers.runNixOSTest {
         assert marked(MESSAGE) == 0
         # Where subtest 10 finds avatars with two users.
         assert marked(avatar_box(0)) == 0 and marked(avatar_box(2)) == 0
-        assert marked(USERS_CHIP) > 0
+        retry(lambda _: cancel_shown(), 10)
 
     with subtest("a wrong password, then the right one"):
         n = count("prompt: secret")
@@ -398,7 +432,7 @@ pkgs.testers.runNixOSTest {
         log_in("alpha", ALPHA)
         assert "starting session Alpha (alpha.desktop)" in read_log()
 
-    with subtest("Escape goes back to the row of one user; the Log In button submits"):
+    with subtest("Escape goes back to the row of one user; the field's arrow submits"):
         n = count("prompt: secret")
         type_text("abc")
         wait_for_dots(3)
@@ -412,45 +446,50 @@ pkgs.testers.runNixOSTest {
         wait_for_line("prompt: secret", n + 1)
         # Nothing typed before the cancel is left over; the hint ("Password") counts for none.
         assert dots() == 0, dots()
+        # No arrow in the empty field: a click there does nothing.
+        assert marked(ARROW) == 0
         before = read_log()
         type_text(PASSWORD)
         wait_for_dots(len(PASSWORD))
+        assert marked(ARROW) > 0
+        past_greetd_alarm()
         click(*LOG_IN)
         logged_in("alpha", ALPHA, before)
 
-    with subtest("keys move the focus ring; typing goes to the field; Enter on Log In submits"):
+    with subtest("keys move the focus ring; typing goes to the field; Enter on the arrow submits"):
         # One layout: its label at the top right opens nothing (keys typed next would go
-        # to a popup), and Tab never reaches it (below, Tab goes round from Log In, past
-        # the power row, to the field).
+        # to a popup), and Tab never reaches it (below, Tab goes round from the arrow, past
+        # the bottom row, to the field).
         click(*LAYOUT_LABEL)
         # A new greeter, its focus on the field: no ring until a key moves it.
-        assert marked(FIELD_RING) == 0 and marked(LOG_IN_RING) == 0
-        assert marked(SESSION_RING) == 0
-        # The field, "‹ Users", the session chip, Log In.
-        machine.send_key("tab")
+        assert marked(FIELD_RING) == 0 and marked(SESSION_RING) == 0
+        # The field, then (nothing typed: no arrow) the session chip.
         machine.send_key("tab")
         retry(lambda _: marked(SESSION_RING) > 0, 10)
-        assert marked(FIELD_RING) == 0 and marked(LOG_IN_RING) == 0
+        assert marked(FIELD_RING) == 0
         # Typed with the focus on the chip, the password goes to the field, and the focus
         # (its ring still shown) with it.
         type_text(PASSWORD)
         wait_for_dots(len(PASSWORD))
         assert marked(SESSION_RING) == 0 and marked(FIELD_RING) > 0
-        for _ in range(3):
-            machine.send_key("tab")
-        retry(lambda _: marked(LOG_IN_RING) > 0, 10)
+        # The arrow shows, with no ring; Tab from the field: the arrow's ring.
+        arrow = brightness(ARROW_RING)
+        machine.send_key("tab")
+        retry(lambda _: brightness(ARROW_RING) > arrow + 300, 10)
         assert marked(SESSION_RING) == 0 and marked(FIELD_RING) == 0
-        # Tab goes past the power row and round to the field, Shift+Tab back to Log In.
-        power = power_buttons()
-        for _ in range(power + 1):
+        # Tab goes past the chip and the bottom row (Cancel and the power buttons) and round
+        # to the field, Shift+Tab back to the arrow.
+        stops = 1 + 1 + power_buttons() + 1
+        for _ in range(stops):
             machine.send_key("tab")
-        retry(lambda _: marked(FIELD_RING) > 0 and marked(LOG_IN_RING) == 0, 10)
-        for _ in range(power + 1):
+        retry(lambda _: marked(FIELD_RING) > 0 and brightness(ARROW_RING) < arrow + 100, 10)
+        for _ in range(stops):
             machine.send_key("shift-tab")
-        retry(lambda _: marked(LOG_IN_RING) > 0 and marked(FIELD_RING) == 0, 10)
-        # Moving the focus typed nothing; Enter, on Log In, submits.
+        retry(lambda _: brightness(ARROW_RING) > arrow + 300 and marked(FIELD_RING) == 0, 10)
+        # Moving the focus typed nothing; Enter, on the arrow, submits.
         assert dots() == len(PASSWORD), dots()
         assert "popup shown" not in read_log()
+        past_greetd_alarm()
         before = read_log()
         machine.send_key("ret")
         logged_in("alpha", ALPHA, before)
@@ -486,10 +525,19 @@ pkgs.testers.runNixOSTest {
         log_in("beta", BETA)
 
     with subtest("a session chosen, then a cancel: still chosen when greeted again"):
-        # alice last logged in to Beta: Alpha, by a click on its row.
+        # alice last logged in to Beta, highlighted in the popup: the pointer on Alpha's
+        # row highlights it instead, and Enter chooses it.
         click(*SESSION_CHIP)
         wait_for_line("session popup shown", 3)
-        click(*popup_row(0))
+        x, y = popup_row(0)
+        # A strip along the top of the row, above the pointer (the cursor is drawn down
+        # from it): brighter once highlighted, before Enter goes in.
+        strip = (x - 60, y - 11, 120, 1)
+        dark = brightness(strip)
+        move(x + 1, y)
+        move(x, y)
+        retry(lambda _: brightness(strip) > dark + 1000, 10)
+        machine.send_key("ret")
         wait_for_line("session Alpha chosen")
         backs = count("cancelled; back to the users")
         machine.send_key("esc")
@@ -533,7 +581,7 @@ pkgs.testers.runNixOSTest {
         backs, asked = count("back to the users"), count("asking for a user name")
         prompts, unlisted = count("prompt: secret"), count("greeting a user who is not listed")
         codes = count("prompt: visible")
-        click(*USERS)
+        click_cancel()
         wait_for_line("back to the users", backs + 1)
         # The row of alice and "Other…": a click on "Other…".
         retry(lambda _: marked(avatar_box(1, n=2)) > 0, 10)
@@ -582,7 +630,7 @@ pkgs.testers.runNixOSTest {
         # session asked of greetd until a user is chosen.
         for i in range(3):
             assert marked(avatar_box(i)) > 0, i
-        assert marked(FIELD) == 0 and marked(USERS_CHIP) == 0
+        assert marked(FIELD) == 0 and not cancel_shown()
         assert "greeting" not in after, after
         # No ring yet (the strips, at the same height over the same background, are alike);
         # Right moves the focus from alice to bob, and his ring shows.
@@ -596,11 +644,10 @@ pkgs.testers.runNixOSTest {
         wait_for_line("greeting bob (Bob Builder)")
         wait_for_line("sessions: Alpha, Beta; Alpha chosen (first)", 2)
         wait_for_line("prompt: secret", prompts + 1)
-        # His login has the "‹ Users" chip; a key chose him, so the field shows the ring.
-        retry(lambda _: marked(USERS_CHIP) > 0 and marked(FIELD_RING) > 0, 10)
-        # The field, "‹ Users", the session chip: Space there opens the popup.
+        # His login has Cancel; a key chose him, so the field shows the ring.
+        retry(lambda _: cancel_shown() and marked(FIELD_RING) > 0, 10)
+        # The field, then the session chip: Space there opens the popup.
         popups, chosen = count("session popup shown"), count("session Beta chosen")
-        machine.send_key("tab")
         machine.send_key("tab")
         retry(lambda _: marked(SESSION_RING) > 0, 10)
         machine.send_key("spc")
@@ -613,12 +660,13 @@ pkgs.testers.runNixOSTest {
         type_text(BOB_PASSWORD)
         wait_for_dots(len(BOB_PASSWORD))
         assert marked(SESSION_RING) == 0 and marked(FIELD_RING) > 0
+        past_greetd_alarm()
         type_text("\n")
         logged_in("beta", BETA, before, user="bob", ready="input ready")
         state = machine.succeed(f"cat {STATE}")
         assert 'last-user "bob"' in state and 'session "bob" "beta.desktop"' in state, state
 
-    with subtest("the last user preselected; Escape and the Users chip go back to the row"):
+    with subtest("the last user preselected; Escape and Cancel go back to the row"):
         before = read_log()
         restart_greetd()
         assert "last user bob (remembered)" in read_log()[len(before):]
@@ -639,7 +687,7 @@ pkgs.testers.runNixOSTest {
         wait_for_line("greeting bob (Bob Builder)", greetings + 2)
         wait_for_line("prompt: secret", prompts + 2)
         assert dots() == 0, dots()
-        click(*USERS)
+        click_cancel()
         wait_for_line("cancelled; back to the users", 2)
         retry(lambda _: marked(FIELD) == 0 and marked(avatar_box(0)) > 0, 10)
         # A click on her avatar: alice, with her own session.
@@ -719,12 +767,14 @@ pkgs.testers.runNixOSTest {
         assert re.search(r"users: ?$", after, re.M), after
         assert "asking for a user name" in after, after
         # No row to go back to.
-        assert marked(USERS_CHIP) == 0 and marked(avatar_box(0)) == 0
+        assert not cancel_shown() and marked(avatar_box(0)) == 0
         prompts, unlisted = count("prompt: secret"), count("greeting a user who is not listed")
         codes = count("prompt: visible")
         type_text("bobb\n")
         wait_for_line("greeting a user who is not listed", unlisted + 1)
         wait_for_line("prompt: visible", codes + 1)
+        # A typed user's login goes back to the user name: Cancel shows.
+        retry(lambda _: cancel_shown(), 10)
         backs = count("cancelled; back to the user name")
         machine.send_key("esc")
         wait_for_line("cancelled; back to the user name", backs + 1)

@@ -53,7 +53,7 @@ const BTN_LEFT: u32 = 0x110;
 pub enum Event {
     /// The answer was submitted, by Enter or the Log In button; `Entry::submission` has it.
     Submit,
-    /// Escape or the "‹ Users" chip: give up this login.
+    /// Escape or Cancel: give up this login.
     Cancel,
     /// The avatar at this place in the row was activated.
     Choose(usize),
@@ -342,12 +342,20 @@ impl State {
             } else {
                 Shown::Background
             };
-            self.draw_toplevel(i, shows);
+            // Where the pointer is on it, in physical pixels.
+            let toplevel = &self.toplevels[i];
+            let pointer = self.pointer_at.as_ref();
+            let pointer = pointer.filter(|at| &at.surface == toplevel.window.wl_surface());
+            let f = f64::from(toplevel.surface.scale) / 120.0;
+            let pointer = pointer.map(|at| (at.x * f, at.y * f));
+            self.draw_toplevel(i, shows, pointer);
         }
         self.draw_popup();
     }
 
-    fn draw_toplevel(&mut self, i: usize, shows: Shown) {
+    /// Draw toplevel `i` showing `shows`, the widget under `pointer` (in physical pixels)
+    /// hovered: drawn again only if what it shows, hover included, changed.
+    fn draw_toplevel(&mut self, i: usize, mut shows: Shown, pointer: Option<(f64, f64)>) {
         let State {
             toplevels,
             painter,
@@ -371,7 +379,7 @@ impl State {
                 other.insert(prepare(painter, layout))
             }
         };
-        if let (Shown::Login(view), Some(extras)) = (&shows, &mut prepared.extras) {
+        if let (Shown::Login(view), Some(extras)) = (&mut shows, &mut prepared.extras) {
             if let Status::Cooldown(seconds) = view.look.status {
                 painter.countdown(&mut prepared.scene, seconds);
             }
@@ -380,6 +388,7 @@ impl State {
             if let Err(e) = extras.update(painter, view) {
                 error!("rendering the login screen: {e}");
             }
+            view.hover = extras.hover(pointer);
         }
         let paint = |canvas: &mut [u8]| match &shows {
             Shown::Login(view) => {
@@ -540,6 +549,17 @@ impl State {
         }
     }
 
+    /// The popup's row under the pointer is selected, as the arrow keys select one: hover
+    /// and selection are one highlight there.
+    fn hover_popup(&mut self) {
+        if let (Some(at), Some(popup)) = (&self.pointer_at, &mut self.popup)
+            && popup.popup.wl_surface() == &at.surface
+            && let Some(row) = popup.list.row_at(at.y)
+        {
+            popup.selected = row;
+        }
+    }
+
     /// Do what a key or click on a widget does, but type.
     fn act(&mut self, action: Action, qh: &QueueHandle<Self>) {
         let Action::Activate(widget) = action else {
@@ -548,7 +568,7 @@ impl State {
         match widget {
             Widget::Avatar(i) => self.events.push_back(Event::Choose(i)),
             Widget::Pill => {}
-            Widget::Users => self.events.push_back(Event::Cancel),
+            Widget::Back => self.events.push_back(Event::Cancel),
             Widget::Power(i) => self.events.push_back(Event::Power(i)),
             Widget::Cancel => self.events.push_back(Event::Dismiss),
             Widget::Confirm => self.events.push_back(Event::Confirm),
@@ -594,8 +614,8 @@ impl State {
             // Modifiers and keys that do nothing, which the field's keyboard follows.
             _ => return true,
         };
+        let shown = self.login.shown(Instant::now());
         let chooser = &mut self.login.chooser;
-        let shown = chooser.shown();
         match chooser.focus.key(focus_key, &shown) {
             Action::Type => true,
             action => {
@@ -628,10 +648,7 @@ fn prepare(painter: &Painter, layout: Layout) -> Prepared {
         error!("preparing the login screen: {e}; drawing it plain");
         painter.plain(layout)
     });
-    let extras = Extras::new(painter, &scene).unwrap_or_else(|e| {
-        error!("preparing the login screen's buttons: {e}");
-        None
-    });
+    let extras = Extras::new(&scene);
     Prepared { scene, extras }
 }
 
@@ -842,6 +859,7 @@ impl Dispatch<WlPointer, ()> for State {
                     x: surface_x,
                     y: surface_y,
                 });
+                state.hover_popup();
             }
             wl_pointer::Event::Leave { .. } => state.pointer_at = None,
             wl_pointer::Event::Motion {
@@ -852,6 +870,7 @@ impl Dispatch<WlPointer, ()> for State {
                 if let Some(at) = &mut state.pointer_at {
                     (at.x, at.y) = (surface_x, surface_y);
                 }
+                state.hover_popup();
             }
             wl_pointer::Event::Button {
                 serial,

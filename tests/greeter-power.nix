@@ -10,7 +10,8 @@
 # One user, alice, with one session.
 #
 # Behaviours asserted:
-#   1. logind's answers for the greeter: the four buttons, drawn along the bottom
+#   1. logind's answers for the greeter: the four buttons, drawn along the bottom after
+#      Cancel (back to the row of alice and "Other…")
 #   2. Sleep, by a click: no dialog, the marker; on resume the half-typed password is
 #      wiped (the next attempt, typed in full, logs in), and the focus is off Sleep (Enter
 #      does not sleep again)
@@ -105,11 +106,12 @@ pkgs.testers.runNixOSTest {
     PASSWORD = "${password}"
     LAYOUT = (1024, 768)
     PLAIN = [0x20, 0x24, 0x28]
-    # The power row: buttons 72x56, 16 apart, centred, 24 from the bottom.
-    def power_button(i, n=4):
+    # The bottom row: Cancel, then the power buttons; boxes 72x56, 16 apart, centred, 24
+    # from the bottom.
+    def power_button(i, n=5):
         x0 = 512 - (n * 72 + (n - 1) * 16) / 2
-        return (x0 + 36 + i * 88, 768 - 24 - 28)
-    def power_box(i, n=4):
+        return (x0 + 36 + (i + 1) * 88, 768 - 24 - 28)
+    def power_box(i, n=5):
         x, y = power_button(i, n)
         return (x - 36, y - 28, 72, 56)
     # The dialog: 320x132, centred; its buttons 120x32, 20 from its bottom, 16 apart.
@@ -213,8 +215,8 @@ pkgs.testers.runNixOSTest {
         machine.fail(f"test -e {DIR}/suspended")
 
     with subtest("Hibernate by the keyboard: Tab to the row, Right, Enter"):
-        # The field, "‹ Users", Log In, then the power row.
-        for _ in range(3):
+        # From the field (empty: no arrow), Cancel, then the power buttons.
+        for _ in range(2):
             machine.send_key("tab")
         machine.send_key("right")
         machine.send_key("ret")
@@ -277,7 +279,8 @@ pkgs.testers.runNixOSTest {
         greeter_ready()
 
     with subtest("Shut Down by the keyboard: the dialog, Right, Enter: power off"):
-        for _ in range(6):
+        # Cancel, then the four power buttons.
+        for _ in range(5):
             machine.send_key("tab")
         wait_for_more("dialog: Shut down now?", lambda: machine.send_key("ret"))
         machine.send_key("right")

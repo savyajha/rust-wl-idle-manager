@@ -2,8 +2,10 @@
   lib,
   rustPlatform,
   pkg-config,
+  adwaita-fonts,
   cairo,
   libxkbcommon,
+  makeFontsConf,
   pango,
 }:
 
@@ -31,6 +33,10 @@ rustPlatform.buildRustPackage {
     libxkbcommon
     pango
   ];
+
+  # A font for the unit tests that draw text.
+  FONTCONFIG_FILE = makeFontsConf { fontDirectories = [ adwaita-fonts ]; };
+  preCheck = "export XDG_CACHE_HOME=$TMPDIR";
 
   meta = {
     description = "Graphical greetd greeter that looks like rust-wl-idle-manager's lock screen";

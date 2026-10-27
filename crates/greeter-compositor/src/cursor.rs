@@ -110,16 +110,17 @@ fn from_xcursor(image: xcursor::parser::Image) -> Image {
     }
 }
 
-/// The theme's image for a cursor `size` (in logical pixels) at an output's `scale`: the
-/// smallest at least that many pixels, or else the largest. The built-in arrow, at the scale
-/// rounded, if there is no theme.
+/// The theme's image for a cursor `size` (in logical pixels) at an output's `scale`: the one
+/// nearest that many physical pixels, the larger of two as near, to be drawn as it is (sharp,
+/// where a desktop scales an image down to the size exactly). The built-in arrow, at the
+/// scale rounded, if there is no theme.
 pub fn pick(theme: &[(u32, Image)], size: u32, scale: f64) -> Image {
-    let wanted = (size as f64 * scale).round() as u32;
-    let at_least = theme
+    let wanted = size as f64 * scale;
+    let distance = |s: u32| (s as f64 - wanted).abs();
+    let nearest = theme
         .iter()
-        .filter(|(s, _)| *s >= wanted)
-        .min_by_key(|(s, _)| *s);
-    match at_least.or_else(|| theme.iter().max_by_key(|(s, _)| *s)) {
+        .min_by(|(a, _), (b, _)| distance(*a).total_cmp(&distance(*b)).then(b.cmp(a)));
+    match nearest {
         Some((_, image)) => image.clone(),
         None => arrow((scale.round() as usize).max(1)),
     }
@@ -201,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn picks_the_smallest_size_large_enough() {
+    fn picks_the_nearest_size() {
         let image = |width| Image {
             width,
             height: 1,
@@ -210,9 +211,14 @@ mod tests {
         };
         let theme = [(24, image(24)), (36, image(36)), (48, image(48))];
         assert_eq!(pick(&theme, 24, 1.0).width, 24);
+        // 38.4: 36 is nearer than 48 (the laptop's case).
+        assert_eq!(pick(&theme, 24, 1.6).width, 36);
+        // 30 and 42: halfway, so the larger.
         assert_eq!(pick(&theme, 24, 1.25).width, 36);
-        assert_eq!(pick(&theme, 24, 1.6).width, 48);
+        assert_eq!(pick(&theme, 24, 1.75).width, 48);
+        // Beyond the largest, or below the smallest.
         assert_eq!(pick(&theme, 24, 3.0).width, 48);
+        assert_eq!(pick(&theme, 16, 1.0).width, 24);
         // No theme: the arrow at the scale rounded.
         assert_eq!(pick(&[], 24, 1.6), arrow(2));
     }

@@ -19,10 +19,8 @@ use crate::layouts::Layout as KeyboardLayout;
 use crate::power::Action;
 use crate::sessions::Session;
 
-// In logical pixels. The Log In button and the "‹ Users" chip sit beside the field, the
-// message line and the session chip under it (under the caps lock line).
-const BESIDE: f64 = 12.0;
-const BUTTON_WIDTH: f64 = 80.0;
+// In logical pixels. The message line and the session chip sit under the field (under the
+// caps lock line).
 const CHIP_HEIGHT: f64 = 24.0;
 const MESSAGE_BELOW: f64 = 32.0;
 const SESSION_BELOW: f64 = 58.0;
@@ -45,6 +43,12 @@ const NAME_BELOW: f64 = 8.0;
 const RING_WIDTH: f64 = 2.0;
 const RING_GAP: f64 = 2.0;
 const RING: Rgba = [1.0, 1.0, 1.0, 0.7];
+// Hover: white over the widget under the pointer, which raises its frosted fill's alpha by
+// about HOVER; a power button, which has no fill, gets a plate of PLATE behind its icon and
+// label, its corners PLATE_RADIUS round.
+const HOVER: f64 = 0.08;
+const PLATE: f64 = 0.1;
+const PLATE_RADIUS: f64 = 12.0;
 
 // The indicator row at the top right: 24 high, 8 from the top and 12 from the right edge,
 // its items 8 apart (the layout, then the battery, rightmost). With a popup the layout is a
@@ -115,9 +119,11 @@ pub struct View {
     session: Option<String>,
     /// The avatar row's names, when it is shown instead of a user.
     pub row: Option<Vec<String>>,
-    /// Whether the "‹ Users" chip is shown.
-    users: bool,
+    /// Whether Cancel is shown, in the bottom row: there is somewhere to go back to.
+    back: bool,
     ring: Option<Widget>,
+    /// The widget under the pointer, which the toplevel sets (`Extras::hover`).
+    pub hover: Option<Widget>,
     indicators: Indicators,
     power: Vec<Action>,
     /// The dialog's action, while it is open.
@@ -159,6 +165,13 @@ impl Login {
         self.chooser.resumed();
     }
 
+    /// The widgets shown (`Chooser::shown`): the field's arrow while something is typed
+    /// and not being checked, as `Extras` draws it.
+    pub fn shown(&self, now: Instant) -> Vec<Widget> {
+        self.chooser
+            .shown(self.entry.look(now).status == Status::Typing)
+    }
+
     pub fn view(&self, now: Instant) -> View {
         let screen = &self.chooser.screen;
         let (secret, prompt) = match screen {
@@ -175,8 +188,9 @@ impl Login {
             message: self.message.clone(),
             session: session.then(|| self.sessions[self.chosen].name.clone()),
             row: (*screen == Screen::Row).then(|| self.chooser.names()),
-            users: self.chooser.has_row(),
+            back: self.chooser.can_go_back(),
             ring: self.chooser.focus.ring(),
+            hover: None,
             indicators: Indicators {
                 layout: self
                     .layouts
@@ -205,9 +219,16 @@ struct Line {
     label: Label,
 }
 
-/// A power button: its box and its label (the icon is drawn each time).
-struct PowerButton {
-    action: Action,
+/// What a button of the bottom row is: Cancel, back from the login, or a power button.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bottom {
+    Cancel,
+    Power(Action),
+}
+
+/// A button of the bottom row: its box and its label (the icon is drawn each time).
+struct BottomButton {
+    kind: Bottom,
     rect: Rect,
     label: Label,
 }
@@ -234,15 +255,17 @@ pub struct Extras {
     pill: Rect,
     /// The scene's avatar, where the avatar row goes.
     avatar: Rect,
+    /// Around the field's arrow button, which logs in.
+    arrow: Rect,
+    /// Whether the arrow shows: something is typed, and not being checked.
+    arrow_shown: bool,
     factor: f64,
-    log_in: Button,
-    users: Button,
-    users_shown: bool,
     session: Option<Button>,
     message: Option<Line>,
     /// While it is shown, instead of a user.
     row: Option<Row>,
     ring: Option<Widget>,
+    hover: Option<Widget>,
     /// The frame's width.
     width: f64,
     indicators: Indicators,
@@ -252,29 +275,18 @@ pub struct Extras {
     battery: Option<Rect>,
     /// The frame's height.
     height: f64,
-    power: Vec<PowerButton>,
+    /// The bottom row: Cancel first, if shown, then the power buttons.
+    bottom: Vec<BottomButton>,
     dialog: Option<Dialog>,
 }
 
 impl Extras {
     /// The widgets around `scene`'s field; `None` for a plain scene, which has none.
-    pub fn new(painter: &Painter, scene: &Scene) -> Result<Option<Self>, cairo::Error> {
-        let Some(pill) = scene.pill() else {
-            return Ok(None);
+    pub fn new(scene: &Scene) -> Option<Self> {
+        let (Some(pill), Some(arrow)) = (scene.pill(), scene.button()) else {
+            return None;
         };
         let f = scene.layout.factor();
-        let log_in = whole(Rect {
-            x: pill.x + pill.w + BESIDE * f,
-            y: pill.y,
-            w: BUTTON_WIDTH * f,
-            h: pill.h,
-        });
-        let users = whole(Rect {
-            x: pill.x - (BESIDE + BUTTON_WIDTH) * f,
-            y: pill.center().1 - CHIP_HEIGHT * f / 2.0,
-            w: BUTTON_WIDTH * f,
-            h: CHIP_HEIGHT * f,
-        });
         // Without an avatar in the look, the row goes where the field is.
         let avatar = scene.avatar().unwrap_or_else(|| {
             let (x, y) = pill.center();
@@ -286,25 +298,25 @@ impl Extras {
                 h: d,
             })
         });
-        Ok(Some(Self {
+        Some(Self {
             pill,
             avatar,
+            arrow,
+            arrow_shown: false,
             factor: f,
-            log_in: button(painter, "Log In", log_in, draw::BUTTON, f)?,
-            users: button(painter, "‹ Users", users, draw::FIELD, f)?,
-            users_shown: false,
             session: None,
             message: None,
             row: None,
             ring: None,
+            hover: None,
             width: f64::from(scene.layout.pixels.0),
             indicators: Indicators::default(),
             layout_chip: None,
             battery: None,
             height: f64::from(scene.layout.pixels.1),
-            power: Vec::new(),
+            bottom: Vec::new(),
             dialog: None,
-        }))
+        })
     }
 
     /// Render the message line and the session chip again where `view` changed them.
@@ -349,9 +361,18 @@ impl Extras {
         if self.indicators != view.indicators {
             self.render_indicators(painter, &view.indicators)?;
         }
-        let actions = self.power.iter().map(|button| button.action);
-        if !actions.eq(view.power.iter().copied()) {
-            self.render_power(painter, &view.power)?;
+        let back = view.back.then_some(Bottom::Cancel);
+        let kinds: Vec<_> = back
+            .into_iter()
+            .chain(view.power.iter().map(|&a| Bottom::Power(a)))
+            .collect();
+        if !self
+            .bottom
+            .iter()
+            .map(|button| button.kind)
+            .eq(kinds.iter().copied())
+        {
+            self.render_bottom(painter, &kinds)?;
         }
         if self.dialog.as_ref().map(|dialog| dialog.action) != view.dialog {
             self.dialog = None;
@@ -359,7 +380,7 @@ impl Extras {
                 self.dialog = Some(self.render_dialog(painter, action)?);
             }
         }
-        self.users_shown = view.users;
+        self.arrow_shown = view.look.status == Status::Typing;
         self.ring = view.ring;
         Ok(())
     }
@@ -395,15 +416,15 @@ impl Extras {
         Ok(())
     }
 
-    /// The power row of `actions`, centred at the bottom.
-    fn render_power(&mut self, painter: &Painter, actions: &[Action]) -> Result<(), cairo::Error> {
+    /// The bottom row of `kinds`, centred at the bottom.
+    fn render_bottom(&mut self, painter: &Painter, kinds: &[Bottom]) -> Result<(), cairo::Error> {
         let f = self.factor;
-        let n = actions.len() as f64;
+        let n = kinds.len() as f64;
         let left = self.width / 2.0 - (n * POWER_WIDTH + (n - 1.0) * POWER_GAP) * f / 2.0;
         let y = self.height - (POWER_BOTTOM + POWER_HEIGHT) * f;
         let font = Font::new(draw::HINT_SIZE, Weight::Medium, WHITE);
-        self.power.clear();
-        for (i, &action) in actions.iter().enumerate() {
+        self.bottom.clear();
+        for (i, &kind) in kinds.iter().enumerate() {
             let x = left + i as f64 * (POWER_WIDTH + POWER_GAP) * f;
             let rect = whole(Rect {
                 x,
@@ -411,14 +432,14 @@ impl Extras {
                 w: POWER_WIDTH * f,
                 h: POWER_HEIGHT * f,
             });
-            let label = painter.label(action.label(), &font, f, |(w, _)| {
+            let text = match kind {
+                Bottom::Cancel => "Cancel",
+                Bottom::Power(action) => action.label(),
+            };
+            let label = painter.label(text, &font, f, |(w, _)| {
                 ((rect.center().0 - w / 2.0).round(), rect.y + 34.0 * f)
             })?;
-            self.power.push(PowerButton {
-                action,
-                rect,
-                label,
-            });
+            self.bottom.push(BottomButton { kind, rect, label });
         }
         Ok(())
     }
@@ -456,6 +477,14 @@ impl Extras {
                 f,
             )?,
         })
+    }
+
+    /// The widget under the pointer at `at`, in physical pixels (None: not on this
+    /// surface), now shown hovered: as `hit` has it for what `update` last showed, so none
+    /// that has gone (such as the power row's under the dialog).
+    pub fn hover(&mut self, at: Option<(f64, f64)>) -> Option<Widget> {
+        self.hover = at.and_then(|(x, y)| self.hit(x, y));
+        self.hover
     }
 
     /// Whether `(x, y)`, in physical pixels, is in the dialog.
@@ -506,11 +535,7 @@ impl Extras {
                 label.paint(cr, 1.0)?;
             }
         } else {
-            let users = self.users_shown.then_some(&self.users);
-            for button in [Some(&self.log_in), users, self.session.as_ref()]
-                .into_iter()
-                .flatten()
-            {
+            if let Some(button) = &self.session {
                 draw::rounded(cr, button.rect, button.rect.h / 2.0);
                 draw::frost(cr, button.alpha, OUTLINE, f)?;
                 button.label.paint(cr, 1.0)?;
@@ -529,9 +554,12 @@ impl Extras {
         if let (Some(rect), Some(battery)) = (self.battery, self.indicators.battery) {
             paint_battery(cr, rect, battery, f)?;
         }
-        for button in &self.power {
+        for button in &self.bottom {
             let icon = (button.rect.center().0, button.rect.y + 16.0 * f);
-            icons::power(cr, button.action, icon, f)?;
+            match button.kind {
+                Bottom::Cancel => icons::cancel(cr, icon, f)?,
+                Bottom::Power(action) => icons::power(cr, action, icon, f)?,
+            }
             button.label.paint(cr, 1.0)?;
         }
         if let Some(dialog) = &self.dialog {
@@ -547,6 +575,18 @@ impl Extras {
                 draw::frost(cr, button.alpha, OUTLINE, f)?;
                 button.label.paint(cr, 1.0)?;
             }
+        }
+        if let Some(widget) = self.hover
+            && let Some(rect) = self.place(widget)
+        {
+            // A chip's or a button's shape, or an avatar's circle; a power button's plate.
+            let (radius, alpha) = match widget {
+                Widget::Back | Widget::Power(_) => (PLATE_RADIUS * f, PLATE),
+                _ => (rect.h / 2.0, HOVER),
+            };
+            draw::rounded(cr, rect, radius);
+            draw::set_color(cr, [1.0, 1.0, 1.0, alpha]);
+            cr.fill()?;
         }
         // Round every widget's shape, a field's or a chip's or an avatar's.
         if let Some(rect) = self.ring.and_then(|widget| self.place(widget)) {
@@ -575,8 +615,13 @@ impl Extras {
                 _ => None,
             };
         }
+        let back = self.bottom.first().filter(|b| b.kind == Bottom::Cancel);
         match (widget, &self.row) {
-            (Widget::Power(i), _) => self.power.get(i).map(|button| button.rect),
+            (Widget::Back, _) => back.map(|button| button.rect),
+            (Widget::Power(i), _) => {
+                let i = i + usize::from(back.is_some());
+                self.bottom.get(i).map(|button| button.rect)
+            }
             (Widget::Cancel | Widget::Confirm, _) => None,
             (Widget::Layout, _) => {
                 let chip = self.layout_chip.as_ref().filter(|_| self.indicators.picker);
@@ -585,9 +630,8 @@ impl Extras {
             (Widget::Avatar(i), Some(row)) => row.avatars.get(i).map(Avatar::square),
             (_, Some(_)) | (Widget::Avatar(_), None) => None,
             (Widget::Pill, None) => Some(self.pill),
-            (Widget::Users, None) => self.users_shown.then_some(self.users.rect),
             (Widget::Session, None) => self.session.as_ref().map(|session| session.rect),
-            (Widget::LogIn, None) => Some(self.log_in.rect),
+            (Widget::LogIn, None) => self.arrow_shown.then_some(self.arrow),
         }
     }
 
@@ -596,13 +640,13 @@ impl Extras {
         let avatars = self.row.as_ref().map_or(0, |row| row.avatars.len());
         let buttons = [
             Widget::LogIn,
-            Widget::Users,
+            Widget::Back,
             Widget::Session,
             Widget::Layout,
             Widget::Cancel,
             Widget::Confirm,
         ];
-        let power = (0..self.power.len()).map(Widget::Power);
+        let power = (0..self.bottom.len()).map(Widget::Power);
         let mut widgets = (0..avatars).map(Widget::Avatar).chain(buttons).chain(power);
         widgets.find(|&widget| self.place(widget).is_some_and(|rect| inside(rect, x, y)))
     }
@@ -811,11 +855,11 @@ mod tests {
         let view = login(&["Alice"], &["A", "B"], true, "Password: ").view(now);
         assert_eq!(view.hint, "Password");
         assert_eq!((view.text, view.session.as_deref()), (None, Some("B")));
-        // One user: their login, with "‹ Users" for the row of them and "Other…".
-        assert_eq!((view.row, view.users), (None, true));
+        // One user: their login, with Cancel for the row of them and "Other…".
+        assert_eq!((view.row, view.back), (None, true));
         // No one listed: the user name, with no row to go back to.
         let view = login(&[], &["A"], true, "").view(now);
-        assert_eq!((&*view.hint, view.users), ("User name", false));
+        assert_eq!((&*view.hint, view.back), ("User name", false));
         let view = login(&["Alice"], &["A"], false, "").view(now);
         assert_eq!(view.hint, draw::HINT);
         // Typed text shows for a visible prompt only; one session needs no chip.
@@ -829,12 +873,13 @@ mod tests {
         let view = login.view(now);
         let names = ["Alice", "Bob", "Other…"].map(String::from);
         assert_eq!(view.row.as_deref(), Some(&names[..]));
-        assert_eq!((view.session, view.users), (None, true));
+        // Nowhere to go back to from the row.
+        assert_eq!((view.session, view.back), (None, false));
         login.chooser.choose(2);
         let view = login.view(now);
         // Asked for visibly, before any user is known: no session chip yet.
         assert_eq!((&*view.hint, view.text.as_deref()), ("User name", Some("")));
-        assert_eq!((view.row, view.session, view.users), (None, None, true));
+        assert_eq!((view.row, view.session, view.back), (None, None, true));
     }
 
     #[test]
@@ -875,6 +920,37 @@ mod tests {
             (indicators.layout.as_deref(), indicators.picker),
             (Some("DE"), false)
         );
+    }
+
+    /// The hovered widget is the one under the pointer of those shown, and none off them,
+    /// off the surface, or once the dialog hides the power row.
+    #[test]
+    fn hover_follows_the_pointer_and_the_screen() {
+        let config = ui::config::LockScreen::default_layout();
+        let palette = ui::theme::Palette::parse("");
+        let painter = Painter::given(config, palette, "Adwaita Sans", None, "Ann".into());
+        let scene = painter.scene(Layout::new((1280, 720), 120, None)).unwrap();
+        let mut extras = Extras::new(&scene).unwrap();
+        let mut login = login(&["Alice"], &["A", "B"], true, "Password: ");
+        login.chooser.power = vec![Action::Sleep, Action::Restart];
+        let now = Instant::now();
+        extras.update(&painter, &login.view(now)).unwrap();
+        // Nothing typed: no arrow.
+        let arrow = scene.button().unwrap().center();
+        assert_eq!(extras.hover(Some(arrow)), None);
+        login.entry.press(ui::entry::Key::Char('a'), 1, now);
+        extras.update(&painter, &login.view(now)).unwrap();
+        let log_in = extras.place(Widget::LogIn).unwrap().center();
+        let restart = extras.place(Widget::Power(1)).unwrap().center();
+        assert_eq!(extras.hover(Some(log_in)), Some(Widget::LogIn));
+        assert_eq!(extras.hover(Some(restart)), Some(Widget::Power(1)));
+        assert_eq!(extras.hover(Some((1.0, 1.0))), None);
+        assert_eq!(extras.hover(None), None);
+        login.chooser.dialog = Some(Action::Restart);
+        extras.update(&painter, &login.view(now)).unwrap();
+        assert_eq!(extras.hover(Some(restart)), None);
+        let cancel = extras.place(Widget::Cancel).unwrap().center();
+        assert_eq!(extras.hover(Some(cancel)), Some(Widget::Cancel));
     }
 
     #[test]

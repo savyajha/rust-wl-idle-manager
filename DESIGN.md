@@ -260,9 +260,11 @@ Everything a frame needs is prepared ahead of time, per output, in a `Scene`:
 the background at a quarter of the output's physical size (the blurred
 wallpaper scaled to cover it, or a plain colour, with a dark gradient at the
 top and the bottom), and every text rendered at the output's scale and placed:
-the date, clock and name, the initial, "Enter Password", "⇪ Caps Lock is on"
-and the arrow "→" (the two symbols are text too, in GTK's font or its
-fallback). Drawing a frame paints into a shared-memory buffer through a cairo
+the date, clock and name, the initial, "Enter Password" and "⇪ Caps Lock is on"
+(the symbol is text too, in GTK's font or its fallback). The field's button has
+an arrow drawn as a path, a line with a head, two pixels wide with round ends,
+in the style of the greeter's power icons. Drawing a frame paints into a
+shared-memory buffer through a cairo
 surface over it: the background scaled up with bilinear filtering (about 4 ms
 at 2560 × 1600), the texts composited, and a few shapes filled: the frosted
 circle, field and button (white at a low opacity over the blurred background,
@@ -604,11 +606,13 @@ The cursor is a theme's pointer with `--cursor-theme` (a theme's directory,
 `…/share/icons/NAME`), or else a built-in arrow, drawn at the output's scale
 rounded; it is hidden until the pointer first moves. From the theme it reads
 `cursors/left_ptr`, or else `cursors/default`, once at start-up, and for each
-output takes the smallest of its sizes at least `--cursor-size` (default 24)
-times the output's scale, or else the largest; the image's hotspot is at the
-pointer. A theme that cannot be read is logged, and the arrow is used. The
-cursor goes on the output's cursor plane where there is one and the image
-fits it; otherwise, and if a flip with the cursor plane ever fails, it
+output takes the size nearest `--cursor-size` (default 24) times the output's
+scale, the larger of two as near, drawn as it is, not resampled: at 24 and scale
+1.6 (38.4 px), 36 px, where niri draws the 48 px image (for the scale rounded up)
+at 38.4. The image's hotspot is at the pointer. A theme that cannot be read is
+logged, and the arrow is used. The cursor goes on the output's cursor plane
+where there is one and the image fits it; otherwise, and if a flip with the
+cursor plane ever fails, it
 is drawn into the frame (and the plane is switched off), pixel for pixel at
 any scale. Legacy KMS has no usable cursor plane here, and
 virtual GPUs hide theirs from clients that cannot set a cursor hotspot, as
@@ -736,10 +740,10 @@ they are sorted by that, ignoring case. A byte that is not UTF-8 is replaced; if
 The avatar row has each user's avatar (their initial in a circle) with their
 name under it, then "Other…", centred where the look puts the avatar, in
 columns 120 pixels wide (wider for a longer name). With several users the
-greeter starts on it; with one, on that user's login, as below, with "‹ Users"
+greeter starts on it; with one, on that user's login, as below, with Cancel
 leading to the row of them and "Other…". No greetd session is created until a
 user is chosen, by Enter or a click on their avatar; Escape at their login, or
-"‹ Users", cancels it and goes back to the row, on their avatar. "Other…" asks
+Cancel, cancels it and goes back to the row, on their avatar. "Other…" asks
 for any user name (root, a user outside the UID range, one known only to NSS) in
 a visible field; Enter there logs that user in, called by their full name if
 they are listed, else by the name typed, which the greeter never logs (it might
@@ -747,7 +751,11 @@ be a password typed in the wrong place). PAM still may: pam_unix logs the name
 when a login is cancelled at its prompt ("could not identify password for
 […]"), as it does for any login. Escape at a typed user's login goes back to the
 user name, and from there to the row. With no one listed the greeter starts on
-the user name, with no row. Typing on the row does nothing: it has no field.
+the user name, with no row. Cancel, at the left of the bottom row, before the
+power buttons and in their style (a circle with a cross in it, over "Cancel"),
+shows only where there is somewhere to go back to: at a listed user's login and
+at the user name when anyone is listed, and at a typed user's login. Typing on
+the row does nothing: it has no field.
 
 The row starts on the last user to log in: on "Other…" if they are not listed,
 on the first if there is none. The
@@ -776,9 +784,11 @@ shown), or going back and choosing again would be a way round the cooldown.
 ### Keyboard focus
 
 The widgets shown take the keyboard's focus in reading order: the avatars on
-the row; on a login, the field, "‹ Users" (with a row), the session chip (with
-more than one session, once the user is known) and Log In. Tab and Shift+Tab
-move it, and round; Left and Right move it along the row. Enter and Space
+the row; on a login, the field, its arrow (while something is typed), and the
+session chip (with more than one session, once the user is known); then the
+bottom row, Cancel (where shown) first. Tab and Shift+Tab move it, and round;
+Left and Right move it along a row (the avatars, the bottom row). Space in the
+bottom row is text, as on a power button. Enter and Space
 activate the widget focused (Space on the session chip opens the popup), except
 in the field, which takes them, as it takes any key that types (a character,
 Backspace); typed elsewhere, such a key moves the focus to the field first.
@@ -860,8 +870,9 @@ never holds up the session.
 
 ### Power
 
-Along the bottom of the login screen's output, centred, are the power buttons,
-in this order: Sleep, Hibernate, Restart, Shut Down. Each is an icon (cairo paths
+Along the bottom of the login screen's output, centred, after Cancel where it
+shows (see Users), are the power buttons, in this order: Sleep, Hibernate,
+Restart, Shut Down. Each is an icon (cairo paths
 in the indicators' style: white, lines 2 wide, in a circle 18 across: a crescent,
 a snowflake, an arrow round, the power symbol) over its label, in a box 72 by 56,
 16 apart, 24 from the bottom. A task of its own asks logind (`CanSuspend`,
@@ -919,9 +930,12 @@ Each output gets a fullscreen `xdg_toplevel`. The login screen is on the output
 the compositor announced first (the lowest registry name), its primary one; the
 others show the background alone. The login screen is the lock screen's scene
 (the same `Painter`, at each output's preferred fractional scale, through a
-viewport) with the greeter's widgets drawn over it: a Log In button right of the
-field, a "‹ Users" chip left of it, a line under it for messages, and, with more
-than one session, a chip under that with the chosen session's name. The empty
+viewport) with the greeter's widgets drawn over it: a line under the field for
+messages, and, with more than one session, a chip under that with the chosen
+session's name. The field's round arrow button, inside its right end, logs in;
+it shows once something is typed, as on the lock screen (dimmed, and inert,
+while the answer is checked; not in a cooldown), and the text or dots stop short
+of it. The empty
 field shows greetd's prompt without its colon ("Password"); for a visible
 prompt, the field shows the answer as typed instead of a dot per character.
 What the login screen shows is a `View` (the entry's look, the prompt, the
@@ -932,8 +946,19 @@ one of at most two buffers, as the lock screen's are.
 A click on the session chip opens the session popup: an `xdg_popup` under the
 chip, with a grab, listing the sessions. Up and Down move its highlight, Enter
 or a click on a row chooses; Escape or a click outside it (handled by the
-compositor) dismisses it. A click on the Log In button submits like Enter; a
-click on "‹ Users", or Escape, gives up the login and goes back (see Users).
+compositor) dismisses it. A click on the field's arrow submits like Enter; a
+click on Cancel, or Escape, gives up the login and goes back (see Users).
+
+A widget under the pointer is shown hovered: white at 0.08 over it (raising a
+chip's or a button's frosted fill by about that much; an avatar's circle and the
+field's arrow alike), and for a power button or Cancel, which have no fill, a
+plate of white at 0.1, its corners 12 round, drawn over its box (over its icon and
+label, which are white already). The hovered widget is
+found as a click finds it, among those shown, on each pointer event; the screen
+is drawn again only when it changes, and it clears when the pointer leaves or
+the widget goes (the dialog opening, the row giving way to the login). In a
+popup the row under the pointer is highlighted, as the arrow keys highlight it.
+The cursor's shape does not change. The focus ring is independent of it.
 On the avatar row, the screen has the
 background, date and clock, and the row instead of the user's avatar, name and
 field.
@@ -1021,7 +1046,7 @@ battery's level, and the session started.
 the compositor test's two outputs, with a PAM stack that asks a user with a
 TOTP secret for a visible verification code (pam_google_authenticator with
 `echo_verification_code` and `nullok`) before the password: a wrong password
-then the right one, Escape and the "‹ Users" chip, the Log In button, the
+then the right one, Escape and Cancel, the field's arrow (shown once typed), the
 session popup by keyboard and by click, the state file and the session
 remembered after greetd restarts, a session picked and then cancelled kept when
 the same user is greeted again, both prompts, the "de" keymap the greeter
@@ -1043,8 +1068,9 @@ by the keyboard.
 `tests/greeter-power-scale.nix` has the laptop's setup on one output at scale
 1.6: tap-to-click and clickfinger asked for (QEMU has no touchpad, so only the
 compositor's flags are checked) and capitaine-cursors at size 24. The theme's
-48 px image drawn at the pointer by its hotspot, checked pixel by pixel; the
-dialog by a click and by the keyboard; a right click doing nothing; and Sleep
+36 px image drawn at the pointer by its hotspot, checked pixel by pixel; the
+field's arrow and a power button brightening under the pointer and back after it;
+the dialog by a click and by the keyboard; a right click doing nothing; and Sleep
 by a click.
 
 `tests/greeter-indicators.nix` has three layouts, "de", "us" and "us(dvorak)",

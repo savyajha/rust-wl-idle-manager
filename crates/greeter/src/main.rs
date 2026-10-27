@@ -278,7 +278,7 @@ struct Started {
 impl Greeter {
     fn event(&mut self, event: Event) -> Step {
         let login = self.wayland.login();
-        // Leaving a login (Escape or "‹ Users" always goes back from one).
+        // Leaving a login (Escape or Cancel always goes back from one).
         if matches!(event, Event::Cancel) && matches!(login.chooser.screen, Screen::Login(_)) {
             self.picked
                 .set_session(&self.user, &login.sessions[login.chosen].file);

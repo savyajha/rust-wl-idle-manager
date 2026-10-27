@@ -15,9 +15,9 @@
 #
 # Behaviours asserted:
 #   1. the layouts and their short names; without UPower, no battery is shown
-#   2. Tab reaches the layout indicator, last after Log In and the power row; Enter opens
-#      its popup, Down and Enter choose "us"; the row's pixels change; the user name typed for "Other…" is then
-#      typed with "us" (yves logs in, typed with the Y key), and the layout he logged in with
+#   2. Tab reaches the layout indicator, last after the bottom row; Enter opens its popup,
+#      Down and Enter choose "us"; the row's pixels change; the user name typed for "Other…"
+#      is then typed with "us" (yves logs in, typed with the Y key), and the layout he logged in with
 #      is remembered for him
 #   3. after a restart, alice (with none remembered) has the first layout again, the row
 #      looks as before; yves, typed with "de", gets his "us" back; then, at his prompt, a
@@ -184,9 +184,11 @@ pkgs.testers.runNixOSTest {
     # the layout's chip is rightmost with no battery, its centre about 20 in from its end.
     ROW = (824, 8, 188, 24)
     CHIP = (992, 20)
-    # The "‹ Users" chip, left of the default look's field (176x30, centred, its bottom
-    # 156 + 10 + the caps lock line's 16 from the screen's).
-    USERS = (512 - 88 - 12 - 40, 768 - 156 - 26 - 15)
+    def cancel():
+        """Cancel, first in the bottom row (boxes 72x56, 16 apart, centred, 24 from the
+        bottom), with the power buttons after it."""
+        n = power_buttons() + 1
+        return (512 - (n * 72 + (n - 1) * 16) / 2 + 36, 768 - 24 - 28)
     def other():
         """"Other…" on the row of alice and it: right of her, 120 apart, centred."""
         return (512 + 60, 768 - 249 - 32)
@@ -249,8 +251,8 @@ pkgs.testers.runNixOSTest {
         wait_for_line("input ready", n + 1)
 
     def to_other():
-        """From alice's login, by "‹ Users" and a click: "Other…"'s user name."""
-        wait_for_more("back to the users", lambda: click(*USERS))
+        """From alice's login, by Cancel and a click: "Other…"'s user name."""
+        wait_for_more("back to the users", lambda: click(*cancel()))
         wait_for_more("asking for a user name", lambda: click(*other()))
 
     machine.start()
@@ -272,8 +274,8 @@ pkgs.testers.runNixOSTest {
         plain = row()
 
     with subtest("Tab, Enter, Down, Enter choose us; yves's name is typed with it"):
-        # The field, "‹ Users", Log In, the power row, then the indicator.
-        for _ in range(3 + power_buttons()):
+        # The field, then Cancel, the power buttons and the indicator.
+        for _ in range(2 + power_buttons()):
             machine.send_key("tab")
         wait_for_more("layout popup shown", lambda: machine.send_key("ret"))
         machine.send_key("down")
@@ -346,7 +348,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a variant: us(dvorak), whose A P G I D type alice"):
         wait_for_line("DE chosen (first)", 3)
-        for _ in range(3 + power_buttons()):
+        for _ in range(2 + power_buttons()):
             machine.send_key("tab")
         wait_for_more("layout popup shown", lambda: machine.send_key("ret"))
         machine.send_key("down")

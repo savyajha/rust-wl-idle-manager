@@ -6,15 +6,17 @@
 # are checked. The cursor theme is capitaine-cursors at size 24, as on the laptop.
 #
 # Behaviours asserted:
-#   1. the three buttons (Sleep, Restart, Shut Down) are drawn; the compositor runs with --tap
-#      and --clickfinger
-#   2. the pointer is the theme's 48 px image (24 at scale 1.6, rounded up to a size the
-#      theme has), drawn over the background with its hotspot at the pointer
-#   3. a click on Restart opens the dialog; a click on its Cancel closes it, the focus back
+#   1. the three buttons (Sleep, Restart, Shut Down) are drawn, after Cancel; the
+#      compositor runs with --tap and --clickfinger
+#   2. the pointer is the theme's 36 px image (the size nearest 24 at scale 1.6, 38.4),
+#      drawn over the background with its hotspot at the pointer
+#   3. hover: under the pointer, the field's arrow (once something is typed) and a power
+#      button brighten; away from them, they are as before
+#   4. a click on Restart opens the dialog; a click on its Cancel closes it, the focus back
 #      on Restart
-#   4. Tab (to Shut Down) and Enter open the dialog; Escape closes it
-#   5. a right click on Restart does nothing: only the left button clicks
-#   6. a click on Sleep sleeps: the marker
+#   5. Tab (to Shut Down) and Enter open the dialog; Escape closes it
+#   6. a right click on Restart does nothing: only the left button clicks
+#   7. a click on Sleep sleeps: the marker
 
 { pkgs }:
 
@@ -85,10 +87,14 @@ pkgs.testers.runNixOSTest {
     SCALE = 1.6
     # Logical pixels, as the pointer has them.
     LAYOUT = (640, 480)
-    # The power row: three buttons 72x56, 16 apart, centred, 24 from the bottom.
-    def power_button(i, n=3):
+    # The bottom row: Cancel (back to the row of alice and "Other…"), then the three power
+    # buttons; boxes 72x56, 16 apart, centred, 24 from the bottom.
+    def power_button(i, n=4):
         x0 = 320 - (n * 72 + (n - 1) * 16) / 2
-        return (x0 + 36 + i * 88, 480 - 24 - 28)
+        return (x0 + 36 + (i + 1) * 88, 480 - 24 - 28)
+    # The default look's field: 176x30, centred, 180 to 210 from the bottom; its arrow a
+    # circle 20 across, 5 inside its right end.
+    ARROW = (320 + 88 - 5 - 10, 480 - 195)
     # The dialog: 320x132, centred; its buttons 120x32, 20 from its bottom, 16 apart.
     CANCEL = (320 - 8 - 60, 240 - 66 + 132 - 20 - 16)
 
@@ -128,6 +134,16 @@ pkgs.testers.runNixOSTest {
         action()
         wait_for_line(text, n + 1, timeout)
 
+    def area(rect):
+        """A logical rectangle's pixels."""
+        width, pixels = screen()
+        x0, y0, w, h = [round(v * SCALE) for v in rect]
+        rows = range(y0, y0 + h)
+        return [list(pixels[(y * width + x) * 3:][:3]) for y in rows for x in range(x0, x0 + w)]
+
+    def brightness(pixels):
+        return sum(sum(p) for p in pixels)
+
     def marked(rect):
         """How many pixels of a logical rectangle differ clearly from the plain background."""
         width, pixels = screen()
@@ -146,12 +162,13 @@ pkgs.testers.runNixOSTest {
         def boxes(_):
             return all(marked((x - 36, y - 28, 72, 56)) > 0 for x, y in map(power_button, range(3)))
         retry(boxes, 10)
-        machine.succeed("pgrep -f '^/nix/store/[^ ]*/bin/rust-wl-greeter-compositor .*--tap --clickfinger'")
+        compositor = "^/nix/store/[^ ]*/bin/rust-wl-greeter-compositor"
+        machine.succeed(f"pgrep -f '{compositor} .*--tap --clickfinger'")
 
-    with subtest("the pointer is the theme's 48 px image, its hotspot at the pointer"):
+    with subtest("the pointer is the theme's 36 px image, its hotspot at the pointer"):
         assert "cursor theme: sizes [24, 30, 36, 48, 60, 72]" in read_log(), read_log()
         theme = "${pkgs.capitaine-cursors}/share/icons/capitaine-cursors"
-        w, h, (hx, hy), image = xcursor(f"{theme}/cursors/left_ptr", 48)
+        w, h, (hx, hy), image = xcursor(f"{theme}/cursors/left_ptr", 36)
         # The pointer at logical (100, 120), which the tablet's range has exactly (5120 and
         # 8192 of 32768): physical (160, 192), less the hotspot.
         x0, y0 = 160 - hx, 192 - hy
@@ -167,6 +184,25 @@ pkgs.testers.runNixOSTest {
             print(f"{off} of {w * h} pixels unlike the theme's image")
             return off == 0
         retry(drawn, 10)
+
+    with subtest("hover: the arrow and a power button brighten under the pointer"):
+        # Each with the pointer at its bottom right, and a patch of it at its top left, where
+        # the cursor (drawn down and right of the pointer) is not.
+        x, y = ARROW
+        arrow = ((x + 6, y + 6), (x - 7, y - 7, 5, 5))
+        x, y = power_button(1)
+        restart = ((x + 30, y + 20), (x - 30, y - 20, 16, 10))
+        machine.send_chars("x")
+        # The arrow shows once something is typed.
+        retry(lambda _: marked((ARROW[0] - 10, ARROW[1] - 10, 20, 20)) > 0, 10)
+        for pointer, patch in [arrow, restart]:
+            # Nothing hovered (the last patch is back as it was, below).
+            unlit = area(patch)
+            move(*pointer)
+            retry(lambda _: brightness(area(patch)) > brightness(unlit) + 100, 10)
+            move(20, 20)
+            retry(lambda _: area(patch) == unlit, 10)
+        machine.send_key("backspace")
 
     with subtest("a click on Restart opens the dialog; a click on its Cancel closes it"):
         wait_for_more("dialog: Restart now?", lambda: click(*power_button(1)))

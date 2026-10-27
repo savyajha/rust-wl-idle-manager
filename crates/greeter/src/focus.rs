@@ -1,9 +1,10 @@
 //! The keyboard focus on the login screen. Tab and Shift+Tab move it through the widgets
 //! shown, in reading order, and round; Left and Right move it along a row (the avatars, the
-//! power buttons, the dialog's buttons). Enter and Space activate the widget it is on,
-//! except in the field, which takes them as it takes any key that types; such a key, typed
-//! elsewhere, moves the focus to the field first, if it is shown (not on the avatar row, nor
-//! in the dialog). A ring shows it once a key has moved it, until a click. No I/O.
+//! bottom row's Cancel and power buttons, the dialog's buttons). Enter and Space activate
+//! the widget it is on, except in the field, which takes them as it takes any key that
+//! types; such a key, typed elsewhere, moves the focus to the field first, if it is shown
+//! (not on the avatar row, nor in the dialog). A ring shows it once a key has moved it,
+//! until a click. No I/O.
 
 /// A widget the focus can be on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -12,11 +13,12 @@ pub enum Widget {
     Avatar(usize),
     /// The field.
     Pill,
-    /// The "‹ Users" chip.
-    Users,
+    /// The field's arrow, which logs in, while something is typed.
+    LogIn,
     /// The session chip.
     Session,
-    LogIn,
+    /// The bottom row's Cancel, back from the login.
+    Back,
     /// The keyboard layout's indicator, when it opens a popup.
     Layout,
     /// The power button at this place in the power row.
@@ -36,8 +38,8 @@ pub enum Key {
     Right,
     /// Enter.
     Activate,
-    /// Space: Enter, except on a power button, where it is text (a password may start with
-    /// one, and must not put the machine to sleep).
+    /// Space: Enter, except in the bottom row, where it is text (a password may start with
+    /// one, and must not put the machine to sleep, nor cancel the login).
     Space,
     /// A key the field acts on: a character, Backspace.
     Text,
@@ -77,7 +79,7 @@ impl Focus {
     pub fn key(&mut self, key: Key, shown: &[Widget]) -> Action {
         let at = shown.iter().position(|&widget| widget == self.focused);
         let key = match key {
-            Key::Space if matches!(self.focused, Widget::Power(_)) => Key::Text,
+            Key::Space if row(self.focused) == Some(Row::Bottom) => Key::Text,
             Key::Space => Key::Activate,
             key => key,
         };
@@ -130,14 +132,14 @@ impl Focus {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Row {
     Avatars,
-    Power,
+    Bottom,
     Dialog,
 }
 
 fn row(widget: Widget) -> Option<Row> {
     match widget {
         Widget::Avatar(_) => Some(Row::Avatars),
-        Widget::Power(_) => Some(Row::Power),
+        Widget::Back | Widget::Power(_) => Some(Row::Bottom),
         Widget::Cancel | Widget::Confirm => Some(Row::Dialog),
         _ => None,
     }
@@ -148,7 +150,7 @@ mod tests {
     use super::*;
     use Widget::*;
 
-    const LOGIN: [Widget; 4] = [Pill, Users, Session, LogIn];
+    const LOGIN: [Widget; 4] = [Pill, LogIn, Session, Back];
     const ROW: [Widget; 3] = [Avatar(0), Avatar(1), Avatar(2)];
 
     #[test]
@@ -159,11 +161,11 @@ mod tests {
             assert_eq!(focus.key(key, &LOGIN), Action::None);
             focus.ring()
         };
-        assert_eq!(tab(Key::Tab), Some(Users));
-        assert_eq!(tab(Key::Tab), Some(Session));
         assert_eq!(tab(Key::Tab), Some(LogIn));
+        assert_eq!(tab(Key::Tab), Some(Session));
+        assert_eq!(tab(Key::Tab), Some(Back));
         assert_eq!(tab(Key::Tab), Some(Pill));
-        assert_eq!(tab(Key::BackTab), Some(LogIn));
+        assert_eq!(tab(Key::BackTab), Some(Back));
         assert_eq!(tab(Key::BackTab), Some(Session));
         // Through the avatars too, one by one.
         let mut focus = Focus::new(Avatar(2));
@@ -199,7 +201,7 @@ mod tests {
     fn enter_and_space_activate_but_type_in_the_field() {
         let mut focus = Focus::new(Pill);
         assert_eq!(focus.key(Key::Activate, &LOGIN), Action::Type);
-        for widget in [Users, Session, LogIn] {
+        for widget in [LogIn, Session, Back] {
             focus.focused = widget;
             assert_eq!(focus.key(Key::Activate, &LOGIN), Action::Activate(widget));
         }
@@ -233,14 +235,16 @@ mod tests {
         focus.key(Key::Activate, &LOGIN);
         assert_eq!(focus.ring(), None);
         focus.key(Key::BackTab, &LOGIN);
-        assert_eq!(focus.ring(), Some(Session));
+        assert_eq!(focus.ring(), Some(Pill));
     }
 
     #[test]
     fn left_and_right_move_along_the_power_row_and_the_dialog() {
-        let shown = [Pill, LogIn, Power(0), Power(1), Layout];
-        let mut focus = Focus::new(Power(0));
+        let shown = [Pill, LogIn, Back, Power(0), Power(1), Layout];
+        let mut focus = Focus::new(Back);
         focus.key(Key::Left, &shown);
+        assert_eq!(focus.focused, Back);
+        focus.key(Key::Right, &shown);
         assert_eq!(focus.focused, Power(0));
         focus.key(Key::Right, &shown);
         focus.key(Key::Right, &shown);

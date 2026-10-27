@@ -1,5 +1,6 @@
-//! The power row's icons, drawn as cairo paths in the indicators' style: white, with lines
-//! two logical pixels wide and round ends, each in a circle 18 across.
+//! The bottom row's icons (Cancel's and the power buttons'), drawn as cairo paths in the
+//! indicators' style: white, with lines two logical pixels wide and round ends, each in a
+//! circle 18 across.
 
 use std::f64::consts::{PI, TAU};
 
@@ -57,4 +58,20 @@ pub fn power(cr: &Context, action: Action, (x, y): (f64, f64), f: f64) -> Result
             cr.stroke()
         }
     }
+}
+
+/// Draw the Cancel button's icon, a circle with a cross in it, as `power` draws its icons.
+pub fn cancel(cr: &Context, (x, y): (f64, f64), f: f64) -> Result<(), cairo::Error> {
+    let r = 9.0 * f;
+    draw::set_color(cr, [1.0; 4]);
+    cr.set_line_width(2.0 * f);
+    cr.set_line_cap(LineCap::Round);
+    cr.arc(x, y, 0.8 * r, 0.0, TAU);
+    cr.stroke()?;
+    let a = 0.32 * r;
+    cr.move_to(x - a, y - a);
+    cr.line_to(x + a, y + a);
+    cr.move_to(x + a, y - a);
+    cr.line_to(x - a, y + a);
+    cr.stroke()
 }
