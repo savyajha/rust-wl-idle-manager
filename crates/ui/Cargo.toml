@@ -20,6 +20,6 @@ tokio.workspace = true
 tracing.workspace = true
 wayland-client.workspace = true
 zbus.workspace = true
-xkbcommon = { version = "0.8", default-features = false, features = ["wayland"] }
+xkbcommon = { version = "0.9", default-features = false, features = ["wayland"] }
 zeroize.workspace = true
 zune-jpeg = "0.5"
