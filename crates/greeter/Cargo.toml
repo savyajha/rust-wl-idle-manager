@@ -19,7 +19,7 @@ tracing.workspace = true
 tracing-subscriber = "0.3"
 wayland-client.workspace = true
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
-xkbcommon = { version = "0.8", default-features = false }
+xkbcommon = { version = "0.9", default-features = false }
 # The battery, from UPower.
 zbus.workspace = true
 zeroize.workspace = true
