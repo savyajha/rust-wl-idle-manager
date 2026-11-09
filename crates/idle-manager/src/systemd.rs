@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use anyhow::{Context, ensure};
 use ui::config::Argv;
 use zbus::proxy;
-use zbus::zvariant::{OwnedObjectPath, Value};
+use zbus::{OwnedObjectPath, Variant};
 
 #[proxy(
     interface = "org.freedesktop.systemd1.Manager",
@@ -17,8 +17,8 @@ pub trait SystemdManager {
         &self,
         name: &str,
         mode: &str,
-        properties: &[(&str, Value<'_>)],
-        aux: &[(&str, &[(&str, Value<'_>)])],
+        properties: &[(&str, Variant<'_>)],
+        aux: &[(&str, &[(&str, Variant<'_>)])],
     ) -> zbus::Result<OwnedObjectPath>;
 
     fn kill_unit(&self, name: &str, whom: &str, signal: i32) -> zbus::Result<()>;
@@ -36,13 +36,13 @@ impl SystemdManagerProxy<'_> {
         let path = env::var("PATH").unwrap_or_default();
         let program = find_program(&argv.program, &path)?;
         let properties = [
-            ("Description", Value::from(description)),
+            ("Description", Variant::from(description)),
             (
                 "ExecStart",
-                Value::from(vec![(program, argv.to_vec(), false)]),
+                Variant::from(vec![(program, argv.to_vec(), false)]),
             ),
             // Unload the unit once it stops, even if it failed, so its name is free again.
-            ("CollectMode", Value::from("inactive-or-failed")),
+            ("CollectMode", Variant::from("inactive-or-failed")),
         ];
         // Job mode "fail": refuse a conflicting job rather than replace it.
         let started = self

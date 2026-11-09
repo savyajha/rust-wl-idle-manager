@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Cargo.lock (and Cargo.toml for new major versions), one grouped PR a month.
+  # Cargo.lock (and Cargo.toml for new major versions), one grouped PR a month for minor and patch updates.
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -9,9 +9,12 @@ updates:
     ignore:
       - dependency-name: miette
         update-types: ["version-update:semver-major"]
+    # Major versions stay out of the group, each in its own PR, so that one
+    # breaking update can't hold back the routine ones.
     groups:
       cargo:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # Keeps the action versions in .github/workflows current.
   - package-ecosystem: github-actions

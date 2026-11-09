@@ -8,9 +8,9 @@ use anyhow::{Context, bail};
 use futures_lite::StreamExt;
 use tokio::sync::mpsc;
 use tracing::info;
+use zbus::OwnedVariant;
 use zbus::fdo;
 use zbus::names::InterfaceName;
-use zbus::zvariant::OwnedValue;
 
 const UPOWER: &str = "org.freedesktop.UPower";
 const DISPLAY_DEVICE: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
@@ -55,8 +55,8 @@ async fn follow(sender: &mpsc::Sender<Option<Battery>>) -> anyhow::Result<()> {
         .await
         .context("connecting to the system bus")?;
     let properties = fdo::PropertiesProxy::builder(&bus)
-        .destination(UPOWER)?
-        .path(DISPLAY_DEVICE)?
+        .destination(UPOWER)
+        .path(DISPLAY_DEVICE)
         .build()
         .await?;
     // Listening before the first read, so that no change is missed between them.
@@ -96,7 +96,7 @@ fn log(battery: Option<Battery>) {
 }
 
 /// The battery in the DisplayDevice's properties `all`; a property missing is no battery.
-fn shown(all: &HashMap<String, OwnedValue>) -> Option<Battery> {
+fn shown(all: &HashMap<String, OwnedVariant>) -> Option<Battery> {
     let get = |name: &str| all.get(name).map(|value| value.try_clone());
     let present = bool::try_from(get("IsPresent")?.ok()?).ok()?;
     let percentage = f64::try_from(get("Percentage")?.ok()?).ok()?;
@@ -132,11 +132,11 @@ mod tests {
 
     #[test]
     fn the_battery_is_read_from_the_properties_and_none_without_one() {
-        let all = |properties: &[(&str, zbus::zvariant::Value)]| -> HashMap<String, OwnedValue> {
+        let all = |properties: &[(&str, zbus::Variant)]| -> HashMap<String, OwnedVariant> {
             let owned = properties.iter().map(|(name, value)| {
                 (
                     name.to_string(),
-                    OwnedValue::try_from(value.clone()).unwrap(),
+                    OwnedVariant::try_from(value.clone()).unwrap(),
                 )
             });
             owned.collect()

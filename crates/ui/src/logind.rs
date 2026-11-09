@@ -4,8 +4,8 @@ use std::env;
 use std::os::fd::OwnedFd;
 
 use anyhow::Context;
+use zbus::OwnedObjectPath;
 use zbus::proxy;
-use zbus::zvariant::{self, OwnedObjectPath};
 
 #[proxy(
     interface = "org.freedesktop.login1.Manager",
@@ -14,13 +14,7 @@ use zbus::zvariant::{self, OwnedObjectPath};
 )]
 pub trait LogindManager {
     /// Take an inhibitor lock; it is held until the returned fd is closed.
-    fn inhibit(
-        &self,
-        what: &str,
-        who: &str,
-        why: &str,
-        mode: &str,
-    ) -> zbus::Result<zvariant::OwnedFd>;
+    fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<zbus::OwnedFd>;
 
     fn get_session(&self, session_id: &str) -> zbus::Result<OwnedObjectPath>;
 

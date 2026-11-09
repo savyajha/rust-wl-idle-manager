@@ -1,26 +1,30 @@
-use std::io::ErrorKind;
-use std::os::fd::{AsFd, OwnedFd};
+use std::io::{self, ErrorKind};
+use std::os::fd::AsFd;
+use std::os::unix::net::UnixStream as StdUnixStream;
 
 use anyhow::Context;
-use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
+use tokio::net::UnixStream;
 use tokio::time::{self, Instant};
 use wayland_client::backend::WaylandError;
 use wayland_client::{Connection, EventQueue, QueueHandle};
 
-/// A Wayland event queue on tokio: its connection's socket is waited for through `AsyncFd`,
-/// and events are read with wayland-client's `prepare_read` and `read`, so no second event
+/// A Wayland event queue on tokio: its connection's socket is waited for through a duplicate
+/// registered as a `UnixStream`, and events are read with wayland-client's `prepare_read` and `read`, so no second event
 /// loop is needed.
 pub struct Queue<S> {
     queue: EventQueue<S>,
-    fd: AsyncFd<OwnedFd>,
+    socket: UnixStream,
 }
 
 impl<S: 'static> Queue<S> {
     pub fn new(conn: &Connection, queue: EventQueue<S>) -> anyhow::Result<Self> {
-        let fd = conn.as_fd().try_clone_to_owned()?;
+        let socket = StdUnixStream::from(conn.as_fd().try_clone_to_owned()?);
+        // tokio requires this. wayland-client already sends and receives without blocking.
+        socket.set_nonblocking(true)?;
         Ok(Self {
             queue,
-            fd: AsyncFd::new(fd)?,
+            socket: UnixStream::from_std(socket)?,
         })
     }
 
@@ -51,18 +55,24 @@ impl<S: 'static> Queue<S> {
         let Some(guard) = self.queue.prepare_read() else {
             return Ok(true);
         };
-        let mut ready = tokio::select! {
-            ready = self.fd.readable() => ready.context("waiting for the Wayland compositor")?,
+        tokio::select! {
+            ready = self.socket.readable() => ready.context("waiting for the Wayland compositor")?,
             () = time::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
                 return Ok(false);
             }
-        };
-        match guard.read() {
-            Ok(_) => {}
-            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {
-                ready.clear_ready();
+        }
+        // try_io forgets the socket's readiness if the read would block.
+        let read = self.socket.try_io(Interest::READABLE, || {
+            guard.read().map_err(|e| match e {
+                WaylandError::Io(e) => e,
+                e => io::Error::other(e),
+            })
+        });
+        match read {
+            Err(e) if e.kind() != ErrorKind::WouldBlock => {
+                return Err(e).context("reading from the Wayland compositor");
             }
-            Err(e) => return Err(e).context("reading from the Wayland compositor"),
+            _ => {}
         }
         Ok(true)
     }
